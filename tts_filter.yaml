@@ -4,6 +4,7 @@ server:
   model: XXXXXXXXXXXX
 generation:
   temperature: 0
+  reasoning_effort: low
 dictionary:
   Daisuke Takago: たかごう だいすけ
   鷹合大輔: たかごう だいすけ
