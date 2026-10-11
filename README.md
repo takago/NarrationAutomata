@@ -8,7 +8,7 @@ Turn PDF slides into narrated videos automatically with AI.
 
 `slide-narrator` は，講義や研究発表用の**PDFスライドからナレーション付き動画を作成するシステム**です．日英字幕の生成，レーザーポインタ風マーカーによる視線誘導，原稿の手動編集に対応します．CLIとNiceGUIベースのWebUIを利用できます．
 
-
+![WebUI画面](screenshot.png)
 *スクリーンショットは開発中の画面です．現在のUIとは一部異なる場合があります．*
 
 ## 主な機能
