@@ -107,9 +107,22 @@ python3 slide_lecture.py presentation.pdf --from explain --mode research --lang 
 
 詳しい引数，`--force`，VLM方式と生成物の再利用については [`slide_lecture.md`](slide_lecture.md) を参照してください．
 
-## 実行環境の例
+## 参考実行環境
 
-ローカルLLMとして Ollama（[公式サイト](https://ollama.com/)），日本語TTSとして [Irodori-TTS-Server](https://github.com/Aratako/Irodori-TTS-Server)，英語TTSとして [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) など，OpenAI互換エンドポイントを持つサーバを利用できます．参照音声を用いる際は，音源の権利と利用条件を確認してください．
+以下は，開発者が実際に利用している構成例です．ローカル環境でLLM・日本語TTS・英語TTSを動作させています．この構成が必須というわけではありません．
+
+1. **LLMサーバ**： [Ollama](https://ollama.com/)
+   - モデル： [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
+   - GPU：NVIDIA GeForce RTX 5090
+2. **日本語TTSサーバ**： [Aratakoさんの Irodori-TTS-Server](https://github.com/Aratako/Irodori-TTS-Server)
+   - 参照音声： [hadouさんの Hadou-Voice-Dataset](https://huggingface.co/datasets/hadou1225/Hadou-Voice-Dataset)
+   - GPU：NVIDIA GeForce RTX 5070 Ti
+3. **英語TTSサーバ**： [remskyさんの Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI)
+   - 処理負荷が比較的小さいため，CPUで稼働
+
+実行速度は異なると思いますが，NVIDIA DGX Spark 1台でも動作させられる可能性があります（未検証）．
+
+LLM・TTSともにOpenAI互換APIを利用します．参照音声を利用する際は，音源の権利と利用条件を確認してください．
 
 ## 開発者向けドキュメント
 
