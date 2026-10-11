@@ -112,6 +112,7 @@ python3 slide_lecture.py presentation.pdf --from explain --mode research --lang 
 
 1. **LLMサーバ**： [Ollama](https://ollama.com/)
    - モデル： [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
+     - tts_filter.pyでヨミを作らせるために使用する場合は，推論"low"以上にしないと，ヨミを作れないことがあるようです．  
    - GPU：NVIDIA GeForce RTX 5090
 2. **日本語TTSサーバ**： [Aratakoさんの Irodori-TTS-Server](https://github.com/Aratako/Irodori-TTS-Server)
    - 参照音声： [hadouさんの Hadou-Voice-Dataset](https://huggingface.co/datasets/hadou1225/Hadou-Voice-Dataset)
