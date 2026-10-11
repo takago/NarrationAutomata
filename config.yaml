@@ -5,7 +5,7 @@ llm:
   api_key: dummy
   model: XXXXXXXXXX
   temperature: 0.3
-  reasoning_effort: low
+  reasoning_effort: none
 tts:
   ja:
     base_url: http://XXXXXXXXXX:58885/v1
