@@ -678,6 +678,8 @@ class SlideNarratorApp:
         self.user_manage_container = None
         self.uploader = None
         self.project_select = None
+        self.project_prompt_area = None
+        self.project_prompt_save_button = None
         self.project_name_input = None
         self.active_count_label = None
         self.mode_select = None
@@ -1567,6 +1569,18 @@ class SlideNarratorApp:
             safe_notify(f'前回のプロジェクトを復元できませんでした: {exc}', type='warning')
 
     def refresh_project_widgets(self) -> None:
+        if self.project_prompt_area is not None:
+            prompt = self.proj_cfg.get('project_prompt', '') if self.pdf else ''
+            self.project_prompt_area.value = prompt if isinstance(prompt, str) else ''
+            if self.pdf and not self.read_only:
+                self.project_prompt_area.enable()
+            else:
+                self.project_prompt_area.disable()
+        if self.project_prompt_save_button is not None:
+            if self.pdf and not self.read_only:
+                self.project_prompt_save_button.enable()
+            else:
+                self.project_prompt_save_button.disable()
         if self.mode_select:
             self.mode_select.value = self.mode_code
         if self.lang_select:
@@ -2081,6 +2095,25 @@ class SlideNarratorApp:
             i = self.active_pages.index(self.edit_page)
             if i + 1 < len(self.active_pages):
                 await self.select_edit_page(self.active_pages[i + 1])
+
+    def save_project_prompt(self) -> None:
+        """プロジェクト共通指示を保存する．生成済み成果物は変更しない．"""
+        if not self.write_access_allowed() or not self.paths or not self.pdf:
+            return
+        if self.processing or GLOBAL_EXECUTION_LOCK.is_locked():
+            safe_notify('処理中は追加プロンプトを変更できません．', type='warning')
+            return
+        if self.project_prompt_area is None:
+            return
+        project = load_project_json(self.paths.root)
+        value = str(self.project_prompt_area.value or '').strip()
+        if value:
+            project['project_prompt'] = value
+        else:
+            project.pop('project_prompt', None)
+        save_project_json(self.paths.root, project)
+        self.proj_cfg = project
+        safe_notify('プロジェクト全体の追加プロンプトを保存しました．', type='positive')
 
     def save_slide_prompt(self, page: int, value: str) -> bool:
         """スライド固有の指示をproject.jsonに保存する．既存の成果物は消さない．"""
@@ -3858,6 +3891,17 @@ class SlideNarratorApp:
                 add_project_button.disable()
             self.refresh_project_list()
             self.refresh_project_name_input()
+
+            with ui.expansion('プロジェクト全体の追加プロンプト', icon='edit_note').classes('w-full mt-2'):
+                ui.label('全スライドのナレーション生成に適用します．変更は次回の生成・再生成から有効になります．').classes('text-xs text-zinc-400')
+                self.project_prompt_area = ui.textarea(
+                    label='共通の追加指示',
+                    placeholder='例：情報工学科3年生を対象とし，専門用語を正確に使い，具体例を交えて説明してください．',
+                ).props('outlined autogrow').classes('w-full')
+                self.project_prompt_save_button = ui.button(
+                    '追加プロンプトを保存', icon='save', on_click=self.save_project_prompt,
+                ).props('outline color=primary dense').classes('w-full')
+            self.refresh_project_widgets()
 
             self.mode_select = ui.radio({'lecture': '🎓 講義', 'research': '🔬 研究発表'}, value=self.mode_code).props('inline')
             self.mode_select.on_value_change(lambda e: self._mode_changed(e.value))
