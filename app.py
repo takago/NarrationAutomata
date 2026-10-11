@@ -1970,8 +1970,32 @@ class SlideNarratorApp:
             if i + 1 < len(self.active_pages):
                 await self.select_edit_page(self.active_pages[i + 1])
 
-    async def regenerate_narration(self, page: int, text_area: Any) -> None:
+    def save_slide_prompt(self, page: int, value: str) -> bool:
+        """スライド固有の指示をproject.jsonに保存する．既存の成果物は消さない．"""
+        if not self.write_access_allowed() or not self.paths or self.processing or GLOBAL_EXECUTION_LOCK.is_locked():
+            safe_notify('処理中は追加プロンプトを変更できません．', type='warning')
+            return False
+        # 他の画面・セッションからの設定を不用意に上書きしないよう最新を読み直す．
+        project = load_project_json(self.paths.root)
+        prompts = project.get('slide_prompts', {})
+        if not isinstance(prompts, dict):
+            prompts = {}
+        prompts = dict(prompts)
+        if value.strip():
+            prompts[str(page)] = value.strip()
+        else:
+            prompts.pop(str(page), None)
+        project['slide_prompts'] = prompts
+        save_project_json(self.paths.root, project)
+        self.proj_cfg['slide_prompts'] = prompts
+        safe_notify(f'スライド {page} の追加プロンプトを保存しました．', type='positive')
+        return True
+
+    async def regenerate_narration(self, page: int, text_area: Any, prompt_area: Any = None) -> None:
         if not self.write_access_allowed():
+            return
+        # 詳細画面からは未保存の入力内容も再生成前に確実に保存する．
+        if prompt_area is not None and not self.save_slide_prompt(page, prompt_area.value or ''):
             return
         self._start_background_job(
             lambda: self._regenerate_narration_worker(page, text_area),
@@ -2416,9 +2440,23 @@ class SlideNarratorApp:
 
             with ui.column().classes('w-full gap-3 pt-2'):
                 main_lang = '日本語' if self.lang_code == 'ja' else '英語'
+                saved_prompts = load_project_json(self.paths.root).get('slide_prompts', {})
+                if not isinstance(saved_prompts, dict):
+                    saved_prompts = {}
+                slide_prompt = saved_prompts.get(str(page), '')
+                prompt_area = ui.textarea(
+                    '追加プロンプト（このスライド専用）',
+                    value=slide_prompt if isinstance(slide_prompt, str) else '',
+                    placeholder='このスライドで特に説明したい内容や説明順序などを入力',
+                ).props('outlined autogrow').classes('w-full')
+                ui.label('保存した指示は一括生成と個別再生成の両方に適用されます．保存だけでは既存の原稿・音声・動画を変更しません．').classes('text-xs text-zinc-400')
+                self.register_main_action_button(ui.button(
+                    '💾 追加プロンプトを保存',
+                    on_click=lambda: self.save_slide_prompt(page, prompt_area.value or ''),
+                ).props('outline color=primary'))
                 text_area = ui.textarea(f'主言語ナレーション原稿（{main_lang}）', value=current_text).props('outlined').classes('w-full').style('min-height: 180px')
                 with ui.row().classes('w-full gap-2'):
-                    self.register_main_action_button(ui.button('✨ ナレーションを再生成', on_click=lambda: self.regenerate_narration(page, text_area)).classes('grow').props('outline'))
+                    self.register_main_action_button(ui.button('✨ ナレーションを再生成', on_click=lambda: self.regenerate_narration(page, text_area, prompt_area)).classes('grow').props('outline'))
                     self.register_main_action_button(ui.button('🔄 保存して字幕・ポインタを再解析', on_click=lambda: self.save_and_realign(page, text_area.value, page_vlm_switch.value)).classes('grow').props('color=primary'))
 
                 if alignments:

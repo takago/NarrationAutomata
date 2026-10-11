@@ -291,6 +291,15 @@ def save_project_json(project_dir: Path, data: dict) -> None:
     atomic_write_text(p, json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def get_slide_additional_prompt(project_dir: Path, page: int) -> str:
+    """プロジェクトに保存された指定ページ専用の追加指示を取得する．"""
+    prompts = load_project_json(project_dir).get("slide_prompts", {})
+    if not isinstance(prompts, dict):
+        return ""
+    value = prompts.get(str(page), "")
+    return value if isinstance(value, str) else ""
+
+
 def make_client(cfg: dict) -> OpenAI:
     http_client = httpx.Client(
         trust_env=False,
@@ -1136,6 +1145,7 @@ def make_explanation(
     active_idx: int,
     mode: str = "lecture",
     lang: str = "ja",
+    additional_prompt: str = "",
 ) -> str:
     if lang == "ja":
         title_overview = "発表全体の概要：" if mode == "research" else "講義全体の概要："
@@ -1179,6 +1189,14 @@ Currently presenting slide {active_idx + 1} of {total_active}.
 {instruction_line}
 Return ONLY the raw narration text.
 """
+
+    # 個別指示はこのスライドのナレーション生成にだけ付与する．
+    # 共通システムプロンプトは変更しない．
+    if additional_prompt and additional_prompt.strip():
+        if lang == "ja":
+            prompt += "\nこのスライド専用の追加指示：\n" + additional_prompt.strip() + "\n"
+        else:
+            prompt += "\nAdditional instructions for this slide only:\n" + additional_prompt.strip() + "\n"
 
     content = [
         {"type": "text", "text": prompt},
@@ -1253,6 +1271,7 @@ def generate_single_explanation(
         active_idx=cur_idx,
         mode=mode,
         lang=lang,
+        additional_prompt=get_slide_additional_prompt(out_dir.parent, page),
     )
 
     out_file = out_dir / f"{page:03d}.txt"
@@ -1407,6 +1426,7 @@ def generate_explanations(
             active_idx=k,
             mode=mode,
             lang=lang,
+            additional_prompt=get_slide_additional_prompt(out_dir.parent, i),
         )
         atomic_write_text(out, text + "\n")
         previous_explanation = text
