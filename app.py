@@ -43,6 +43,7 @@ from slide_lecture import (
     generate_single_alignment,
     generate_single_explanation,
     generate_single_tts,
+    tts_text_stats,
     load_project_json,
     make_client,
     parse_page_ranges,
@@ -931,6 +932,9 @@ class SlideNarratorApp:
             else:
                 textarea.value = ''
             self._simple_text_signatures[page] = signature
+            stats_label = getattr(textarea, '_narration_stats_label', None)
+            if self._widget_available(stats_label):
+                stats_label.set_text(self._narration_stats_text(textarea.value or ''))
 
         if self._active_tab == 'detail' and self._widget_available(self.edit_container) and self.edit_page in self.active_pages:
             page = self.edit_page
@@ -2468,6 +2472,34 @@ class SlideNarratorApp:
                 self._add_simple_editor_card(p)
                 self._simple_cards[p].move(target_container=self._simple_grid, target_index=index)
 
+    def _narration_stats_text(self, value: str) -> str:
+        language = self.lang_code
+        config = self.cfg.get('tts', {}).get(language, {})
+        limit_key = 'max_input_chars' if language == 'ja' else 'max_input_words'
+        limit = int(config.get(limit_key) or 0)
+        stats = tts_text_stats(value or '', language, limit)
+        unit = '文字' if language == 'ja' else '単語'
+        counts = (f"文字数: {stats['characters']}  |  "
+                  f"単語数: {stats['words']}  |  "
+                  f"段落数: {stats['paragraphs']}  |  "
+                  f"TTS分割数: {stats['chunks'] if not stats['error'] else '不可'}")
+        if stats['error']:
+            return counts + '  |  ⚠ ' + stats['error']
+        if limit:
+            return counts + f'  |  TTS上限: {limit}{unit}（分割目標80%）'
+        return counts + '  |  TTS分割上限: 未設定'
+
+    def _add_narration_stats(self, textarea: Any) -> Any:
+        """編集中の原稿を即座に計数する（保存前でも更新）．"""
+        label = ui.label(self._narration_stats_text(textarea.value or '')).classes(
+            'text-xs text-zinc-400 whitespace-pre-wrap'
+        )
+        textarea.on('update:model-value', lambda e: label.set_text(
+            self._narration_stats_text(e.args if isinstance(e.args, str) else (textarea.value or ''))
+        ))
+        textarea._narration_stats_label = label
+        return label
+
     def _add_simple_editor_card(self, p: int) -> None:
         if self._simple_grid is None or not self.paths:
             return
@@ -2490,6 +2522,7 @@ class SlideNarratorApp:
                             label=f'ナレーション原稿（スライド {p}）', value=curr_txt,
                         ).props('outlined').classes('w-full h-[180px]').style('height: 180px; min-height: 180px;')
                         ta.props('input-style="height: 140px; resize: vertical;"')
+                        self._add_narration_stats(ta)
                         self._simple_textareas[p] = ta
                         self._simple_text_signatures[p] = self._file_signature(txt_path)
                         with ui.row().classes('w-full items-center justify-end gap-3 pt-1'):
@@ -2704,6 +2737,7 @@ class SlideNarratorApp:
                     on_click=lambda: self.save_slide_prompt(page, prompt_area.value or ''),
                 ).props('outline color=primary'))
                 text_area = ui.textarea(f'主言語ナレーション原稿（{main_lang}）', value=current_text).props('outlined').classes('w-full').style('min-height: 180px')
+                self._add_narration_stats(text_area)
                 with ui.row().classes('w-full gap-2'):
                     self.register_main_action_button(ui.button('✨ ナレーションを再生成', on_click=lambda: self.regenerate_narration(page, text_area, prompt_area)).classes('grow').props('outline'))
                     self.register_main_action_button(ui.button('🔄 保存して字幕・ポインタを再解析', on_click=lambda: self.save_and_realign(page, text_area.value, page_vlm_switch.value)).classes('grow').props('color=primary'))
@@ -3069,7 +3103,7 @@ class SlideNarratorApp:
                     continue
         return []
 
-    def _build_tts_settings(self) -> tuple[tuple[ui.input, ui.input, ui.select, ui.select], tuple[ui.input, ui.input, ui.select, ui.select]]:
+    def _build_tts_settings(self):
         tts = self.cfg.setdefault('tts', {})
         ja = tts.setdefault('ja', {})
         en = tts.setdefault('en', {})
@@ -3094,6 +3128,10 @@ class SlideNarratorApp:
                     m_btn = ui.button('🔄 モデル取得').props('dense outline')
                     voice_sel = ui.select(options=[cur_voice] if cur_voice else [], value=cur_voice, label=f'{lang_name} Voice / 話者').props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
                     v_btn = ui.button('🗣 ボイス取得').props('dense outline')
+                    limit_key = 'max_input_chars' if lang_tag == 'ja' else 'max_input_words'
+                    limit_label = '最大文字数' if lang_tag == 'ja' else '最大単語数'
+                    limit_in = ui.number(limit_label, value=int(cfg_data.get(limit_key) or 0), min=0, step=1).props('dense outlined').classes('w-32')
+                    auto_btn = ui.button('🔍 自動設定').props('dense outline')
 
                 async def fetch_models():
                     b = (base_in.value or '').strip()
@@ -3140,6 +3178,141 @@ class SlideNarratorApp:
                         ui.notify(f'ボイス一覧取得に失敗しました: {err}', type='negative')
                     finally:
                         v_btn.enable()
+
+                # LLMによる原稿生成とTTSの試行を分離し，試行ごとに画面を更新する．
+                async def run_auto_limit():
+                    model = str(model_sel.value or '').strip()
+                    voice = str(voice_sel.value or '').strip()
+                    base = str(base_in.value or '').strip()
+                    if not all((base, model, voice)):
+                        ui.notify('TTSのBase URL，Model，Voiceを設定してください．', type='warning')
+                        return
+
+                    tcfg = {'base_url': base, 'api_key': str(key_in.value or 'dummy'),
+                            'model': model, 'voice': voice}
+                    unit = '文字' if lang_tag == 'ja' else '単語'
+                    measures = ([100, 200, 400, 600, 800, 1200, 1600, 2000]
+                                if lang_tag == 'ja' else [30, 60, 100, 150, 200, 300, 400, 500])
+                    auto_btn.disable()
+                    progress.visible = True
+                    progress.value = 0
+                    results.clear()
+                    attempts = 0
+                    total = len(measures) + 4  # 追加の絞り込み試行を含む上限
+
+                    def update_status(message: str):
+                        status.set_text(message)
+
+                    def append_result(message: str):
+                        with results:
+                            ui.label(message).classes('text-xs text-zinc-300 whitespace-pre-wrap break-all')
+
+                    def build_llm_text(llm_cfg):
+                        lc = make_client(llm_cfg)
+                        prompt = ('自然な日本語で大学講義のナレーション原稿を作成してください．約3500文字．'
+                                  '段落を分け，繰り返しを避けてください．' if lang_tag == 'ja' else
+                                  'Write a coherent university lecture narration in English. '
+                                  'About 1300 words with several paragraphs, no repetition.')
+                        r = lc.chat.completions.create(
+                            model=llm_cfg['model'], messages=[{'role': 'user', 'content': prompt}],
+                            max_tokens=6000, extra_body={"reasoning_effort": "none"})
+                        return (r.choices[0].message.content or '').strip()
+
+                    try:
+                        llm_cfg = self.cfg.get('llm', {})
+                        seed = ''
+                        if llm_cfg.get('base_url') and llm_cfg.get('model'):
+                            update_status('① LLMで長文の講義原稿を生成中…（TTS測定はまだ開始していません）')
+                            append_result('LLMによるテスト原稿を生成しています…')
+                            try:
+                                seed = await run.io_bound(build_llm_text, llm_cfg)
+                                if seed:
+                                    append_result(f'LLM原稿生成完了：{len(seed)}文字，{len(seed.split())}単語')
+                            except Exception as exc:
+                                append_result(f'LLM原稿生成失敗：{exc}．固定文章で測定します．')
+                        else:
+                            append_result('LLM未設定：固定文章で測定します．')
+
+                        if not seed:
+                            seed = ('オペレーティングシステムは，計算機の資源を管理し，アプリケーションに共通の機能を提供します．'
+                                    'プロセス管理やメモリ管理など，複数の機能が協調して動作します．\n\n'
+                                    if lang_tag == 'ja' else
+                                    'An operating system manages the resources of a computer. '
+                                    'It provides essential services for applications, including process scheduling '
+                                    'and memory management. These components work together to support reliable execution.\n\n')
+                        words = seed.split()
+
+                        def sample(target):
+                            if lang_tag == 'en':
+                                return ' '.join((words * (target // max(1, len(words)) + 2))[:target])
+                            return (seed * (target // max(1, len(seed)) + 2))[:target]
+
+                        def synthesize(text):
+                            client = make_client(tcfg)
+                            data = client.audio.speech.create(
+                                model=model, voice=voice, input=text, response_format='mp3').read()
+                            if not data:
+                                raise RuntimeError('空の音声データ')
+                            return len(data)
+
+                        async def try_length(n: int, phase: str):
+                            nonlocal attempts
+                            attempts += 1
+                            update_status(f'② {phase}：{n}{unit}をTTSに送信中…（{attempts}回目）')
+                            started = time.monotonic()
+                            try:
+                                size = await run.io_bound(synthesize, sample(n))
+                                append_result(f'✅ {n}{unit}：成功（{time.monotonic()-started:.1f}秒，{size:,}バイト）')
+                                success = True
+                            except Exception as exc:
+                                append_result(f'❌ {n}{unit}：失敗（{time.monotonic()-started:.1f}秒） {str(exc)[:250]}')
+                                success = False
+                            progress.value = min(1.0, attempts / total)
+                            return success
+
+                        successes = []
+                        failed = None
+                        for n in measures:
+                            if await try_length(n, '段階測定'):
+                                successes.append(n)
+                            else:
+                                failed = n
+                                break
+                        if failed is not None and successes:
+                            low, high = successes[-1], failed
+                            for _ in range(4):
+                                if high - low < 20:
+                                    break
+                                mid = (low + high) // 2
+                                if await try_length(mid, '上限の絞り込み'):
+                                    low = mid
+                                else:
+                                    high = mid
+                            successes.append(low)
+
+                        progress.value = 1.0
+                        if successes:
+                            recommended = max(1, int(max(successes) * 0.8))
+                            limit_in.set_value(recommended)
+                            update_status(f'③ 測定完了：推奨上限 {recommended}{unit}（最大成功値の80%）．設定保存で確定してください．')
+                            append_result(f'推奨設定：{recommended}{unit}（最大成功 {max(successes)}{unit}）')
+                            ui.notify('長文TTSテストが完了しました．設定を保存してください．', type='positive')
+                        else:
+                            update_status('③ 測定終了：最初の試行から失敗したため，設定値は変更していません．')
+                    except Exception as exc:
+                        update_status(f'測定エラー：{exc}')
+                        append_result(f'❌ 測定処理エラー：{exc}')
+                        ui.notify(str(exc), type='negative')
+                    finally:
+                        auto_btn.enable()
+
+                with ui.column().classes('w-full gap-2'):
+                    status = ui.label('0は文字数・単語数による分割を無効にします．').classes('text-xs text-zinc-400')
+                    progress = ui.linear_progress(value=0).classes('w-full')
+                    progress.visible = False
+                    with ui.expansion('長文TTSテストの進行状況・測定結果', icon='fact_check', value=True).classes('w-full'):
+                        results = ui.column().classes('w-full gap-1 max-h-64 overflow-y-auto')
+                auto_btn.on_click(run_auto_limit)
 
                 m_btn.on_click(fetch_models)
                 v_btn.on_click(fetch_voices)
@@ -3199,7 +3372,7 @@ class SlideNarratorApp:
 
                     test_btn.on_click(run_test)
 
-            return base_in, key_in, model_sel, voice_sel
+            return base_in, key_in, model_sel, voice_sel, limit_in
 
         ja_widgets = _build_single_tts_card('ja', '日本語', ja, 'こんにちは。日本語の音声合成テストです。正常に聞こえますか？', 'test_ja.mp3')
         en_widgets = _build_single_tts_card('en', '英語', en, 'Hello! This is a test for English text-to-speech synthesis.', 'test_en.mp3')
@@ -3305,11 +3478,14 @@ class SlideNarratorApp:
                 new_word = ui.input('単語・識別子（例: argc）').classes('grow')
                 new_reading = ui.input('読みの目安（例: アーギューシー）').classes('grow')
 
-                def add_word() -> None:
-                    if new_word.value and new_reading.value:
-                        filter_dict[new_word.value.strip()] = new_reading.value.strip()
-                        save_config(TTS_FILTER_PATH, filter_cfg)
-                        ui.notify(f'「{new_word.value.strip()} → {new_reading.value.strip()}」を追加しました．', type='positive')
+                async def add_word() -> None:
+                    word = (new_word.value or '').strip()
+                    reading = (new_reading.value or '').strip()
+                    if not word or not reading:
+                        ui.notify('単語と読みの両方を入力してください．', type='warning')
+                        return
+                    if await save_filter_configuration(extra_word=(word, reading)):
+                        ui.notify(f'「{word} → {reading}」を追加しました．', type='positive')
                         self.refresh_settings()
 
                 ui.button('辞書に追加', on_click=add_word).props('dense outline')
@@ -3320,33 +3496,65 @@ class SlideNarratorApp:
                     {'headerName': '読みの目安', 'field': '読みの目安', 'editable': True},
                 ],
                 'rowData': [{'単語 / 識別子': k, '読みの目安': v} for k, v in filter_dict.items()],
-                ':getRowId': '(params) => params.data[\"単語 / 識別子\"]',
+                ':getRowId': '(params) => params.data["単語 / 識別子"]',
                 'defaultColDef': {'flex': 1, 'resizable': True},
                 'animateRows': False,
                 'stopEditingWhenCellsLoseFocus': True,
             }).classes('w-full h-80')
 
-            async def save_filter_configuration() -> None:
-                await grid.load_client_data()
-                data = grid.options.get('rowData', [])
-                new_dict = {}
-                for row in data or []:
-                    w = str(row.get('単語 / 識別子', '')).strip()
-                    r = str(row.get('読みの目安', '')).strip()
-                    if w and r and w != 'nan' and r != 'nan':
-                        new_dict[w] = r
+            async def save_filter_configuration(extra_word: tuple[str, str] | None = None) -> bool:
+                """画面のヨミ変換LLM設定と辞書を同じtts_filter.yamlに保存する．"""
+                try:
+                    await grid.load_client_data()
+                    data = grid.options.get('rowData', [])
+                    new_dict: dict[str, str] = {}
+                    for row in data or []:
+                        w = str(row.get('単語 / 識別子', '')).strip()
+                        r = str(row.get('読みの目安', '')).strip()
+                        if w and r and w != 'nan' and r != 'nan':
+                            new_dict[w] = r
+                    if extra_word is not None:
+                        new_dict[extra_word[0]] = extra_word[1]
 
-                filter_cfg['server'] = {
-                    'base_url': (filter_base.value or '').strip(),
-                    'api_key': (filter_key.value or '').strip() or 'dummy',
-                    'model': (str(filter_model_sel.value) if filter_model_sel.value is not None else '').strip(),
-                }
-                filter_cfg['generation'] = {'temperature': float(filter_temp.value or 0)}
-                filter_cfg['dictionary'] = new_dict
-                save_config(TTS_FILTER_PATH, filter_cfg)
-                ui.notify(f'tts_filter.yaml を更新しました（辞書全 {len(new_dict)} 件）．', type='positive')
+                    base_url = (filter_base.value or '').strip()
+                    model = (str(filter_model_sel.value) if filter_model_sel.value is not None else '').strip()
+                    api_key = (filter_key.value or '').strip() or 'dummy'
+                    if not base_url or not model:
+                        ui.notify('フィルタ用 LLM の Base URL と Model を入力してください．', type='warning')
+                        return False
 
-            ui.button('💾 ヨミ変換設定・辞書 (tts_filter.yaml) を保存', on_click=save_filter_configuration).props('dense outline color=emerald').classes('w-full')
+                    # 保存時にディスクから読み直し，既存の追加設定は削除しない．
+                    latest = load_tts_filter_config(TTS_FILTER_PATH) if TTS_FILTER_PATH.exists() else {}
+                    latest.setdefault('server', {}).update({
+                        'base_url': base_url,
+                        'api_key': api_key,
+                        'model': model,
+                    })
+                    latest.setdefault('generation', {})['temperature'] = float(filter_temp.value or 0)
+                    latest['dictionary'] = new_dict
+                    save_config(TTS_FILTER_PATH, latest)
+
+                    # 再読込によって実際に保存された接続先・モデルを検証する．
+                    saved = load_tts_filter_config(TTS_FILTER_PATH)
+                    if (saved.get('server', {}).get('base_url') != base_url or
+                            saved.get('server', {}).get('model') != model):
+                        raise RuntimeError('ヨミ変換LLM設定の保存内容が一致しません．')
+                    saved_filter_label.set_text(
+                        f'保存済み: {saved["server"]["model"]} / {saved["server"]["base_url"]}  '
+                        f'（{TTS_FILTER_PATH.resolve()}）'
+                    )
+                    ui.notify(f'tts_filter.yaml にLLM接続先・モデル・辞書 {len(new_dict)} 件を保存しました．', type='positive')
+                    return True
+                except Exception as err:
+                    ui.notify(f'tts_filter.yaml の保存に失敗しました: {err}', type='negative')
+                    return False
+
+            ui.button('💾 ヨミ変換設定・辞書 (tts_filter.yaml) を保存',
+                      on_click=lambda: save_filter_configuration()).props('dense outline color=emerald').classes('w-full')
+            saved_filter_label = ui.label(
+                f'保存済み: {server_cfg.get("model", "（未設定）")} / '
+                f'{server_cfg.get("base_url", "（未設定）")}  （{TTS_FILTER_PATH.resolve()}）'
+            ).classes('text-xs text-zinc-400 break-all')
 
     def refresh_settings(self) -> None:
         if not self.settings_container:
@@ -3358,7 +3566,7 @@ class SlideNarratorApp:
                 ui.label('システム設定').classes('text-h4 font-bold')
 
             llm_base, llm_key, llm_model, llm_temp = self._build_llm_settings()
-            (ja_base, ja_key, ja_model, ja_voice), (en_base, en_key, en_model, en_voice) = self._build_tts_settings()
+            (ja_base, ja_key, ja_model, ja_voice, ja_limit), (en_base, en_key, en_model, en_voice, en_limit) = self._build_tts_settings()
 
             def save_main_config() -> None:
                 self.cfg['llm']['base_url'] = (llm_base.value or '').strip()
@@ -3371,6 +3579,7 @@ class SlideNarratorApp:
                     'model': (str(ja_model.value) if ja_model.value is not None else '').strip(),
                     'voice': (str(ja_voice.value) if ja_voice.value is not None else '').strip(),
                     'response_format': 'mp3',
+                    'max_input_chars': int(ja_limit.value or 0),
                 }
                 self.cfg['tts']['en'] = {
                     'base_url': (en_base.value or '').strip(),
@@ -3378,6 +3587,7 @@ class SlideNarratorApp:
                     'model': (str(en_model.value) if en_model.value is not None else '').strip(),
                     'voice': (str(en_voice.value) if en_voice.value is not None else '').strip(),
                     'response_format': 'mp3',
+                    'max_input_words': int(en_limit.value or 0),
                 }
                 save_config(CONFIG_PATH, self.cfg)
                 ui.notify('config.yaml を保存しました．', type='positive')

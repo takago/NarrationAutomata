@@ -16,6 +16,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -73,6 +74,26 @@ DEFAULT_SYSTEM_PROMPT_TEMPLATE = """# 日本語TTS用 技術表記読み変換�
 - `ptr` → ポインタ
 - ※意味が特定・推測できない場合は、無理な創作は避ける。
 
+### 識別子・ファイル名のアンダースコア `_`
+- 関数名，変数名，ファイル名などに含まれる `_` は，通常の読み上げでは発音しない。「アンダースコア」「アンダーバー」「下線」などと読まない。
+- `_` で区切られた各部分を自然につなげて読む。語の境界が分かりにくい場合は軽く区切ってよいが，記号名を補わない。
+- `pthread_create()` → 「ピースレッド クリエート」
+- `pthread_detach()` → 「ピースレッド デタッチ」
+- `thread_id` → 「スレッド アイディー」
+- `hello_world.c` → 「ハロー ワールド ドット シー」
+- `get_user_name()` → 「ゲット ユーザー ネーム」
+- ただし，アンダースコアという記号そのものの名称や入力手順を説明する文章（例：「アンダースコアを入力する」）では，その説明を維持する。識別子やパスの綴りを明示する説明では必要に応じて記号名を読む。
+
+### 関数名・メソッド名の丸括弧 `()`
+- 関数名やメソッド名の直後に付く空の丸括弧 `()` は，通常の講義ナレーションでは発音しない。「かっこ」「丸括弧」「開き括弧」「閉じ括弧」などを補わない。
+- `hello()` → 「ハロー」
+- `pthread_create()` → 「ピースレッド クリエート」
+- `get_user_name()` → 「ゲット ユーザー ネーム」
+- `main()` → 「メイン」
+- 引数がある関数呼び出しも，関数名について話しているだけなら括弧は読まず，必要な場合だけ引数の意味を自然に説明する。
+- ただし，`()` という記号自体，空の引数リスト，関数呼び出しの構文，入力すべき正確なコードを説明しているときは，括弧があることを必要に応じて言葉で説明してよい。
+- 関数名以外の丸括弧（数式のグループ化など）は文脈で判断する。すべての括弧を機械的に削除しない。
+
 ### UNIX / Linux パス
 スラッシュを機械的に読まず、階層や慣用的な呼び方に基づいて読む。
 - `/usr/bin` → ユーザービン
@@ -100,11 +121,23 @@ DEFAULT_SYSTEM_PROMPT_TEMPLATE = """# 日本語TTS用 技術表記読み変換�
 
 ### プログラム記号・演算子
 記号名を機械的に発音せず、構文上の役割や意味に合わせて読む。
-- **プリプロセッサ / コメント**:
-  - `#include` → インクルード
-  - `#define` → デファイン
-  - `# comment` → （# は読まない）
-  - `#123` → ナンバー123
+- **アスタリスク `*`**:
+  - C言語などのポインタ宣言・間接参照を説明し，記号自体を読む必要がある場合は「アスター」と読む。「アスタリスク」「スター」とはしない。
+  - `int *ptr` → 「イント アスター ポインタ」（宣言を読み上げる場合）
+  - `*ptr` → 「アスター ポインタ」（式を記号どおり読む場合）
+  - ただし乗算の `a * b` は「エー かける ビー」など，計算の意味に合わせて読む。Markdownの強調用 `*` は読まない。
+- **シャープ `#`**:
+  - 記号そのものを読む必要があるときは「シャープ」と読む。「ハッシュ」とはしない。
+  - `#include` → インクルード（慣用表現では記号を省略）
+  - `#define` → デファイン（慣用表現では記号を省略）
+  - `# comment` → （コメント記号として機能するなら # は読まない）
+  - `#123` → ナンバー123（番号を表す場合）
+  - 記号を説明する文脈の `#` → シャープ
+- **感嘆符 `!`**:
+  - 文字列リテラル内で感嘆符そのものを説明・読み上げる場合は「感嘆符」と読む。「エクスクラメーションマーク」等の長い名称は避ける。
+  - `"Hello!"` を文字と記号として読む場合 → 「ハロー 感嘆符」
+  - 普通の文章の末尾にある `!` は「感嘆符」と付け足さず，自然な抑揚で読む。
+  - `!=` は比較演算子なので「等しくない」などと読み，感嘆符とは読まない。論理否定の `!flag` は「フラグではない」など文脈に合わせる。
 - **演算子・式**:
   - `ptr != NULL` → 「ポインタがヌルではない」
   - `a == b` → 「エーとビーが等しい」
@@ -133,7 +166,18 @@ DEFAULT_SYSTEM_PROMPT_TEMPLATE = """# 日本語TTS用 技術表記読み変換�
 
 ---
 
-## 5. 出力フォーマット
+## 5. 絶対に守る編集範囲
+
+- これは「文章の読み変換」であり，「全文のひらがな化」でも「文章の書き直し」でもない。
+- 変更するのは英字の技術語，コマンド，識別子，パス，読み間違えやすい専門表記など，発音の修正が必要な部分だけ。
+- 漢字を含む自然な日本語の部分は，一文字も変更しない。例：「関数の中身は」「共有変数を増やして」「処理を繰り返します」はそのまま残す。
+- 文章を要約しない。文の数，並び，数字，情報量を維持する。
+- 変換する箇所が見つからない文章は，原文をそのまま返す。
+- 出力前に原文と照らし合わせ，日本語本文の漢字がひらがなに置き換わっていないか確認する。
+- 記号は一律置換しない。`_`，`*`，`#`，`!` は，識別子・ポインタ・プリプロセッサ・文字列・演算子・装飾などの役割を見分けて読み分ける。
+- 発音に必要な変換以外の単語や文意，数字，コードの動作説明を変更しない。
+
+## 6. 出力フォーマット
 
 - **変換後の文章のみ**をプレーンテキストで出力すること。
 - Markdown記号や説明文、引用コードブロックは一切含めないこと。"""
@@ -202,6 +246,27 @@ def make_client(config: dict) -> OpenAI:
     )
 
 
+def _kanji_count(text: str) -> int:
+    return len(re.findall(r"[\u3400-\u9fff]", text))
+
+
+def _suspicious_change(original: str, converted: str) -> str | None:
+    """危険な全文ひらがな化や欠落を検出する．誤検出を避けて保守的に判定．"""
+    if not converted.strip():
+        return "空の出力"
+    orig_n = len(original.strip())
+    result_n = len(converted.strip())
+    if orig_n >= 40 and result_n < orig_n * 0.58:
+        return "出力が極端に短い"
+    if orig_n >= 40 and result_n > orig_n * 2.0:
+        return "出力が極端に長い"
+    before = _kanji_count(original)
+    after = _kanji_count(converted)
+    if before >= 8 and after < before * 0.65:
+        return "漢字が大幅に減少（過剰なひらがな化の疑い）"
+    return None
+
+
 def transform(
     client: OpenAI,
     model: str,
@@ -209,70 +274,64 @@ def transform(
     text: str,
     generation: dict,
 ) -> str:
-    """入力文章をLLMでTTS向けに変換する．"""
-
+    """一つの段落を変換し，異常時に厳格な指示で再試行する．"""
     if not text.strip():
         return text
+    leading = text[:len(text) - len(text.lstrip())]
+    trailing = text[len(text.rstrip()):]
+    core_text = text.strip()
 
-    kwargs = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": text,
-            },
-        ],
-        "extra_body": {
-            "reasoning_effort" : "none",
+    def request(strict: bool) -> str:
+        messages = [{"role": "system", "content": system_prompt}]
+        if strict:
+            messages.append({"role": "system", "content": (
+                "前回の変換は本文保持に失敗しました。漢字のひらがな化・"
+                "省略・言い換えを禁止します。日本語の文は原文のまま残し，"
+                "英字・技術表記の読みが必要な箇所だけを変換してください。"
+                "変換後の本文だけを出力してください。"
+            )})
+        messages.append({"role": "user", "content": core_text})
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "extra_body": {"reasoning_effort": "none"},
         }
-    }
+        for key in ("temperature", "max_tokens", "top_p", "seed"):
+            if key in generation:
+                kwargs[key] = generation[key]
+        response = client.chat.completions.create(**kwargs)
+        choice = response.choices[0]
+        result = choice.message.content
+        if result is None:
+            raise RuntimeError("LLMから空の応答が返されました．")
+        if choice.finish_reason == "length":
+            raise RuntimeError("LLMの出力が上限に達して打ち切られました．")
+        return result.strip()
 
-    if "temperature" in generation:
-        kwargs["temperature"] = generation["temperature"]
-
-    if "max_tokens" in generation:
-        kwargs["max_tokens"] = generation["max_tokens"]
-
-    if "top_p" in generation:
-        kwargs["top_p"] = generation["top_p"]
-
-    if "seed" in generation:
-        kwargs["seed"] = generation["seed"]
-
-    response = client.chat.completions.create(**kwargs)
-
-    result = response.choices[0].message.content
-
-    if result is None:
-        raise RuntimeError("LLMから空の応答が返されました．")
-
-    return result.strip()
+    last_reason = ""
+    for attempt in range(2):
+        result = request(strict=attempt > 0)
+        last_reason = _suspicious_change(core_text, result) or ""
+        if not last_reason:
+            return leading + result + trailing
+        print(f"[TTS_FILTER WARN] 変換異常（試行{attempt+1}）: {last_reason}", file=sys.stderr)
+    # 過剰変換されたテキストを音声合成へ渡さない．
+    print(f"[TTS_FILTER WARN] 再試行後も異常のため原文を保持: {last_reason}", file=sys.stderr)
+    return text
 
 
 def split_paragraphs(text: str) -> list[str]:
-    """
-    空行を単位として文章を分割する．
-
-    長大な文章を一度にLLMへ渡さないための簡単な分割．
-    """
+    """空行を単位として文章を分割する（従来仕様）．"""
     paragraphs = []
     current = []
-
     for line in text.splitlines():
         if line.strip():
             current.append(line)
-        else:
-            if current:
-                paragraphs.append("\n".join(current))
-                current = []
-
+        elif current:
+            paragraphs.append("\n".join(current))
+            current = []
     if current:
         paragraphs.append("\n".join(current))
-
     return paragraphs
 
 
@@ -283,25 +342,13 @@ def transform_text(
     text: str,
     generation: dict,
 ) -> str:
-    """文章全体を段落単位で変換する．"""
-
+    """空行で区切った段落ごとに変換し，段落内部は分割しない．"""
     paragraphs = split_paragraphs(text)
-
     if not paragraphs:
         return text
-
     converted = []
-
     for paragraph in paragraphs:
-        result = transform(
-            client=client,
-            model=model,
-            system_prompt=system_prompt,
-            text=paragraph,
-            generation=generation,
-        )
-        converted.append(result)
-
+        converted.append(transform(client, model, system_prompt, paragraph, generation))
     return "\n\n".join(converted)
 
 

@@ -1476,6 +1476,62 @@ def generate_alignments(
         atomic_write_text(align_out, json.dumps(align_data, ensure_ascii=False, indent=2))
 
 
+def tts_input_length(text: str, lang: str) -> int:
+    """TTS上限に対する入力長（日本語は改行を除く文字数，英語は空白区切り単語数）．"""
+    return len(text.replace("\r", "").replace("\n", "")) if lang == "ja" else len(text.split())
+
+
+def tts_text_stats(text: str, lang: str, limit: int = 0) -> dict:
+    """編集画面と音声合成で共通の分割計画・統計を返す．"""
+    paragraphs = [p.strip() for p in re.split(r"\n[ \t]*\n+", text.strip()) if p.strip()]
+    try:
+        chunks = split_tts_text(text, lang, limit)
+        error = ""
+    except ValueError as exc:
+        chunks = []
+        error = str(exc)
+    return {
+        "characters": len(text.replace("\r", "").replace("\n", "")),
+        "words": len(text.split()),
+        "paragraphs": len(paragraphs),
+        "chunks": len(chunks),
+        "error": error,
+    }
+
+
+def split_tts_text(text: str, lang: str, limit: int) -> list[str]:
+    """設定上限の80%を目標として空行区切りの段落をまとめる．段落内部は分割しない．
+
+    1段落が目標を超えても設定上限内なら単独送信し，上限超過なら明示的に失敗する．
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if limit <= 0:
+        return [text]
+    target = max(1, int(limit * 0.8))
+    paragraphs = [p.strip() for p in re.split(r"\n[ \t]*\n+", text) if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    for index, paragraph in enumerate(paragraphs, 1):
+        size = tts_input_length(paragraph, lang)
+        if size > limit:
+            unit = "文字" if lang == "ja" else "単語"
+            raise ValueError(
+                f"TTS入力上限を超える段落があります（段落{index}: {size}{unit}，設定上限: {limit}{unit}）．"
+                "原稿に空行を追加するか，上限設定を見直してください．"
+            )
+        joined = current + "\n\n" + paragraph if current else paragraph
+        if current and tts_input_length(joined, lang) > target:
+            chunks.append(current)
+            current = paragraph
+        else:
+            current = joined
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def generate_tts(
     text_path: Path,
     out_path: Path,
@@ -1490,25 +1546,46 @@ def generate_tts(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     temp_out = out_path.with_name(f".{out_path.stem}.tmp.mp3")
-
+    # 音声と同じページ番号で，実際にTTSへ送信したヨミ変換後テキストを残す．
+    tts_text_path = out_path.with_name(f"{out_path.stem}_tts.txt")
+    parts: list[Path] = []
+    concat_list = out_path.with_name(f".{out_path.stem}.concat.txt")
     try:
         client = make_client(tts_cfg)
         raw_text = text_path.read_text(encoding="utf-8").strip()
-
         tts_text = apply_tts_filter(raw_text, filter_config_path) if lang == "ja" else raw_text
-
-        response = client.audio.speech.create(
-            model=tts_cfg["model"],
-            voice=tts_cfg["voice"],
-            input=tts_text,
-            response_format=tts_cfg.get("response_format", "mp3"),
-        )
-        response.write_to_file(temp_out)
+        limit_key = "max_input_chars" if lang == "ja" else "max_input_words"
+        limit = max(0, int(tts_cfg.get(limit_key) or 0))
+        chunks = split_tts_text(tts_text, lang, limit)
+        if not chunks:
+            raise ValueError("TTSの入力テキストが空です")
+        for i, chunk in enumerate(chunks, 1):
+            part = out_path.with_name(f".{out_path.stem}.part{i:04d}.mp3") if len(chunks) > 1 else temp_out
+            parts.append(part)
+            response = client.audio.speech.create(
+                model=tts_cfg["model"], voice=tts_cfg["voice"], input=chunk,
+                response_format="mp3",
+            )
+            response.write_to_file(part)
+            print(f"[TTS:{lang}] part {i}/{len(chunks)} ({len(chunk)} chars, {len(chunk.split())} words)")
+        if len(parts) > 1:
+            # concat demuxer によるストリームコピー．途中ファイルはすべて一時ファイル．
+            concat_list.write_text("".join(f"file '{part.name}'\n" for part in parts), encoding="utf-8")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+                            "-i", str(concat_list), "-c", "copy", str(temp_out)], check=True)
+        # 全チャンクの合成と連結が成功してから，完成MP3と対応する入力文を保存する．
+        # 段落区切りは維持し，分割TTS時も送信した順序で記録する．
+        # 失敗時には以前の正常な音声・入力記録を残す．
+        tts_input_record = "\n\n".join(chunks)
         temp_out.replace(out_path)
+        atomic_write_text(tts_text_path, tts_input_record)
         print(f"[TTS:{lang}] {out_path}")
+        print(f"[TTS:{lang}] input text: {tts_text_path} ({len(chunks)} chunk(s))")
     finally:
-        if temp_out.exists():
-            temp_out.unlink()
+        for part in parts:
+            part.unlink(missing_ok=True)
+        temp_out.unlink(missing_ok=True)
+        concat_list.unlink(missing_ok=True)
 
 
 def generate_page_video(
