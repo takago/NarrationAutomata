@@ -632,6 +632,7 @@ class SlideNarratorApp:
         self.cancellation_requested = False
         self._loaded_log_text: str | None = None
         self._restore_started = False
+        self._active_tab = 'gallery'
         self._refresh_debounce_task: asyncio.Task | None = None
 
         # UI ウィジェット参照
@@ -644,6 +645,10 @@ class SlideNarratorApp:
         self.simple_edit_container = None
         self.edit_container = None
         self.slide_video_gallery = None
+        self._slide_play_buttons: dict[int, Any] = {}
+        self._gallery_video_signatures: dict[int, tuple | None] = {}
+        self._last_gallery_video_check = 0.0
+        self._video_dialog = None
         # 差分更新対象の画面部品．ブラウザ接続ごとに独立して保持する．
         self._simple_cards: dict[int, Any] = {}
         self._simple_grid = None
@@ -873,6 +878,21 @@ class SlideNarratorApp:
         self._detail_signatures.clear()
         self._final_video_signature = None
 
+    def poll_visible_outputs(self) -> None:
+        """2秒ごとのファイル監視は，表示中タブの必要な出力に限定する．"""
+        if not self.paths or not self.pdf:
+            return
+        if self._active_tab == 'gallery':
+            if time.monotonic() - self._last_gallery_video_check >= 6.0:
+                self._refresh_gallery_video_buttons()
+                self._last_gallery_video_check = time.monotonic()
+            self._refresh_sidebar_final_video_if_changed()
+            return
+        if self._active_tab not in ('simple', 'detail'):
+            self._refresh_sidebar_final_video_if_changed()
+            return
+        self.poll_generated_outputs()
+
     def poll_generated_outputs(self) -> None:
         """生成物だけを差分反映する．既存の入力欄・再生中の動画には触れない．"""
         if not self.paths or not self.pdf:
@@ -884,7 +904,7 @@ class SlideNarratorApp:
             # プロジェクト切替時の全描画は既存の refresh_all が担当する．
             return
 
-        for page, textarea in list(self._simple_textareas.items()):
+        for page, textarea in (list(self._simple_textareas.items()) if self._active_tab == 'simple' else []):
             if not self._widget_available(textarea):
                 self._simple_textareas.pop(page, None)
                 continue
@@ -902,13 +922,7 @@ class SlideNarratorApp:
                 textarea.value = ''
             self._simple_text_signatures[page] = signature
 
-        if self._video_grid is not None and self._widget_available(self._video_grid):
-            for page in self.active_pages:
-                signature = self._file_signature(self.paths.video(page))
-                if signature != self._video_signatures.get(page) or page not in self._video_cards:
-                    self._replace_video_card(page, signature)
-
-        if self._widget_available(self.edit_container) and self.edit_page in self.active_pages:
+        if self._active_tab == 'detail' and self._widget_available(self.edit_container) and self.edit_page in self.active_pages:
             page = self.edit_page
             current = {
                 'text': self._file_signature(self.paths.explanation(page)),
@@ -921,34 +935,59 @@ class SlideNarratorApp:
                     self.refresh_editor, '生成結果による詳細画面の更新'))
             self._detail_signatures = current
 
-        final_signature = self._file_signature(self.paths.final_video)
-        if final_signature != self._final_video_signature:
-            self._final_video_signature = final_signature
+        self._refresh_sidebar_final_video_if_changed()
+
+    def _refresh_sidebar_final_video_if_changed(self) -> None:
+        if not self.paths or not self._widget_available(self.final_video_container):
+            return
+        signature = self._file_signature(self.paths.final_video)
+        if signature != self._final_video_signature:
+            self._final_video_signature = signature
             background_tasks.create(self._safe_async_view_update(
                 self.refresh_final_video, '完成動画の差分更新'))
 
-    def _replace_video_card(self, page: int, signature: tuple | None = None) -> None:
-        """指定スライドのカードだけを置換．他の動画プレーヤーは保持する．"""
-        if not self.paths or self._video_grid is None:
+    def _refresh_gallery_video_buttons(self) -> None:
+        """動画プレーヤーを生成せず，単体動画の有無のみを差分反映する．"""
+        if not self.paths:
             return
-        card = self._video_cards.get(page)
-        if card is None or not self._widget_available(card):
-            with self._video_grid:
-                card = ui.card().classes('w-full p-3 gap-2 rounded-lg bg-zinc-800 border border-zinc-700 shadow-sm')
-            self._video_cards[page] = card
-        else:
-            card.clear()
-        with card:
-            video = self.paths.video(page)
-            img = self.paths.page_image(page)
-            if video.exists():
-                ui.video(file_url(video)).classes('w-full rounded shadow-sm')
-            else:
-                if img.exists():
-                    ui.image(file_url(img)).classes('w-full opacity-60 rounded shadow-sm')
-                ui.label('（単体動画 未生成）').classes('text-xs text-orange-400 font-medium')
-            ui.label(f'スライド {page}').classes('text-sm font-bold text-white self-center pt-1')
-        self._video_signatures[page] = signature if signature is not None else self._file_signature(self.paths.video(page))
+        for page, button in list(self._slide_play_buttons.items()):
+            if not self._widget_available(button):
+                self._slide_play_buttons.pop(page, None)
+                self._gallery_video_signatures.pop(page, None)
+                continue
+            signature = self._file_signature(self.paths.video(page))
+            if signature != self._gallery_video_signatures.get(page):
+                self._gallery_video_signatures[page] = signature
+                if signature is None:
+                    button.classes(add='hidden')
+                else:
+                    button.classes(remove='hidden')
+
+    def show_video_dialog(self, path: Path, title: str) -> None:
+        """動画は選択された1本だけ読み込む．閉じるとプレーヤーごと破棄する．"""
+        if not path.is_file():
+            safe_notify('動画ファイルが見つかりません．', type='warning')
+            self._refresh_gallery_video_buttons()
+            return
+        if self._video_dialog is not None:
+            try:
+                self._video_dialog.delete()
+            except Exception:
+                pass
+            self._video_dialog = None
+        dialog = ui.dialog()
+        self._video_dialog = dialog
+        with dialog, ui.card().classes('w-[90vw] max-w-5xl bg-zinc-900 text-white'):
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.label(title).classes('text-lg font-bold')
+                ui.button(icon='close', on_click=dialog.close).props('flat round dense color=white')
+            ui.video(file_url(path)).props('controls autoplay').classes('w-full rounded')
+        def cleanup(_=None) -> None:
+            if self._video_dialog is dialog:
+                self._video_dialog = None
+            dialog.delete()
+        dialog.on('hide', cleanup)
+        dialog.open()
 
     def refresh_job_status(self) -> None:
         """ポーリング時に画面上のボタン・進捗バー群を同期"""
@@ -1074,7 +1113,8 @@ class SlideNarratorApp:
         for button in self.main_action_buttons:
             self.set_button_enabled_visual(button, not (globally_busy or self.read_only))
 
-        self.refresh_history_log()
+        if self._active_tab == 'logs':
+            self.refresh_history_log()
 
     # --- プロジェクト / スライド選択管理 ---
 
@@ -1135,7 +1175,6 @@ class SlideNarratorApp:
         if refresh:
             # 選択操作ではデッキそのものを破棄しない．
             self._refresh_slide_card_states(changed_pages)
-            self._sync_video_selection()
             # 詳細エディタは一枚のみ表示するため，選択状態に応じて更新する．
             background_tasks.create(self._safe_async_view_update(
                 self.refresh_editor, '選択変更による詳細エディタの更新'))
@@ -1149,15 +1188,21 @@ class SlideNarratorApp:
         await self.refresh_gallery()
         await self.refresh_simple_editor()
         await self.refresh_editor()
-        await self.refresh_slide_videos()
 
     def debounce_refresh_views(self, stages: tuple[str, ...]) -> None:
         """画面全体の再構築はしない．各接続のタイマーで差分を検出する．"""
         self._safe_view_update(self.poll_generated_outputs, '生成結果の差分反映')
 
-    def refresh_output_views_on_tab_change(self) -> None:
-        self._safe_view_update(self.poll_generated_outputs, 'タブ切替時の差分更新')
-        self.refresh_history_log()
+    def refresh_output_views_on_tab_change(self, tab: str | None = None) -> None:
+        if tab is not None:
+            self._active_tab = tab
+        if self._active_tab in ('simple', 'detail'):
+            self._safe_view_update(self.poll_generated_outputs, 'タブ切替時の差分更新')
+        elif self._active_tab == 'gallery':
+            self._refresh_gallery_video_buttons()
+            self._refresh_sidebar_final_video_if_changed()
+        elif self._active_tab == 'logs':
+            self.refresh_history_log()
 
     # --- プロジェクト一覧・名前・削除 ---
 
@@ -1446,6 +1491,10 @@ class SlideNarratorApp:
             shutil.rmtree(project_dir, ignore_errors=True)
             ui.notify(f'プロジェクトの作成に失敗しました: {exc}', type='negative')
             self.refresh_project_list()
+
+    async def _initial_restore(self) -> None:
+        """最後に開いていたプロジェクトを復元する．"""
+        await self.restore_last_project()
 
     async def restore_last_project(self) -> None:
         if self._restore_started:
@@ -2243,6 +2292,8 @@ class SlideNarratorApp:
             return
         self.gallery.clear()
         self._slide_cards.clear()
+        self._slide_play_buttons.clear()
+        self._gallery_video_signatures.clear()
         self._gallery_project_key = project_key
         if not self.images:
             self.gallery.add(ui.label('プレゼンテーションPDFを選択してください．'))
@@ -2278,6 +2329,18 @@ class SlideNarratorApp:
                                 f'スライド {n}', value=is_active,
                                 on_change=lambda e, page=n: self.toggle_slide_active(page, e.value),
                             ).props('dense dark color=blue').classes('text-white font-medium text-sm')
+                            video_path = self.paths.video(n) if self.paths else None
+                            video_exists = bool(video_path and video_path.is_file())
+                            play_button = ui.button(
+                                icon='play_circle',
+                                on_click=lambda _, page=n: self.show_video_dialog(
+                                    self.paths.video(page), f'スライド {page} の動画'),
+                            ).props('flat round dense color=positive').tooltip('このスライドの動画を再生')
+                            play_button.on('click.stop', lambda _: None)
+                            if not video_exists:
+                                play_button.classes(add='hidden')
+                            self._slide_play_buttons[n] = play_button
+                            self._gallery_video_signatures[n] = self._file_signature(video_path) if video_path else None
                             # チェックボックス操作がカードのクリックに伝播すると二重反転する．
                             cb.on('click.stop', lambda _: None)
                             if self.read_only:
@@ -2574,42 +2637,8 @@ class SlideNarratorApp:
 
                     self.register_main_action_button(ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2'))
 
-    def _sync_video_selection(self) -> None:
-        if self._video_grid is None or not self._widget_available(self._video_grid):
-            return
-        for page in list(self._video_cards):
-            if page not in self._selected_pages:
-                self._video_cards.pop(page).delete()
-                self._video_signatures.pop(page, None)
-        # 新規カードのみを指定位置に挿入する．再生中の動画は触れない．
-        for index, page in enumerate(self.active_pages):
-            if page not in self._video_cards:
-                self._replace_video_card(page)
-                self._video_cards[page].move(target_container=self._video_grid, target_index=index)
-
-    async def refresh_slide_videos(self) -> None:
-        if not self.slide_video_gallery:
-            return
-        project_key = str(self.pdf.resolve()) if self.pdf else None
-        if self._video_project_key == project_key and self._video_grid is not None and self._widget_available(self._video_grid):
-            self._sync_video_selection()
-            return
-        self.slide_video_gallery.clear()
-        self._video_cards.clear()
-        self._video_signatures.clear()
-        self._video_grid = None
-        self._video_project_key = project_key
-        if not self.paths:
-            with self.slide_video_gallery:
-                ui.label('プレゼンテーションPDFを選択してください．').classes('text-blue-500 dark:text-blue-400')
-            return
-        with self.slide_video_gallery:
-            self._video_grid = ui.grid(columns=4).classes('w-full gap-4')
-        for page in self.active_pages:
-            self._replace_video_card(page)
-
     async def refresh_final_video(self) -> None:
-        if not self.final_video_container:
+        if not self._widget_available(self.final_video_container):
             return
         self.final_video_container.clear()
         if not self.paths:
@@ -2619,14 +2648,13 @@ class SlideNarratorApp:
 
         final = self.paths.final_video
         with self.final_video_container:
-            if final.exists():
-                ui.video(file_url(final)).classes('w-full rounded shadow-md')
-                with ui.row().classes('w-full items-center justify-between pt-1'):
-                    ui.link(
-                        '🎬 動画 (MP4) をダウンロード',
+            if final.is_file():
+                ui.button('▶ 完成版ビデオを再生',
+                          on_click=lambda: self.show_video_dialog(final, '完成版ビデオ')) \
+                    .props('color=primary').classes('w-full')
+                ui.link('🎬 MP4をダウンロード',
                         '/download/' + final.resolve().relative_to(Path.cwd().resolve()).as_posix(),
-                        new_tab=True,
-                    ).classes('text-primary font-bold text-xs')
+                        new_tab=True).classes('text-primary font-bold text-xs')
             else:
                 ui.label('動画未生成').classes('text-xs text-zinc-500')
 
@@ -3461,7 +3489,7 @@ class SlideNarratorApp:
                 ui.label('閲覧モード：利用可能時間外のため編集・生成はできません．').classes('text-sm text-amber-400')
             ui.timer(2.0, self.refresh_job_status)
             ui.timer(2.0, lambda: self._safe_view_update(
-                self.poll_generated_outputs, '生成ファイルの差分同期'))
+                self.poll_visible_outputs, '表示タブの生成ファイル差分同期'))
 
             self.uploader = (
                 ui.upload(
@@ -3571,11 +3599,14 @@ class SlideNarratorApp:
             with ui.tabs().classes('w-full') as tabs:
                 self.tabs = tabs
                 tab_gallery = ui.tab('🖼 スライドデッキ')
+                self._tab_gallery = tab_gallery
                 if not self.read_only:
                     tab_simple_edit = ui.tab('📋 ナレーション修正（簡易）')
+                    self._tab_simple_edit = tab_simple_edit
                     tab_edit = ui.tab('📝 ナレーション修正（詳細）')
-                tab_slide_videos = ui.tab('🎞 ビデオデッキ')
+                    self._tab_edit = tab_edit
                 tab_logs = ui.tab('📜 ログ')
+                self._tab_logs = tab_logs
                 if is_admin and not self.read_only:
                     tab_settings = ui.tab('⚙ 設定')
                 if is_admin:
@@ -3584,16 +3615,13 @@ class SlideNarratorApp:
             with ui.tab_panels(tabs, value=tab_gallery).classes('w-full'):
                 with ui.tab_panel(tab_gallery):
                     ui.label('🖼️ スライドデッキ').classes('text-h5')
-                    self.gallery = ui.column().classes('w-full')
+                    self.gallery = ui.column().classes('w-full').props('id=slide-deck-gallery')
                 if not self.read_only:
                     with ui.tab_panel(tab_simple_edit):
                         ui.label('📋 ナレーション修正（簡易）').classes('text-h5')
                         self.simple_edit_container = ui.column().classes('w-full')
                     with ui.tab_panel(tab_edit):
                         self.edit_container = ui.column().classes('w-full')
-                with ui.tab_panel(tab_slide_videos):
-                    ui.label('🎞 ビデオデッキ').classes('text-h5')
-                    self.slide_video_gallery = ui.column().classes('w-full')
                 with ui.tab_panel(tab_logs):
                     with ui.row().classes('w-full items-center justify-between pb-2'):
                         ui.label('📜 実行ログ履歴').classes('text-h5')
@@ -3608,14 +3636,24 @@ class SlideNarratorApp:
                     with ui.tab_panel(tab_user_manage):
                         self.user_manage_container = ui.column().classes('w-full')
 
-            tabs.on_value_change(lambda e: self.refresh_output_views_on_tab_change())
+            def handle_tab_change(e) -> None:
+                mapping = {
+                    tab_gallery.name: 'gallery',
+                    tab_logs.name: 'logs',
+                }
+                if not self.read_only:
+                    mapping[tab_simple_edit.name] = 'simple'
+                    mapping[tab_edit.name] = 'detail'
+                self.refresh_output_views_on_tab_change(mapping.get(e.value, 'other'))
+
+            tabs.on_value_change(handle_tab_change)
 
         if is_admin and not self.read_only:
             self.refresh_settings()
         if is_admin:
             self.refresh_user_management()
 
-        background_tasks.create(self.restore_last_project())
+        background_tasks.create(self._initial_restore())
 
     # --- ユーザー入力イベント ---
 
