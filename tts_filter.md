@@ -1,135 +1,97 @@
-# `tts_filter.py` 内部仕様・解説ドキュメント
+# `tts_filter.py` ヨミ変換フィルタ解説
 
-## 1. 概要
+> この文書はGitHub公開版の `tts_filter.md` に記載された仕様を整理したものです．`app.py` と `slide_lecture.py` からの利用経路については，2026年10月11日の提供コードでも確認しています．
 
-`tts_filter.py` は、技術文書やコマンドライン操作ログなどのテキストを、音声合成（TTS: Text-to-Speech）エンジンが日本語として自然に発音できるよう前処理を行うためのフィルタリング・スクリプトです。
+## 1．目的
 
-OpenAI API 互換のエンドポイント（Ollama、vLLM、OpenWebUI、または OpenAI 公式など）を利用し、LLM に対して専門的な技術表記の読み替えプロンプトと辞書情報を与えることで、文脈に沿ったカタカナ化や読み下しを実現します。
+`tts_filter.py` は，日本語TTSに渡す技術用語・英語表記・識別子・コマンドなどを，LLMによって音声向けの読みへ変換する前処理プログラムです．**原文の意味や説明内容を改変することが目的ではありません**．
 
----
+たとえば `Linux`，`cnt`，`/usr/bin` など，文脈に依存して読み方が変わる文字列を対象とします．漢字・数字・単位などは必要以上に変換しない方針です．
 
-## 2. システム構成と動作の流れ
+## 2．処理の流れ
 
+```text
+入力文章（ファイルまたは標準入力）
+           │
+           ▼
+   段落ごとに分割
+           │
+           ▼
+  基本プロンプト＋YAML辞書
+           │
+           ▼
+  OpenAI互換Chat Completion API
+           │
+           ▼
+  変換結果を結合し出力
 ```
-[ 入力テキスト (標準入力 / ファイル) ]
-                 │
-                 ▼
-     [ split_paragraphs() ]  ──── 空行区切りで段落ごとに分割
-                 │
-                 ▼
-     [ build_system_prompt() ]  ── デフォルト埋め込みプロンプト
-                 │                 + YAMLの辞書 ({{DICTIONARY}})
-                 ▼
-        [ transform() ]  ──────── OpenAI互換 API (Chat Completion)
-                 │
-                 ▼
-[ 出力テキスト (標準出力 / ファイル) ]
-```
 
----
+使用するサーバは `tts_filter.yaml` の `server` で指定します．外部APIだけでなくローカルのOpenAI互換LLMサーバも利用できます．
 
-## 3. 主要コンポーネント・関数の解説
+## 3．主な関数
 
-### 3.1. 定数: `DEFAULT_SYSTEM_PROMPT_TEMPLATE`
-LLM に渡す基底システムプロンプトです。元々 YAML 側に定義されていた内容をスクリプト内に内包しており、以下の重要な制約・ルールが定義されています。
+| 関数 | 役割 |
+|---|---|
+| `load_config()` | `tts_filter.yaml` を読み込む |
+| `build_dictionary_text()` | 辞書項目をLLMが理解できる文字列に変換する |
+| `build_system_prompt()` | 基本変換ルールに辞書を組み込む |
+| `make_client()` | OpenAI互換APIクライアントを構築する |
+| `split_paragraphs()` | 入力を空行単位の段落へ分割する |
+| `transform()` | 1つの対象文章をLLMで変換する |
+| `transform_text()` | 文章全体を段落ごとに変換する |
+| `main()` | CLI引数の解析と入出力 |
 
-1. **基本方針・制約事項**: 原文の意味を変えない、解説や Markdown 装飾を出力せず本文のみ返す等の出力純度の担保。
-2. **参考辞書プレースホルダー (`{{DICTIONARY}}`)**: ユーザー定義辞書を展開するスロット。
-3. **カテゴリ別変換ルール**:
-   - 英字・略語（`GPU` → ジーピーユー、`Linux` → リナックス）
-   - 変数名・識別子（`cnt` → カウンタ、`ptr` → ポインタ）
-   - パス・コマンド（`/usr/bin` → ユーザービン、`ls -la` → エルエス，オプション エルエー）
-   - 演算子・記号（`a == b` → エーとビーが等しい、`p->next` → ポインタのネクスト）
-4. **対象外・フォーマット規約**: 漢字・ひらがな・数字・単位は元の表記を維持。
+GitHubの既存文書では，辞書展開用の `{{DICTIONARY}}` プレースホルダーと，`DEFAULT_SYSTEM_PROMPT_TEMPLATE` を利用する設計が説明されています．実際にプロンプトや辞書の形式を変更するときは，実行環境の `tts_filter.py` と `tts_filter.yaml` を合わせて確認してください．
 
----
+## 4．設定ファイル例
 
-### 3.2. 設定の読み込みとプロンプト構築
-
-#### `load_config(config_path: Path) -> dict`
-- YAML 設定ファイルを `yaml.safe_load` でパースします。
-- ファイルの存在確認およびトップレベルが辞書構造（マッピング）であるかを検証します。
-
-#### `build_dictionary_text(dictionary: dict) -> str`
-- YAML 内の `dictionary:` に定義されたキーバリューペアを展開し、以下のような LLM 用の箇条書きテキストに整形します。
-  ```text
-  - Linux → リナックス
-  - cnt → カウンタ
-  ```
-
-#### `build_system_prompt(config: dict) -> str`
-- YAML 側に `prompt:` の上書き設定があればそれを採用し、指定がなければ埋め込みの `DEFAULT_SYSTEM_PROMPT_TEMPLATE` を採用します。
-- プロンプト内の `{{DICTIONARY}}` 部分を `build_dictionary_text()` の生成結果で置換して最終的なシステムプロンプトを完成させます。
-
----
-
-### 3.3. API クライアント生成と変換処理
-
-#### `make_client(config: dict) -> OpenAI`
-- `openai.OpenAI` クライアントを初期化します。
-- YAML の `server.base_url` および `server.api_key` を読み取ります。
-  ※ ローカル LLM（Ollama や vLLM など）を利用する場合、`api_key` にダミー文字列（例: `"dummy"`）を指定して動作させることが可能です。
-
-#### `split_paragraphs(text: str) -> list[str]`
-- 入力テキストを「空行」単位で段落ごとに分割します。
-- **目的**: 巨大な文章を一度に API に投入すると、コンテキスト長制限の圧迫やハルシネーション（要約・省略・フォーマット崩れ）が発生しやすくなるため、適切な単位に切り分けます。
-
-#### `transform(client, model, system_prompt, text, generation) -> str`
-- 単一の段落テキストを LLM に渡し、変換結果を取得します。
-- `system` ロールに変換ルールと辞書、`user` ロールに対象段落をセットして Chat Completion API を呼び出します。
-- `generation` 辞書から `temperature`, `max_tokens`, `top_p`, `seed` などの推論パラメータを抽出して適用します（`temperature=0` に設定することで再現性とルールの厳格遵守を高めています）。
-
-#### `transform_text(client, model, system_prompt, text, generation) -> str`
-- 分割された全段落を順次 `transform()` で変換し、最終的に `\n\n` で再結合して 1 つのテキストにまとめます。
-
----
-
-### 3.4. エントリポイント (`main`)
-
-- コマンドライン引数をパースします（`argparse`）：
-  - `-c`, `--config`: 設定 YAML ファイルのパス（デフォルト: `tts_filter.yaml`）
-  - `-i`, `--input`: 変換対象の入力テキストファイル（未指定時は `sys.stdin` からパイプ入力）
-  - `-o`, `--output`: 変換結果の出力先ファイル（未指定時は `sys.stdout` へ出力）
-- 標準入出力に対応しているため、UNIX パイプライン（`cat text.txt | ./tts_filter.py | espeak-ng` 等）に容易に組み込める設計になっています。
-
----
-
-## 4. 設定ファイル (`tts_filter.yaml`) の役割
-
-プロンプトが Python スクリプト側に内包されたため、YAML 側は接続先と個別辞書のみをシンプルに管理できるようになっています。
+以下は設定構造の例です．接続先とモデル名は各環境に合わせて変更してください．
 
 ```yaml
 server:
-  base_url: https://your-llm-host:port/v1
+  base_url: http://localhost:11434/v1
   api_key: dummy
-  model: huihui_ai/Qwen3.8-abliterated:latest
+  model: your-model
 
 generation:
   temperature: 0
 
 dictionary:
-  Daisuke Takago: たかごう だいすけ
+  Linux: リナックス
   cnt: カウンタ
   ls: エルエス
-  # 固有表現や誤読しやすい用語を自由に追加可能
 ```
 
----
+辞書はLLMに読み方の参考情報を与えるものです．厳密な文字列置換を保証するものではなく，変換結果はモデルによって変わる可能性があります．
 
-## 5. 主な使用例
+## 5．CLI使用方法
 
-### ① ファイルからファイルへ変換
 ```bash
+# ファイルから読み，ファイルへ書く
 python3 tts_filter.py -i input.txt -o output.txt
+
+# 標準入力から変換
+printf 'Linux で cnt を確認します．\n' | python3 tts_filter.py
+
+# 設定ファイルを切り替える
+python3 tts_filter.py -c custom_tts_filter.yaml -i input.txt
 ```
 
-### ② パイプライン連携（標準入出力）
-```bash
-echo "ls -la を実行して cnt を確認してください。" | python3 tts_filter.py
-# 出力例: エルエス，オプション エルエー を実行して カウンタ を確認してください。
-```
+公開ドキュメントで案内されているオプションは `-c/--config`，`-i/--input`，`-o/--output` です．
 
-### ③ 設定ファイルを切り替えて実行
-```bash
-python3 tts_filter.py -c custom_config.yaml -i document.md
-```
+## 6．WebUIと動画生成との関係
+
+`slide_lecture.py` は日本語TTS処理の前に必要に応じて `apply_tts_filter()` を実行します．`app.py` の管理者向け「設定」画面には，`_build_dict_editor()` によるヨミ辞書の編集・テスト画面があります．
+
+ヨミ変換は **TTSに入力するための音声用テキスト** に対する前処理です．スライドに表示するナレーションや字幕の文字列を自動的に書き換えるものではありません．
+
+スライドの追加プロンプトは `project.json` の `slide_prompts` に保存される**ナレーション生成の指示**であり，`tts_filter.yaml` に保存する**ヨミ辞書**とは目的が異なります．
+
+## 7．テストと注意点
+
+- 同じ用語でも文脈により適切な読みが異なるため，変更後は実際のナレーション文章を使って試してください．
+- `#` や演算子・パス・コマンドオプションなどは，意図しない読みへ変換されることがあります．
+- 辞書を変更しただけでは生成済みMP3の音声は変わりません．必要なページのTTSを再生成してください．
+- プライベートな資料を扱う場合，LLM/TTSのAPI接続先とデータの扱いを確認してください．
+
+詳細なプロンプト実装を改変する場合は，`tts_filter.py` の現在の定数・関数定義を必ず確認し，既存の変換ルールを不用意に簡略化しないでください．
