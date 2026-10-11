@@ -633,6 +633,10 @@ class SlideNarratorApp:
         self._loaded_log_text: str | None = None
         self._restore_started = False
         self._active_tab = 'gallery'
+        self._simple_page = 0
+        self._simple_page_size = 40
+        self._simple_refresh_task = None
+        self._detail_refresh_task = None
         self._refresh_debounce_task: asyncio.Task | None = None
 
         # UI ウィジェット参照
@@ -642,6 +646,12 @@ class SlideNarratorApp:
         self.gallery = None
         self._slide_cards: dict[int, tuple[Any, Any, Any]] = {}
         self._gallery_project_key: str | None = None
+        self._gallery_selected_only = False
+        self._gallery_page = 0
+        self._gallery_page_size = 40
+        self._gallery_page_label = None
+        self._gallery_render_key = None
+        self._gallery_filter_label = None
         self.simple_edit_container = None
         self.edit_container = None
         self.slide_video_gallery = None
@@ -1175,28 +1185,56 @@ class SlideNarratorApp:
         if refresh:
             # 選択操作ではデッキそのものを破棄しない．
             self._refresh_slide_card_states(changed_pages)
+            self._refresh_gallery_filter(changed_pages)
             # 詳細エディタは一枚のみ表示するため，選択状態に応じて更新する．
             background_tasks.create(self._safe_async_view_update(
                 self.refresh_editor, '選択変更による詳細エディタの更新'))
             # 簡易編集画面は，既存の入力欄を保持して差分更新する．
-            self._sync_simple_editor_selection()
+            if self._active_tab == 'simple':
+                self._schedule_editor_tab_refresh('simple')
+            else:
+                self._simple_cards.clear()
+                self._simple_textareas.clear()
+                self._simple_text_signatures.clear()
 
     def request_views_refresh(self) -> None:
         background_tasks.create(self._safe_async_view_update(self.refresh_views, '全画面の再描画'), name=f'refresh-{self.username}')
 
     async def refresh_views(self) -> None:
         await self.refresh_gallery()
-        await self.refresh_simple_editor()
-        await self.refresh_editor()
+        # 非表示タブに数百個の入力欄を一括生成しない．
+        if self._active_tab == 'simple':
+            await self.refresh_simple_editor()
+        elif self._active_tab == 'detail':
+            await self.refresh_editor()
 
     def debounce_refresh_views(self, stages: tuple[str, ...]) -> None:
         """画面全体の再構築はしない．各接続のタイマーで差分を検出する．"""
         self._safe_view_update(self.poll_generated_outputs, '生成結果の差分反映')
 
+    def _schedule_editor_tab_refresh(self, tab: str) -> None:
+        """非表示タブを遅延生成する．同じタブの多重描画は避ける．"""
+        if tab == 'simple':
+            if self._simple_refresh_task is None or self._simple_refresh_task.done():
+                self._simple_refresh_task = background_tasks.create(
+                    self._safe_async_view_update(self.refresh_simple_editor, '簡易編集タブの表示'),
+                    name='simple-editor-display')
+        elif tab == 'detail':
+            if self._detail_refresh_task is None or self._detail_refresh_task.done():
+                self._detail_refresh_task = background_tasks.create(
+                    self._safe_async_view_update(self.refresh_editor, '詳細編集タブの表示'),
+                    name='detail-editor-display')
+
     def refresh_output_views_on_tab_change(self, tab: str | None = None) -> None:
         if tab is not None:
             self._active_tab = tab
-        if self._active_tab in ('simple', 'detail'):
+        if self._active_tab == 'simple':
+            if not self._simple_cards:
+                self._schedule_editor_tab_refresh('simple')
+            self._safe_view_update(self.poll_generated_outputs, 'タブ切替時の差分更新')
+        elif self._active_tab == 'detail':
+            if not self._detail_signatures:
+                self._schedule_editor_tab_refresh('detail')
             self._safe_view_update(self.poll_generated_outputs, 'タブ切替時の差分更新')
         elif self._active_tab == 'gallery':
             self._refresh_gallery_video_buttons()
@@ -1332,6 +1370,8 @@ class SlideNarratorApp:
             self.pdf = target_pdf
             self.paths = ProjectPaths(target_pdf)
             self.proj_cfg = load_project_json(self.paths.root)
+            self._gallery_selected_only = self.proj_cfg.get('gallery_selected_only', False) is True
+            self._gallery_page = 0
             self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
             self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
             saved_vmode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'vlm')
@@ -1402,6 +1442,8 @@ class SlideNarratorApp:
                 self.paths = None
                 self.images = []
                 self.proj_cfg = {}
+                self._gallery_selected_only = False
+                self._gallery_page = 0
                 self.slide_visual_modes = {}
                 self._selected_pages.clear()
                 self.edit_page = None
@@ -1467,6 +1509,8 @@ class SlideNarratorApp:
             self.pdf = target_pdf
             self.paths = ProjectPaths(target_pdf)
             self.proj_cfg = load_project_json(self.paths.root)
+            self._gallery_selected_only = self.proj_cfg.get('gallery_selected_only', False) is True
+            self._gallery_page = 0
             self.proj_cfg.setdefault('project_name', target_pdf.stem)
             self.proj_cfg['project_id'] = project_id
             self.proj_cfg['source_pdf'] = filename
@@ -2283,33 +2327,98 @@ class SlideNarratorApp:
             if checkbox.value != selected:
                 checkbox.set_value(selected)
 
+    def _gallery_page_numbers(self) -> list[int]:
+        if self._gallery_selected_only:
+            return [p for p in range(1, len(self.images) + 1) if p in self._selected_pages]
+        return list(range(1, len(self.images) + 1))
+
+    def _set_gallery_selected_only(self, enabled: bool) -> None:
+        """対象を絞り，最初の40枚から描画する．選択状態は変更しない．"""
+        enabled = bool(enabled)
+        if self._gallery_selected_only == enabled:
+            return
+        self._gallery_selected_only = enabled
+        self._gallery_page = 0
+        if self.paths is not None:
+            try:
+                # 表示設定だけを保存し，生成対象や成果物には影響させない．
+                project = load_project_json(self.paths.root)
+                project['gallery_selected_only'] = enabled
+                save_project_json(self.paths.root, project)
+                self.proj_cfg['gallery_selected_only'] = enabled
+            except Exception:
+                LOGGER.exception('スライドデッキ表示設定の保存に失敗しました')
+                safe_notify('表示設定を保存できませんでした．', type='warning')
+        background_tasks.create(self.refresh_gallery())
+
+    def _set_gallery_page(self, page: int) -> None:
+        numbers = self._gallery_page_numbers()
+        last = max(0, (len(numbers) - 1) // self._gallery_page_size)
+        next_page = max(0, min(page, last))
+        if next_page == self._gallery_page:
+            return
+        self._gallery_page = next_page
+        background_tasks.create(self.refresh_gallery())
+
+    def _refresh_gallery_filter(self, changed_pages: set[int] | None = None) -> None:
+        """表示件数を更新する．選択対象限定中は現在ページだけ再描画する．"""
+        if self._gallery_selected_only:
+            background_tasks.create(self.refresh_gallery())
+        elif self._gallery_filter_label is not None and self._widget_available(self._gallery_filter_label):
+            self._gallery_filter_label.text = (f'全 {self.total_slides} スライド' + (f'（{self._gallery_page_size}枚ずつ表示）' if self.total_slides > self._gallery_page_size else ''))
+
     async def refresh_gallery(self) -> None:
         if not self.gallery:
             return
         project_key = str(self.pdf.resolve()) if self.pdf else None
-        if self._gallery_project_key == project_key and len(self._slide_cards) == len(self.images):
+        if self._gallery_project_key != project_key:
+            self._gallery_page = 0
+            self._gallery_project_key = project_key
+        numbers = self._gallery_page_numbers()
+        max_page = max(0, (len(numbers) - 1) // self._gallery_page_size)
+        self._gallery_page = min(self._gallery_page, max_page)
+        offset = self._gallery_page * self._gallery_page_size
+        visible = numbers[offset:offset + self._gallery_page_size]
+        render_key = (project_key, self._gallery_selected_only, self._gallery_page, tuple(visible))
+        if self._gallery_render_key == render_key and len(self._slide_cards) == len(visible):
             self._refresh_slide_card_states()
             return
         self.gallery.clear()
+        self._gallery_filter_label = None
         self._slide_cards.clear()
         self._slide_play_buttons.clear()
         self._gallery_video_signatures.clear()
-        self._gallery_project_key = project_key
+        self._gallery_render_key = render_key
         if not self.images:
-            self.gallery.add(ui.label('プレゼンテーションPDFを選択してください．'))
+            with self.gallery:
+                ui.label('プレゼンテーションPDFを選択してください．')
             return
 
         with self.gallery:
-            with ui.row().classes('w-full items-center justify-between pb-2'):
-                desc = f'全 {self.total_slides} スライド' + ('（閲覧モード）' if self.read_only else '（カードをクリックまたはチェックボックスで対象を切り替えられます）')
-                ui.label(desc).classes('text-sm text-gray-500 dark:text-gray-400')
+            with ui.row().classes('w-full items-center justify-between gap-4 pb-2'):
+                with ui.row().classes('items-center gap-6'):
+                    self._gallery_filter_label = ui.label(
+                        f'全 {self.total_slides} スライド' +
+                        (f'（{self._gallery_page_size}枚ずつ表示）'
+                         if self.total_slides > self._gallery_page_size else '')
+                    ).classes('text-sm text-gray-400')
+                    ui.switch('ビデオ化対象のみ表示', value=self._gallery_selected_only,
+                              on_change=lambda e: self._set_gallery_selected_only(e.value)).props('color=blue')
                 if not self.read_only:
-                    with ui.row().classes('gap-2'):
-                        self.register_main_action_button(ui.button('全スライドを選択', on_click=self.select_all_slides).props('dense outline size=sm'))
-                        self.register_main_action_button(ui.button('すべて解除', on_click=self.clear_all_slides).props('dense outline size=sm color=negative'))
-
+                    with ui.row().classes('items-center gap-2'):
+                        ui.button('全スライドを選択', on_click=self.select_all_slides).props('dense outline size=sm')
+                        ui.button('すべて解除', on_click=self.clear_all_slides).props('dense outline size=sm color=negative')
+            if len(numbers) > self._gallery_page_size:
+                with ui.row().classes('w-full items-center justify-center gap-3 pb-3'):
+                    ui.button('◀ 前の40枚', on_click=lambda: self._set_gallery_page(self._gallery_page - 1)).props(
+                        'dense outline color=primary' + (' disable' if self._gallery_page == 0 else ''))
+                    ui.label(f'{offset + 1 if visible else 0}–{offset + len(visible)} / {len(numbers)} 枚　'
+                             f'（{self._gallery_page + 1} / {max_page + 1} ページ）').classes('text-sm text-gray-300')
+                    ui.button('次の40枚 ▶', on_click=lambda: self._set_gallery_page(self._gallery_page + 1)).props(
+                        'dense outline color=primary' + (' disable' if self._gallery_page >= max_page else ''))
             with ui.grid(columns=5).classes('w-full gap-4'):
-                for n, img in enumerate(self.images, 1):
+                for n in visible:
+                    img = self.images[n - 1]
                     is_active = n in self._selected_pages
                     card_cls = 'w-full cursor-pointer transition-all border p-3 rounded-lg gap-2 bg-zinc-800 border-zinc-700 shadow-sm '
                     img_cls = 'w-full rounded shadow-sm'
@@ -2318,17 +2427,15 @@ class SlideNarratorApp:
                         img_cls += ' grayscale'
                     if self.read_only:
                         card_cls = card_cls.replace('cursor-pointer', 'cursor-default')
-
                     card = ui.card().classes(card_cls)
                     with card:
                         if not self.read_only:
                             card.on('click', lambda _, page=n: self.toggle_slide_active(page, page not in self._selected_pages))
                         image = ui.image(file_url(img)).classes(img_cls)
                         with ui.row().classes('w-full items-center justify-between pt-1'):
-                            cb = ui.checkbox(
-                                f'スライド {n}', value=is_active,
-                                on_change=lambda e, page=n: self.toggle_slide_active(page, e.value),
-                            ).props('dense dark color=blue').classes('text-white font-medium text-sm')
+                            cb = ui.checkbox(f'スライド {n}', value=is_active,
+                                             on_change=lambda e, page=n: self.toggle_slide_active(page, e.value),
+                                             ).props('dense dark color=blue').classes('text-white font-medium text-sm')
                             video_path = self.paths.video(n) if self.paths else None
                             video_exists = bool(video_path and video_path.is_file())
                             play_button = ui.button(
@@ -2341,7 +2448,6 @@ class SlideNarratorApp:
                                 play_button.classes(add='hidden')
                             self._slide_play_buttons[n] = play_button
                             self._gallery_video_signatures[n] = self._file_signature(video_path) if video_path else None
-                            # チェックボックス操作がカードのクリックに伝播すると二重反転する．
                             cb.on('click.stop', lambda _: None)
                             if self.read_only:
                                 cb.disable()
@@ -2408,11 +2514,31 @@ class SlideNarratorApp:
             with self.simple_edit_container:
                 ui.label('⚠ 処理対象となるスライドがありません．「スライドデッキ」タブで対象スライドを選択してください．').classes('text-orange-500 dark:text-orange-400')
             return
+        pages = self.active_pages
+        max_page = max(0, (len(pages) - 1) // self._simple_page_size)
+        self._simple_page = min(self._simple_page, max_page)
+        offset = self._simple_page * self._simple_page_size
+        visible_pages = pages[offset:offset + self._simple_page_size]
         with self.simple_edit_container:
-            self._simple_count_label = ui.label(f'対象スライド一覧（全 {len(self.active_pages)} スライド）').classes('text-sm text-gray-400 pb-2')
+            self._simple_count_label = ui.label(f'対象スライド一覧（全 {len(pages)} スライド）').classes('text-sm text-gray-400 pb-2')
+            if len(pages) > self._simple_page_size:
+                with ui.row().classes('w-full items-center justify-center gap-3 pb-3'):
+                    ui.button('◀ 前の40枚', on_click=lambda: self._set_simple_page(self._simple_page - 1)).props(
+                        'dense outline color=primary' + (' disable' if self._simple_page == 0 else ''))
+                    ui.label(f'{offset + 1}–{offset + len(visible_pages)} / {len(pages)} 枚　'
+                             f'（{self._simple_page + 1} / {max_page + 1} ページ）')
+                    ui.button('次の40枚 ▶', on_click=lambda: self._set_simple_page(self._simple_page + 1)).props(
+                        'dense outline color=primary' + (' disable' if self._simple_page >= max_page else ''))
             self._simple_grid = ui.column().classes('w-full gap-6')
-        for p in self.active_pages:
+        for p in visible_pages:
             self._add_simple_editor_card(p)
+
+    def _set_simple_page(self, page: int) -> None:
+        max_page = max(0, (len(self.active_pages) - 1) // self._simple_page_size)
+        page = max(0, min(int(page), max_page))
+        if page != self._simple_page:
+            self._simple_page = page
+            self._schedule_editor_tab_refresh('simple')
 
     async def refresh_editor(self) -> None:
         if not self.edit_container:
@@ -3644,9 +3770,13 @@ class SlideNarratorApp:
                 if not self.read_only:
                     mapping[tab_simple_edit.name] = 'simple'
                     mapping[tab_edit.name] = 'detail'
-                self.refresh_output_views_on_tab_change(mapping.get(e.value, 'other'))
+                self.refresh_output_views_on_tab_change(mapping.get(getattr(e.value, 'name', e.value), 'other'))
 
             tabs.on_value_change(handle_tab_change)
+            # Quasar/NiceGUI の tab 値イベントを受け取れない場合にも編集画面を生成する．
+            if not self.read_only:
+                tab_simple_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('simple'))
+                tab_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('detail'))
 
         if is_admin and not self.read_only:
             self.refresh_settings()
