@@ -639,15 +639,21 @@ class SlideNarratorApp:
         self.history_log_widget = None
         self.tabs = None
         self.gallery = None
+        self._slide_cards: dict[int, tuple[Any, Any, Any]] = {}
+        self._gallery_project_key: str | None = None
         self.simple_edit_container = None
         self.edit_container = None
         self.slide_video_gallery = None
         # 差分更新対象の画面部品．ブラウザ接続ごとに独立して保持する．
+        self._simple_cards: dict[int, Any] = {}
+        self._simple_grid = None
+        self._simple_count_label = None
         self._simple_textareas: dict[int, Any] = {}
         self._simple_text_signatures: dict[int, tuple | None] = {}
         self._video_cards: dict[int, Any] = {}
         self._video_signatures: dict[int, tuple | None] = {}
         self._video_grid = None
+        self._video_project_key: str | None = None
         self._output_project_key: str | None = None
         self._detail_signatures: dict[str, tuple | None] = {}
         self._final_video_signature: tuple | None = None
@@ -1113,7 +1119,7 @@ class SlideNarratorApp:
             refresh=save_and_refresh,
         )
 
-    def _on_pages_updated(self, sync_input: bool = True, save: bool = True, refresh: bool = True) -> None:
+    def _on_pages_updated(self, sync_input: bool = True, save: bool = True, refresh: bool = True, changed_pages: set[int] | None = None) -> None:
         if self.edit_page not in self._selected_pages:
             self.edit_page = self.active_pages[0] if self.active_pages else None
 
@@ -1127,7 +1133,14 @@ class SlideNarratorApp:
             self.save_project_settings()
 
         if refresh:
-            self.request_views_refresh()
+            # 選択操作ではデッキそのものを破棄しない．
+            self._refresh_slide_card_states(changed_pages)
+            self._sync_video_selection()
+            # 詳細エディタは一枚のみ表示するため，選択状態に応じて更新する．
+            background_tasks.create(self._safe_async_view_update(
+                self.refresh_editor, '選択変更による詳細エディタの更新'))
+            # 簡易編集画面は，既存の入力欄を保持して差分更新する．
+            self._sync_simple_editor_selection()
 
     def request_views_refresh(self) -> None:
         background_tasks.create(self._safe_async_view_update(self.refresh_views, '全画面の再描画'), name=f'refresh-{self.username}')
@@ -1487,11 +1500,13 @@ class SlideNarratorApp:
     def toggle_slide_active(self, page_num: int, active: bool) -> None:
         if not self.write_access_allowed():
             return
+        if (page_num in self._selected_pages) == bool(active):
+            return
         if active:
             self._selected_pages.add(page_num)
         else:
             self._selected_pages.discard(page_num)
-        self._on_pages_updated(sync_input=True, save=True, refresh=True)
+        self._on_pages_updated(sync_input=True, save=True, refresh=True, changed_pages={page_num})
 
     def select_all_slides(self) -> None:
         if not self.write_access_allowed():
@@ -2199,10 +2214,36 @@ class SlideNarratorApp:
 
     # --- UI レンダリング: スライドデッキ / エディタ / ギャラリー ---
 
+    def _refresh_slide_card_states(self, changed_pages: set[int] | None = None) -> None:
+        """カードと画像を再生成せず，既存要素の選択状態だけ変更する．"""
+        pages = changed_pages if changed_pages is not None else set(self._slide_cards)
+        for page in pages:
+            refs = self._slide_cards.get(page)
+            if not refs:
+                continue
+            card, image, checkbox = refs
+            if not self._widget_available(card):
+                continue
+            selected = page in self._selected_pages
+            if selected:
+                card.classes(remove='opacity-40 hover:border-zinc-600')
+                image.classes(remove='grayscale')
+            else:
+                card.classes(add='opacity-40 hover:border-zinc-600')
+                image.classes(add='grayscale')
+            if checkbox.value != selected:
+                checkbox.set_value(selected)
+
     async def refresh_gallery(self) -> None:
         if not self.gallery:
             return
+        project_key = str(self.pdf.resolve()) if self.pdf else None
+        if self._gallery_project_key == project_key and len(self._slide_cards) == len(self.images):
+            self._refresh_slide_card_states()
+            return
         self.gallery.clear()
+        self._slide_cards.clear()
+        self._gallery_project_key = project_key
         if not self.images:
             self.gallery.add(ui.label('プレゼンテーションPDFを選択してください．'))
             return
@@ -2230,66 +2271,85 @@ class SlideNarratorApp:
                     card = ui.card().classes(card_cls)
                     with card:
                         if not self.read_only:
-                            card.on('click', lambda _, page=n, cur=is_active: self.toggle_slide_active(page, not cur))
-                        ui.image(file_url(img)).classes(img_cls)
-
+                            card.on('click', lambda _, page=n: self.toggle_slide_active(page, page not in self._selected_pages))
+                        image = ui.image(file_url(img)).classes(img_cls)
                         with ui.row().classes('w-full items-center justify-between pt-1'):
                             cb = ui.checkbox(
-                                f'スライド {n}',
-                                value=is_active,
+                                f'スライド {n}', value=is_active,
                                 on_change=lambda e, page=n: self.toggle_slide_active(page, e.value),
                             ).props('dense dark color=blue').classes('text-white font-medium text-sm')
+                            # チェックボックス操作がカードのクリックに伝播すると二重反転する．
+                            cb.on('click.stop', lambda _: None)
                             if self.read_only:
                                 cb.disable()
+                    self._slide_cards[n] = (card, image, cb)
+
+    def _sync_simple_editor_selection(self) -> None:
+        if self._simple_grid is None or not self._widget_available(self._simple_grid) or not self.paths:
+            return
+        if self._simple_count_label is not None:
+            self._simple_count_label.text = f'対象スライド一覧（全 {len(self.active_pages)} スライド）'
+        for p in list(self._simple_cards):
+            if p not in self._selected_pages:
+                self._simple_cards.pop(p).delete()
+                self._simple_textareas.pop(p, None)
+                self._simple_text_signatures.pop(p, None)
+        for index, p in enumerate(self.active_pages):
+            if p not in self._simple_cards:
+                self._add_simple_editor_card(p)
+                self._simple_cards[p].move(target_container=self._simple_grid, target_index=index)
+
+    def _add_simple_editor_card(self, p: int) -> None:
+        if self._simple_grid is None or not self.paths:
+            return
+        img_path = self.paths.page_image(p)
+        txt_path = self.paths.explanation(p)
+        curr_txt = txt_path.read_text(encoding='utf-8') if txt_path.exists() else ''
+        with self._simple_grid:
+            card = ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-lg shadow-sm')
+            self._simple_cards[p] = card
+            with card:
+                with ui.row().classes('w-full items-start gap-4 flex-nowrap'):
+                    with ui.column().classes('w-72 shrink-0 items-center gap-1.5'):
+                        if img_path.exists():
+                            ui.image(file_url(img_path)).classes('w-full rounded border border-zinc-700 shadow-sm')
+                        else:
+                            ui.label('（スライド画像なし）').classes('text-xs text-zinc-500')
+                        ui.label(f'スライド {p}').classes('text-sm font-bold text-zinc-300 self-center')
+                    with ui.column().classes('grow gap-2'):
+                        ta = ui.textarea(
+                            label=f'ナレーション原稿（スライド {p}）', value=curr_txt,
+                        ).props('outlined').classes('w-full h-[180px]').style('height: 180px; min-height: 180px;')
+                        ta.props('input-style="height: 140px; resize: vertical;"')
+                        self._simple_textareas[p] = ta
+                        self._simple_text_signatures[p] = self._file_signature(txt_path)
+                        with ui.row().classes('w-full items-center justify-end gap-3 pt-1'):
+                            self.register_main_action_button(ui.button(
+                                '✨ ナレーションを再生成',
+                                on_click=lambda _, page=p, area=ta: self.regenerate_narration(page, area),
+                            ).props('outline dense'))
+                            self.register_main_action_button(ui.button(
+                                '🔄 保存して字幕・ポインタを再解析',
+                                on_click=lambda _, page=p, area=ta: self.save_and_realign(page, area.value),
+                            ).props('dense color=primary'))
 
     async def refresh_simple_editor(self) -> None:
         if not self.simple_edit_container:
             return
         self.simple_edit_container.clear()
+        self._simple_cards.clear()
         self._simple_textareas.clear()
         self._simple_text_signatures.clear()
+        self._simple_grid = None
         if not self.active_pages or not self.pdf or not self.paths:
             with self.simple_edit_container:
                 ui.label('⚠ 処理対象となるスライドがありません．「スライドデッキ」タブで対象スライドを選択してください．').classes('text-orange-500 dark:text-orange-400')
             return
-
         with self.simple_edit_container:
-            ui.label(f'対象スライド一覧（全 {len(self.active_pages)} スライド）').classes('text-sm text-gray-400 pb-2')
-
-            with ui.column().classes('w-full gap-6'):
-                for p in self.active_pages:
-                    img_path = self.paths.page_image(p)
-                    txt_path = self.paths.explanation(p)
-                    curr_txt = txt_path.read_text(encoding='utf-8') if txt_path.exists() else ''
-
-                    with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-lg shadow-sm'):
-                        with ui.row().classes('w-full items-start gap-4 flex-nowrap'):
-                            with ui.column().classes('w-72 shrink-0 items-center gap-1.5'):
-                                if img_path.exists():
-                                    ui.image(file_url(img_path)).classes('w-full rounded border border-zinc-700 shadow-sm')
-                                else:
-                                    ui.label('（スライド画像なし）').classes('text-xs text-zinc-500')
-                                ui.label(f'スライド {p}').classes('text-sm font-bold text-zinc-300 self-center')
-
-                            with ui.column().classes('grow gap-2'):
-                                ta = ui.textarea(
-                                    label=f'ナレーション原稿（スライド {p}）',
-                                    value=curr_txt,
-                                ).props('outlined').classes('w-full h-[180px]').style('height: 180px; min-height: 180px;')
-                                ta.props('input-style="height: 140px; resize: vertical;"')
-                                self._simple_textareas[p] = ta
-                                self._simple_text_signatures[p] = self._file_signature(txt_path)
-
-                                with ui.row().classes('w-full items-center justify-end gap-3 pt-1'):
-                                    self.register_main_action_button(ui.button(
-                                        '✨ ナレーションを再生成',
-                                        on_click=lambda _, page=p, area=ta: self.regenerate_narration(page, area),
-                                    ).props('outline dense'))
-
-                                    self.register_main_action_button(ui.button(
-                                        '🔄 保存して字幕・ポインタを再解析',
-                                        on_click=lambda _, page=p, area=ta: self.save_and_realign(page, area.value),
-                                    ).props('dense color=primary'))
+            self._simple_count_label = ui.label(f'対象スライド一覧（全 {len(self.active_pages)} スライド）').classes('text-sm text-gray-400 pb-2')
+            self._simple_grid = ui.column().classes('w-full gap-6')
+        for p in self.active_pages:
+            self._add_simple_editor_card(p)
 
     async def refresh_editor(self) -> None:
         if not self.edit_container:
@@ -2514,18 +2574,35 @@ class SlideNarratorApp:
 
                     self.register_main_action_button(ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2'))
 
+    def _sync_video_selection(self) -> None:
+        if self._video_grid is None or not self._widget_available(self._video_grid):
+            return
+        for page in list(self._video_cards):
+            if page not in self._selected_pages:
+                self._video_cards.pop(page).delete()
+                self._video_signatures.pop(page, None)
+        # 新規カードのみを指定位置に挿入する．再生中の動画は触れない．
+        for index, page in enumerate(self.active_pages):
+            if page not in self._video_cards:
+                self._replace_video_card(page)
+                self._video_cards[page].move(target_container=self._video_grid, target_index=index)
+
     async def refresh_slide_videos(self) -> None:
         if not self.slide_video_gallery:
+            return
+        project_key = str(self.pdf.resolve()) if self.pdf else None
+        if self._video_project_key == project_key and self._video_grid is not None and self._widget_available(self._video_grid):
+            self._sync_video_selection()
             return
         self.slide_video_gallery.clear()
         self._video_cards.clear()
         self._video_signatures.clear()
         self._video_grid = None
+        self._video_project_key = project_key
         if not self.paths:
             with self.slide_video_gallery:
                 ui.label('プレゼンテーションPDFを選択してください．').classes('text-blue-500 dark:text-blue-400')
             return
-
         with self.slide_video_gallery:
             self._video_grid = ui.grid(columns=4).classes('w-full gap-4')
         for page in self.active_pages:
