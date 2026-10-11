@@ -115,6 +115,9 @@ ALIGN_SYSTEM_JA = """あなたはプレゼンテーション動画の視線誘�
 2. 図・画像領域への言及：画像内の特定の部品（[図内要素]）に言及している場合はその subpart の block_id を優先し，図全体への言及であれば親の画像領域を選んでください．
 3. 通常テキスト・箇条書きへの言及：該当するテキストブロックの block_id を選んでください．
 4. 冒頭の挨拶やつなぎの言葉など，特定の要素を指すのが明らかに不自然な文のみ null にしてください．それ以外は文脈上もっとも近い block_id を割り当ててください．
+5. 各要素の source は出自を表します．pdf はPDFから直接抽出した文字・コード行・画像領域，vlm は画像を視覚解析して検出した領域です．
+6. 文字列やコード行ではPDF由来の正確な位置を参考にし，図・グラフ・数式の一部分ではVLM由来の細かな領域も積極的に検討してください．ただしsourceだけで機械的に優先順位を決めず，ナレーションの意味と指示対象の範囲が最もよく一致する候補を選んでください．
+7. 同じ対象の候補が重複する場合も，指したい対象に対して適切な粒度のblock_idを一つ選んでください．
 
 必ず以下の形式のJSON配列のみを返してください：
 [
@@ -127,6 +130,7 @@ ALIGN_SYSTEM_EN = """You are an assistant designing laser-pointer focus for a sl
 Given slide elements and narration sentences, assign each sentence to the most relevant block_id (code_line, image, sub-elements in images, or text).
 If a sentence refers to a specific part inside an image, prioritize the subpart element over the whole image.
 Assign null only for broad opening or transitional phrases that have no visual anchor.
+Each element has a source: pdf means a region extracted directly from the PDF (especially accurate for text and code lines), while vlm means a visually detected region (often useful for figure, chart, or equation subparts). Consider PDF candidates for precise text/code positions and VLM candidates for meaningful visual subparts. Never choose solely by source; select the best semantic match and appropriate region granularity. For overlapping candidates, choose the single most appropriate block_id.
 
 Return ONLY a JSON array:
 [
@@ -413,7 +417,9 @@ def extract_page_blocks(pdf: Path, page_index: int, dpi: int) -> list[dict]:
 
                     targets.append({
                         "block_id": len(targets),
+                        "source": "pdf",
                         "type": "code_line",
+                        "label": f"Line {line_idx}: {line_text}",
                         "text": f"Line {line_idx}: {line_text}",
                         "x": px,
                         "y": py,
@@ -424,7 +430,9 @@ def extract_page_blocks(pdf: Path, page_index: int, dpi: int) -> list[dict]:
                 py = bbox[1] + int(10 * scale)
                 targets.append({
                     "block_id": len(targets),
+                    "source": "pdf",
                     "type": "text",
+                    "label": full_text,
                     "text": full_text,
                     "x": px,
                     "y": py,
@@ -436,8 +444,10 @@ def extract_page_blocks(pdf: Path, page_index: int, dpi: int) -> list[dict]:
             py = bbox[1] + h // 2
             targets.append({
                 "block_id": len(targets),
+                "source": "pdf",
                 "type": "image",
                 "text": "[図・画像領域]",
+                "label": "PDF埋め込み画像",
                 "x": px,
                 "y": py,
                 "bbox": bbox,
@@ -463,8 +473,10 @@ def extract_page_blocks(pdf: Path, page_index: int, dpi: int) -> list[dict]:
                 py = bbox[1] + h // 2
                 targets.append({
                     "block_id": len(targets),
+                    "source": "pdf",
                     "type": "image",
                     "text": "[挿入画像・図表]",
+                    "label": "PDF画像・図表",
                     "x": px,
                     "y": py,
                     "bbox": bbox,
@@ -593,6 +605,7 @@ def run_vlm_element_detection(
 
             parsed_blocks.append({
                 "block_id": b.get("block_id", i),
+                "source": "vlm",
                 "type": b_type,
                 "kind": kind,
                 "label": name,
@@ -942,6 +955,7 @@ def align_narration_with_blocks(
         item = {
             "block_id": b["block_id"],
             "type": b["type"],
+            "source": b.get("source", "vlm" if b.get("type") == "image_subpart" else "pdf"),
             "bbox": b["bbox"],
         }
         if b["type"] in ("text", "code_line", "image_subpart"):
@@ -1265,6 +1279,7 @@ def generate_single_alignment(
     if use_vlm:
         sub_elements = detect_visual_elements_with_vlm(client, cfg, image_path, lang=lang)
         for elem in sub_elements:
+            elem["source"] = "vlm"
             elem["block_id"] = len(blocks)
             blocks.append(elem)
 

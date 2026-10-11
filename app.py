@@ -37,7 +37,7 @@ import pymupdf as fitz
 import yaml
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from nicegui import app, run, ui, background_tasks
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from slide_lecture import (
     generate_single_alignment,
@@ -64,11 +64,76 @@ from tts_filter import (
 # ----------------------------------------------------------------------
 
 BADGE_COLORS: dict[str, tuple[str, str]] = {
-    'image_subpart': ('bg-red-500/20 text-red-300 border-red-500/40', '注目要素'),
-    'image': ('bg-amber-500/20 text-amber-300 border-amber-500/40', '画像・領域'),
-    'text': ('bg-blue-500/20 text-blue-300 border-blue-500/40', 'テキスト'),
-    'code_line': ('bg-cyan-500/20 text-cyan-300 border-cyan-500/40', 'コード/数式'),
+    'image_subpart': ('', '注目要素'),
+    'image': ('', '画像・領域'),
+    'text': ('', 'テキスト'),
+    'code_line': ('', 'コード/数式'),
 }
+
+# 枠線は検出元，IDラベルの背景はテキスト／図形の違いを表す．
+SOURCE_COLORS = {
+    'pdf': {'border': '#22c55e', 'image_bg': '#22543a'},
+    'vlm': {'border': '#ef4444', 'image_bg': '#614449'},
+}
+TEXT_BADGE_BG = '#101216'
+
+
+def block_is_text(block: dict) -> bool:
+    """VLMの図内テキストもテキスト系として扱う．"""
+    kind = str(block.get('kind') or '').lower()
+    return block.get('type') in ('text', 'code_line') or kind == 'text'
+
+
+def block_badge_style(block: dict) -> str:
+    """一覧用IDマーカー：テキストは出自色の枠，画像は出自色で塗る．"""
+    source = block_source(block)
+    color = SOURCE_COLORS.get(source, SOURCE_COLORS['pdf'])['border']
+    if block_is_text(block):
+        return (f'background: transparent; border: 1px solid {color}; color: {color}; '
+                'padding: 2px 6px; min-width: 40px; text-align: center;')
+    return (f'background-color: {color}; border: 1px solid {color}; color: white; '
+            'padding: 2px 6px; min-width: 40px; text-align: center;')
+
+
+def source_badge_style(block: dict) -> str:
+    source = block_source(block)
+    background = '#15803d' if source == 'pdf' else '#b91c1c'
+    return f'background-color: {background}; color: white; border: none;'
+
+
+
+def block_source(block: dict) -> str:
+    """旧形式のアライメントデータにも対応して出自を返す．"""
+    return str(block.get('source') or ('vlm' if block.get('type') == 'image_subpart' else 'pdf')).lower()
+
+
+def block_display_name(block: dict, limit: int = 65) -> str:
+    """PDFのテキスト／コードは内容を名前として使う（元データは変更しない）．"""
+    name = block.get('label') or block.get('name') or block.get('text')
+    if not name:
+        name = 'PDF画像・図表' if block_source(block) == 'pdf' and block.get('type') == 'image' else '名称なし'
+    name = ' '.join(str(name).split())
+    return name[:limit] + '…' if len(name) > limit else name
+
+
+def alignment_source_statistics(blocks: list[dict], alignments: list[dict]) -> tuple[dict[str, int], dict]:
+    """採用された文を単位として集計し，要素別の採用回数も返す．"""
+    by_id = {str(b.get('block_id')): b for b in blocks}
+    counts = {'pdf': 0, 'vlm': 0, 'none': 0}
+    usage: dict[str, int] = {}
+    for item in alignments:
+        bid = item.get('block_id')
+        key = str(bid)
+        if bid is None or key not in by_id:
+            counts['none'] += 1
+            continue
+        source = block_source(by_id[key])
+        if source not in ('pdf', 'vlm'):
+            counts['none'] += 1
+            continue
+        counts[source] += 1
+        usage[key] = usage.get(key, 0) + 1
+    return counts, usage
 
 
 # ----------------------------------------------------------------------
@@ -412,27 +477,52 @@ def ensure_page_images(paths: ProjectPaths, dpi: int = 120) -> list[Path]:
     return result
 
 
-def draw_block_preview(img_path: Path, blocks: list[dict]) -> Image.Image:
+def draw_block_preview(img_path: Path, blocks: list[dict], used_ids: set[str] | None = None) -> Image.Image:
     im = Image.open(img_path).convert('RGB')
     draw = ImageDraw.Draw(im)
 
-    color_map = {
-        'image_subpart': ('#ef4444', 3),
-        'image': ('#f59e0b', 2),
-        'text': ('#3b82f6', 2),
-        'code_line': ('#06b6d4', 2),
-    }
+    # 120 dpi程度のスライド画像でも読みやすいサイズ．画像解像度に応じて調整する．
+    font_size = max(18, min(30, round(im.width / 80)))
+    # Pillow内蔵フォントを使用し，OSごとのフォントインストールに依存しない．
+    # size引数はPillow 10.1.0以降で利用可能．
+    font = ImageFont.load_default(size=font_size)
 
     for b in blocks:
+        if used_ids is not None and str(b.get('block_id')) not in used_ids:
+            continue
         box = b.get('bbox')
         bid = b.get('block_id')
-        btype = b.get('type', 'text')
-        if box:
-            color, width = color_map.get(btype, ('#3b82f6', 2))
-            draw.rectangle(box, outline=color, width=width)
-            badge_width = max(35, 12 + len(str(bid)) * 10)
-            draw.rectangle([box[0], max(0, box[1] - 20), box[0] + badge_width, box[1]], fill=color)
-            draw.text((box[0] + 4, max(0, box[1] - 18)), f'#{bid}', fill='white')
+        if not box:
+            continue
+
+        source = block_source(b)
+        border_color = SOURCE_COLORS.get(source, SOURCE_COLORS['pdf'])['border']
+        draw.rectangle(box, outline=border_color, width=3 if source == 'vlm' else 2)
+
+        badge_text = f'#{bid}'
+        text_box = draw.textbbox((0, 0), badge_text, font=font)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+        padding_x, padding_y = 3, 2
+        label_height = text_height + padding_y * 2
+        label_width = text_width + padding_x * 2
+
+        # bbox上辺にほぼ接するように置き，上側に余地がなければbbox内側へ．
+        x = max(0, min(int(box[0]), im.width - label_width))
+        y = int(box[1]) - label_height - 1
+        if y < 0:
+            y = min(im.height - label_height, int(box[1]) + 2)
+        y = max(0, y)
+
+        if block_is_text(b):
+            # テキスト・コード系：背景なし，枠なし，PDF緑／VLM赤の文字．
+            label_color = border_color
+        else:
+            # 画像・図形系：bboxと同じ明るい緑／赤背景，白文字，囲み枠なし．
+            draw.rectangle((x, y, x + label_width, y + label_height), fill=border_color)
+            label_color = 'white'
+        draw.text((x + padding_x - text_box[0], y + padding_y - text_box[1]),
+                  badge_text, fill=label_color, font=font)
     return im
 
 
@@ -532,6 +622,7 @@ class SlideNarratorApp:
         self.default_use_vlm: bool = True
         self.slide_visual_modes: dict[str, str] = {}
         self.edit_page: int | None = None
+        self.preview_used_only: bool = True
         self.processing = False
         self._selected_pages: set[int] = set()
 
@@ -2198,6 +2289,7 @@ class SlideNarratorApp:
             'audio': self._file_signature(self.paths.audio(page)),
         }
 
+        source_counts, block_usage = alignment_source_statistics(blocks, alignments)
         page_vmode = self.slide_visual_modes.get(str(page), 'vlm' if self.default_use_vlm else 'pdf')
         page_use_vlm_init = (page_vmode == 'vlm')
 
@@ -2224,25 +2316,43 @@ class SlideNarratorApp:
             with ui.row().classes('w-full items-start gap-6 flex-nowrap'):
                 with ui.column().classes('flex-[2] min-w-0 gap-3'):
                     if img.exists():
-                        preview = draw_block_preview(img, blocks) if blocks else None
-                        if preview is not None:
-                            preview_path = self.paths.page_preview(page)
-                            preview.save(preview_path)
-                            ts = int(time.time() * 1000)
-                            ui.image(f"{file_url(preview_path)}&ts={ts}").classes('w-full rounded border border-zinc-700 shadow-sm')
-                        else:
-                            ui.image(file_url(img)).classes('w-full rounded border border-zinc-700 shadow-sm')
+                        # 検出された全要素と採用済み要素を別々のプレビューに描画する．
+                        # どちらも表示専用で，アライメントJSONは変更しない．
+                        preview_path = self.paths.page_preview(page)
+                        used_preview_path = preview_path.with_name(f'{preview_path.stem}_used{preview_path.suffix}')
+                        if blocks:
+                            draw_block_preview(img, blocks).save(preview_path)
+                            draw_block_preview(img, blocks, set(block_usage)).save(used_preview_path)
 
-                        with ui.row().classes('w-full items-center justify-center gap-3 text-xs pt-1'):
-                            with ui.row().classes('items-center gap-1'):
-                                ui.element('div').classes('w-3 h-3 bg-red-500 rounded-sm')
-                                ui.label('赤: VLM画像内要素').classes('text-zinc-300')
-                            with ui.row().classes('items-center gap-1'):
-                                ui.element('div').classes('w-3 h-3 bg-amber-500 rounded-sm')
-                                ui.label('橙: 図全体').classes('text-zinc-300')
-                            with ui.row().classes('items-center gap-1'):
-                                ui.element('div').classes('w-3 h-3 bg-blue-500 rounded-sm')
-                                ui.label('青: テキスト/行').classes('text-zinc-300')
+                        with ui.row().classes('w-full items-center justify-between gap-2'):
+                            ui.label('bboxプレビュー').classes('text-sm font-bold text-zinc-200')
+                            preview_switch = ui.switch(
+                                '採用IDのみ表示', value=self.preview_used_only,
+                            ).props('dense color=primary')
+                            preview_switch.tooltip('OFFにすると検出されたすべてのIDを表示します．')
+
+                        def preview_url(used_only: bool) -> str:
+                            if not blocks:
+                                return file_url(img)
+                            target = used_preview_path if used_only else preview_path
+                            return f'{file_url(target)}&ts={time.time_ns()}'
+
+                        preview_image = ui.image(preview_url(self.preview_used_only)).classes(
+                            'w-full rounded border border-zinc-700 shadow-sm'
+                        )
+
+                        def switch_preview(e) -> None:
+                            self.preview_used_only = bool(e.value)
+                            preview_image.set_source(preview_url(self.preview_used_only))
+
+                        preview_switch.on_value_change(switch_preview)
+
+                        # 検出元のみを簡潔に表示する．
+                        with ui.row().classes('w-full items-center justify-center gap-4 text-xs pt-1'):
+                            for color, source_name in (('#22c55e', 'PDF'), ('#ef4444', 'VLM')):
+                                with ui.row().classes('items-center gap-1'):
+                                    ui.label('●').style(f'color: {color};')
+                                    ui.label(source_name).classes('text-zinc-300')
 
                     with ui.card().classes('w-full p-3 bg-zinc-900 border border-zinc-800 rounded-lg gap-2'):
                         ui.label('🔊 ナレーション音声').classes('text-sm font-bold text-zinc-200')
@@ -2261,14 +2371,31 @@ class SlideNarratorApp:
                             ).props('dense color=primary size=sm').classes('w-full'))
 
                 with ui.column().classes('flex-[3] min-w-0 gap-3'):
-                    ui.label('🎯 検出された要素一覧（バッジ対応）').classes('text-xs font-semibold text-zinc-400')
+                    if alignments:
+                        selected = source_counts['pdf'] + source_counts['vlm']
+                        pdf_percent = 100 * source_counts['pdf'] / selected if selected else 0
+                        vlm_percent = 100 * source_counts['vlm'] / selected if selected else 0
+                        with ui.card().classes('w-full p-3 bg-zinc-900 border border-zinc-800 rounded-lg gap-2'):
+                            ui.label('📊 ポインタ採用状況（文単位）').classes('text-sm font-bold text-zinc-200')
+                            with ui.row().classes('w-full items-center gap-4 text-xs'):
+                                ui.label(f"PDF: {source_counts['pdf']}文（{pdf_percent:.1f}%）").classes('text-green-400')
+                                ui.label(f"VLM: {source_counts['vlm']}文（{vlm_percent:.1f}%）").classes('text-red-400')
+                                ui.label(f"指定なし: {source_counts['none']}文").classes('text-zinc-400')
+                            if selected:
+                                with ui.row().classes('w-full h-2 rounded-full overflow-hidden bg-zinc-700 gap-0'):
+                                    if source_counts['pdf']:
+                                        ui.element('div').style(f'width: {pdf_percent}%; background-color: #22c55e; height: 100%')
+                                    if source_counts['vlm']:
+                                        ui.element('div').style(f'width: {vlm_percent}%; background-color: #ef4444; height: 100%')
+                            ui.label('割合はポインタ先が指定された文を母数として計算しています．').classes('text-[10px] text-zinc-500')
+                    ui.label('🎯 検出された要素一覧').classes('text-xs font-semibold text-zinc-400')
                     if not blocks:
                         ui.label('（検出された要素はありません）').classes('text-xs text-zinc-500 italic')
                     else:
                         with ui.column().classes('w-full gap-1.5 max-h-[450px] overflow-y-auto pr-1'):
                             for b in blocks:
                                 bid = b.get('block_id')
-                                label = b.get('label') or '名称なし'
+                                label = block_display_name(b)
                                 btype = b.get('type', 'image_subpart')
                                 style_cls, type_name = BADGE_COLORS.get(btype, BADGE_COLORS['image_subpart'])
 
@@ -2277,9 +2404,15 @@ class SlideNarratorApp:
                                     'border border-zinc-800 hover:border-zinc-700 transition-colors'
                                 ):
                                     with ui.row().classes('items-center gap-2 grow'):
-                                        ui.label(f'#{bid}').classes(f'text-xs font-bold font-mono px-2 py-0.5 rounded border {style_cls}')
-                                        ui.label(label).classes('text-xs text-zinc-200 font-medium break-all')
-                                    ui.badge(type_name).props('outline').classes('text-[10px] text-zinc-400 shrink-0')
+                                        # 固定幅のID欄で，テキストと画像のマーカー位置を揃える．
+                                        with ui.element('div').classes('w-14 shrink-0 flex items-center justify-start'):
+                                            ui.label(f'#{bid}').classes('text-xs font-bold font-mono rounded-sm').style(block_badge_style(b))
+                                        # 2列目に採用数を固定幅で表示する．未採用時は空欄．
+                                        with ui.element('div').classes('w-9 shrink-0 flex items-center justify-center'):
+                                            if block_usage.get(str(bid), 0):
+                                                ui.label(str(block_usage[str(bid)])).classes('text-[10px] font-bold text-zinc-200 rounded-sm px-1.5').style('border: 1px solid #ffffff;')
+                                        ui.label(label).classes('text-xs text-zinc-200 font-medium break-all grow min-w-0')
+                                    ui.badge(type_name).props('outline color=grey-6').classes('text-[10px] text-zinc-400 shrink-0').style('border-color: #71717a; color: #a1a1aa;')
 
             with ui.column().classes('w-full gap-3 pt-2'):
                 main_lang = '日本語' if self.lang_code == 'ja' else '英語'
@@ -2291,7 +2424,11 @@ class SlideNarratorApp:
                 if alignments:
                     ui.separator()
                     ui.label('🎯 文ごとのポインタ先 & 対訳字幕の微調整').classes('text-h6')
-                    block_options = [None] + [b['block_id'] for b in blocks]
+                    block_options = {None: '指定なし'}
+                    for b in blocks:
+                        source = str(b.get('source') or ('vlm' if b.get('type') == 'image_subpart' else 'pdf')).upper()
+                        desc = block_display_name(b, 45)
+                        block_options[b['block_id']] = f"#{b['block_id']} [{source}] {desc}"
                     rows = []
                     for item in alignments:
                         rows.append({
@@ -2311,6 +2448,20 @@ class SlideNarratorApp:
                                 trans = ui.input('対訳字幕', value=row['translation']).props('dense outlined').classes('grow')
                                 row['_select'] = select
                                 row['_trans'] = trans
+
+                    # ポインタ先を変更した場合は保存前でも採用IDプレビューを更新する．
+                    if img.exists() and blocks:
+                        def update_used_preview() -> None:
+                            selected_ids = {
+                                str(r['_select'].value)
+                                for r in rows if r['_select'].value is not None
+                            }
+                            draw_block_preview(img, blocks, selected_ids).save(used_preview_path)
+                            if self.preview_used_only:
+                                preview_image.set_source(preview_url(True))
+
+                        for row in rows:
+                            row['_select'].on_value_change(lambda e: update_used_preview())
 
                     async def save_rows() -> None:
                         out = []
@@ -2566,22 +2717,23 @@ class SlideNarratorApp:
                             with ui.row().classes('w-full items-start gap-4'):
                                 ui.image(f'{file_url(preview_path)}&ts={ts}').classes('w-full max-w-xl rounded-lg border border-zinc-700 shadow-md')
                                 with ui.column().classes('grow min-w-[280px] max-w-md gap-2'):
-                                    ui.label('検出された要素一覧（バッジ対応）').classes('text-xs font-semibold text-zinc-400')
+                                    ui.label('検出された要素一覧').classes('text-xs font-semibold text-zinc-400')
                                     if not parsed_blocks:
                                         ui.label('（バウンディングボックスは検出されませんでした）').classes('text-xs text-zinc-500 italic')
                                     else:
                                         with ui.column().classes('w-full gap-1.5 max-h-[450px] overflow-y-auto pr-1'):
                                             for b in parsed_blocks:
                                                 bid = b.get('block_id')
-                                                label = b.get('label') or '名称なし'
+                                                label = block_display_name(b)
                                                 btype = b.get('type', 'image_subpart')
                                                 style_cls, type_name = BADGE_COLORS.get(btype, BADGE_COLORS['image_subpart'])
 
                                                 with ui.row().classes('w-full items-center justify-between p-2 rounded bg-zinc-900/90 border border-zinc-800 hover:border-zinc-700 transition-colors'):
                                                     with ui.row().classes('items-center gap-2 grow'):
-                                                        ui.label(f'#{bid}').classes(f'text-xs font-bold font-mono px-2 py-0.5 rounded border {style_cls}')
-                                                        ui.label(label).classes('text-xs text-zinc-200 font-medium break-all')
-                                                    ui.badge(type_name).props('outline').classes('text-[10px] text-zinc-400 shrink-0')
+                                                        with ui.element('div').classes('w-14 shrink-0 flex items-center justify-start'):
+                                                            ui.label(f'#{bid}').classes('text-xs font-bold font-mono rounded-sm').style(block_badge_style(b))
+                                                        ui.label(label).classes('text-xs text-zinc-200 font-medium break-all grow min-w-0')
+                                                    ui.badge(type_name).props('outline color=grey-6').classes('text-[10px] text-zinc-400 shrink-0').style('border-color: #71717a; color: #a1a1aa;')
 
                         vlm_blocks_container.clear()
                         if parsed_blocks:
