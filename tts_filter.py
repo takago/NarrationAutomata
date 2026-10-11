@@ -294,8 +294,10 @@ def transform(
         kwargs = {
             "model": model,
             "messages": messages,
-            "extra_body": {"reasoning_effort": "none"},
         }
+        effort = generation.get("reasoning_effort", "low")
+        if effort != "auto":
+            kwargs["extra_body"] = {"reasoning_effort": effort}
         for key in ("temperature", "max_tokens", "top_p", "seed"):
             if key in generation:
                 kwargs[key] = generation[key]

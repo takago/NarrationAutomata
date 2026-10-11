@@ -306,6 +306,13 @@ def get_project_additional_prompt(project_dir: Path) -> str:
     return value if isinstance(value, str) else ""
 
 
+def reasoning_extra_kwargs(effort: str) -> dict:
+    """autoではOpenAI互換APIにreasoning_effortを一切送信しない．"""
+    if effort == "auto":
+        return {}
+    return {"extra_body": {"reasoning_effort": effort}}
+
+
 def make_client(cfg: dict) -> OpenAI:
     http_client = httpx.Client(
         trust_env=False,
@@ -549,7 +556,7 @@ def run_vlm_element_detection(
     prompt: str,
     system_prompt: str | None = None,
     temperature: float = 0.2,
-    max_tokens: int = 2000,
+    reasoning_effort: str = "none",
 ) -> tuple[str, list[dict]]:
     """任意の画像に対してVLMへ問い合わせを行い、要約テキストとパース済みブロック一覧を返します．"""
     if not image_path.exists():
@@ -574,9 +581,8 @@ def run_vlm_element_detection(
     response = client.chat.completions.create(
         model=model,
         temperature=temperature,
-        max_tokens=max_tokens,
         messages=messages,
-        extra_body={"reasoning_effort": "none"},
+        **reasoning_extra_kwargs(reasoning_effort),
     )
 
     raw_text = response.choices[0].message.content or ""
@@ -659,7 +665,7 @@ def detect_visual_elements_with_vlm(
             prompt=user_instruction,
             system_prompt=sys_prompt,
             temperature=0.0,
-            max_tokens=2000,
+            reasoning_effort=cfg.get("reasoning_effort", "none"),
         )
         return sub_elements
     except Exception as e:
@@ -781,12 +787,11 @@ def translate_sentences(client: OpenAI, cfg: dict, sentences: list[str], target_
         response = client.chat.completions.create(
             model=cfg["model"],
             temperature=0.1,
-            max_tokens=cfg.get("max_tokens", 8000),
             messages=[
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
             ],
-            extra_body={"reasoning_effort": "none"} 
+            **reasoning_extra_kwargs(cfg.get("reasoning_effort", "none")),
         )
         translations = extract_json(response.choices[0].message.content)
         if isinstance(translations, list) and len(translations) == len(sentences):
@@ -1005,12 +1010,11 @@ def align_narration_with_blocks(
         response = client.chat.completions.create(
             model=cfg["model"],
             temperature=0.0,
-            max_tokens=4000,
             messages=[
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": content},
             ],
-            extra_body={"reasoning_effort": "none"} 
+            **reasoning_extra_kwargs(cfg.get("reasoning_effort", "none")),
         )
 
         data = extract_json(response.choices[0].message.content)
@@ -1126,11 +1130,11 @@ def build_course_overview(
     response = client.chat.completions.create(
         model=cfg["model"],
         temperature=cfg.get("temperature", 0.2),
-        max_tokens=cfg.get("max_tokens", 8000),
         messages=[
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": material},
         ],
+        **reasoning_extra_kwargs(cfg.get("reasoning_effort", "none")),
     )
     return response.choices[0].message.content.strip()
 
@@ -1222,11 +1226,11 @@ Return ONLY the raw narration text.
     response = client.chat.completions.create(
         model=cfg["model"],
         temperature=cfg.get("temperature", 0.3),
-        max_tokens=cfg.get("max_tokens", 5000),
         messages=[
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": content},
         ],
+        **reasoning_extra_kwargs(cfg.get("reasoning_effort", "none")),
     )
     return response.choices[0].message.content.strip()
 

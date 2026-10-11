@@ -46,6 +46,7 @@ from slide_lecture import (
     tts_text_stats,
     load_project_json,
     make_client,
+    reasoning_extra_kwargs,
     parse_page_ranges,
     run_vlm_element_detection,
     VLM_BBOX_COORD_MAX,
@@ -2858,7 +2859,7 @@ class SlideNarratorApp:
 
     # --- 設定タブ (LLM / TTS / 辞書) ---
 
-    def _build_llm_settings(self) -> tuple[ui.input, ui.input, ui.select, ui.number]:
+    def _build_llm_settings(self) -> tuple[Any, Any, Any, Any, Any]:
         with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm'):
             with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
                 with ui.row().classes('items-center gap-2'):
@@ -2882,6 +2883,7 @@ class SlideNarratorApp:
 
                 fetch_btn = ui.button('🔄 モデル一覧を取得').props('dense outline')
                 llm_temp = ui.number('Temperature', value=float(llm.get('temperature', 0.3)), min=0, max=2, step=0.1).classes('w-36')
+                llm_reason = ui.select(['auto', 'none', 'low', 'medium', 'high'], value=llm.get('reasoning_effort', 'none'), label='Reasoning effort').props('outlined dense').classes('w-40')
 
             async def fetch_llm_models() -> None:
                 base = (llm_base.value or '').strip()
@@ -2937,9 +2939,8 @@ class SlideNarratorApp:
                             res = client.chat.completions.create(
                                 model=selected_model,
                                 temperature=float(llm_temp.value or 0.3),
-                                max_tokens=5000,
                                 messages=[{'role': 'user', 'content': prompt}],
-                                extra_body={"reasoning_effort": "none"},
+                                **reasoning_extra_kwargs(llm_reason.value),
                             )
                             return res.choices[0].message.content or '（空の応答でした）'
 
@@ -3032,7 +3033,7 @@ class SlideNarratorApp:
                             image_path=img_p,
                             prompt=prompt,
                             temperature=float(llm_temp.value or 0.2),
-                            max_tokens=1500,
+                            reasoning_effort=llm_reason.value,
                         )
 
                         vlm_description_box.text = summary_text.strip()
@@ -3087,7 +3088,7 @@ class SlideNarratorApp:
 
                 vlm_run_btn.on_click(run_vlm_test)
 
-        return llm_base, llm_key, llm_model_select, llm_temp
+        return llm_base, llm_key, llm_model_select, llm_temp, llm_reason
 
     @staticmethod
     def _fetch_voices_from_server(base_url: str, api_key: str) -> list[str]:
@@ -3248,7 +3249,7 @@ class SlideNarratorApp:
                                   'About 1300 words with several paragraphs, no repetition.')
                         r = lc.chat.completions.create(
                             model=llm_cfg['model'], messages=[{'role': 'user', 'content': prompt}],
-                            max_tokens=6000, extra_body={"reasoning_effort": "none"})
+                            **reasoning_extra_kwargs(llm_cfg.get("reasoning_effort", "none")))
                         return (r.choices[0].message.content or '').strip()
 
                     try:
@@ -3433,6 +3434,7 @@ class SlideNarratorApp:
                 filter_model_sel = ui.select(options=[cur_filter_model] if cur_filter_model else [], value=cur_filter_model, label='フィルタ用 LLM Model (選択または直接入力)').props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
                 filter_fetch_btn = ui.button('🔄 モデル一覧を取得').props('dense outline')
                 filter_temp = ui.number('Temperature', value=float(gen_cfg.get('temperature', 0)), min=0, max=2, step=0.1).classes('w-36')
+                filter_reason = ui.select(['auto', 'none', 'low', 'medium', 'high'], value=gen_cfg.get('reasoning_effort', 'low'), label='Reasoning effort').props('outlined dense').classes('w-40')
 
             async def fetch_filter_models() -> None:
                 b = (filter_base.value or '').strip()
@@ -3485,7 +3487,7 @@ class SlideNarratorApp:
                     try:
                         t_cfg = {
                             'server': {'base_url': b, 'api_key': k, 'model': m},
-                            'generation': {'temperature': float(filter_temp.value or 0)},
+                            'generation': {**gen_cfg, 'temperature': float(filter_temp.value or 0), 'reasoning_effort': filter_reason.value},
                             'dictionary': filter_dict,
                             'prompt': filter_cfg.get('prompt'),
                         }
@@ -3564,6 +3566,7 @@ class SlideNarratorApp:
                         'model': model,
                     })
                     latest.setdefault('generation', {})['temperature'] = float(filter_temp.value or 0)
+                    latest['generation']['reasoning_effort'] = filter_reason.value
                     latest['dictionary'] = new_dict
                     save_config(TTS_FILTER_PATH, latest)
 
@@ -3598,7 +3601,7 @@ class SlideNarratorApp:
             with ui.row().classes('w-full items-center justify-between pb-2'):
                 ui.label('システム設定').classes('text-h4 font-bold')
 
-            llm_base, llm_key, llm_model, llm_temp = self._build_llm_settings()
+            llm_base, llm_key, llm_model, llm_temp, llm_reason = self._build_llm_settings()
             (ja_base, ja_key, ja_model, ja_voice, ja_limit), (en_base, en_key, en_model, en_voice, en_limit) = self._build_tts_settings()
 
             def save_main_config() -> None:
@@ -3606,6 +3609,7 @@ class SlideNarratorApp:
                 self.cfg['llm']['api_key'] = (llm_key.value or '').strip() or 'dummy'
                 self.cfg['llm']['model'] = (str(llm_model.value) if llm_model.value is not None else '').strip()
                 self.cfg['llm']['temperature'] = llm_temp.value
+                self.cfg['llm']['reasoning_effort'] = llm_reason.value
                 self.cfg['tts']['ja'] = {
                     'base_url': (ja_base.value or '').strip(),
                     'api_key': (ja_key.value or '').strip() or 'dummy',
