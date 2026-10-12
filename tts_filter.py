@@ -25,6 +25,7 @@ from pathlib import Path
 
 import yaml
 from openai import OpenAI
+from statistics_store import record as record_statistics
 
 # YAMLからPythonコード内に埋め込んだプロンプトテンプレート
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = """# 日本語TTS用 技術表記読み変換プロンプト
@@ -215,6 +216,21 @@ def build_dictionary_text(dictionary: dict) -> str:
     return "\n".join(lines)
 
 
+def merge_project_dictionary(config: dict, project_data: dict | None) -> dict:
+    """共通辞書にプロジェクト固有辞書を上書きして返す（引数を変更しない）．"""
+    merged = dict(config)
+    common = config.get("dictionary") or {}
+    if not isinstance(common, dict):
+        raise ValueError("共通ヨミ辞書はマッピングである必要があります．")
+    local = (project_data or {}).get("tts_dictionary") or {}
+    if not isinstance(local, dict):
+        raise ValueError("プロジェクトヨミ辞書はマッピングである必要があります．")
+    if any(not isinstance(k, str) or not isinstance(v, str) for k, v in local.items()):
+        raise ValueError("プロジェクトヨミ辞書の単語と読みは文字列にしてください．")
+    merged["dictionary"] = {**common, **local}
+    return merged
+
+
 def build_system_prompt(config: dict) -> str:
     """システムプロンプトを構築する（YAMLで未定義の場合はデフォルト埋め込みを使用）．"""
     # YAML側に prompt 指定があればそれを使い、なければ埋め込みプロンプトを使用
@@ -285,6 +301,8 @@ def transform(
     text: str,
     generation: dict,
     progress_callback=None,
+    paragraph_index: int | None = None,
+    paragraph_total: int | None = None,
 ) -> str:
     """一つの段落を変換し，異常時に厳格な指示で再試行する．"""
     if not text.strip():
@@ -318,6 +336,7 @@ def transform(
         parts = []
         finish_reason = None
         usage = None
+        request_error = None
         max_chars = int(generation.get("max_output_chars", 20000))
         last_progress = 0.0
         def report_progress(force=False):
@@ -359,8 +378,23 @@ def transform(
             if not result:
                 raise RuntimeError("LLMから空の応答が返されました．")
             return result
+        except Exception as exc:
+            request_error = exc
+            raise
         finally:
             report_progress(force=True)
+            record_statistics('tts_filter', model, 'error' if request_error else 'success',
+                reasoning_effort=effort, filter={
+                    'reasoning_chars': reasoning_chars, 'content_chars': content_chars,
+                    'total_chars': reasoning_chars+content_chars,
+                    'prompt_tokens': getattr(usage,'prompt_tokens',None),
+                    'completion_tokens': getattr(usage,'completion_tokens',None),
+                    'total_tokens': getattr(usage,'total_tokens',None),
+                    'input_chars':len(core_text),
+                    'paragraph_index': paragraph_index,
+                    'paragraph_total': paragraph_total,
+                    'elapsed_sec':round(time.monotonic()-started,3),
+                    'error':str(request_error) if request_error else None})
             tokens = (f"prompt_tokens={usage.prompt_tokens} completion_tokens={usage.completion_tokens} total_tokens={usage.total_tokens}"
                       if usage else "prompt_tokens=N/A completion_tokens=N/A total_tokens=N/A")
             print(f"[LLM] task=tts_filter reasoning_chars={reasoning_chars} content_chars={content_chars} "
@@ -416,7 +450,8 @@ def transform_text(
             event["task"] = f"TTSヨミ変換（段落 {index} / {total}）"
             _emit_filter_progress(event, progress_callback)
         converted.append(transform(client, model, system_prompt, paragraph, generation,
-                                   progress_callback=paragraph_progress))
+                                   progress_callback=paragraph_progress,
+                                   paragraph_index=paragraph_index, paragraph_total=paragraph_total))
     return "\n\n".join(converted)
 
 

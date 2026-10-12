@@ -35,9 +35,12 @@ import yaml
 from openai import OpenAI
 from PIL import Image, ImageDraw
 
+from statistics_store import record as record_statistics, set_current_page
+
 from tts_filter import (
     load_config as load_tts_filter_config,
     build_system_prompt as build_tts_filter_prompt,
+    merge_project_dictionary,
     make_client as make_tts_filter_client,
     transform_text as tts_filter_transform,
 )
@@ -204,6 +207,8 @@ def emit_progress(phase: str, current: int, total: int, page: int | None = None,
         "message": message,
         "reused": reused,
     }
+    if page is not None:
+        set_current_page(page)
     print(f"[PROGRESS] {json.dumps(payload, ensure_ascii=False)}", flush=True)
 
 
@@ -344,6 +349,7 @@ def stream_chat(client: OpenAI, *, task: str = "chat", max_chars: int | None = N
     n_reasoning = n_content = 0
     finish = None
     usage = None
+    error = None
     last_progress_report = 0.0
     def report_progress(force=False):
         nonlocal last_progress_report
@@ -389,6 +395,7 @@ def stream_chat(client: OpenAI, *, task: str = "chat", max_chars: int | None = N
             raise RuntimeError("LLMの回答が空です")
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=result), finish_reason=finish)])
     except Exception as exc:
+        error = exc
         print(f"[LLM] task={task} status=error reason={type(exc).__name__}: {exc}", flush=True)
         raise
     finally:
@@ -399,13 +406,23 @@ def stream_chat(client: OpenAI, *, task: str = "chat", max_chars: int | None = N
                   "prompt_tokens=N/A completion_tokens=N/A total_tokens=N/A")
         print(f"[LLM] task={task} reasoning_chars={n_reasoning} content_chars={n_content} "
               f"total_chars={total} {tokens} elapsed_sec={time.monotonic()-started:.2f}", flush=True)
+        record_statistics(task, str(kwargs.get('model','')), 'error' if error else 'success',
+            reasoning_effort=(kwargs.get('extra_body') or {}).get('reasoning_effort'),
+            llm={'reasoning_chars': n_reasoning, 'content_chars': n_content,
+                 'total_chars': total, 'prompt_tokens': getattr(usage,'prompt_tokens',None),
+                 'completion_tokens': getattr(usage,'completion_tokens',None),
+                 'total_tokens': getattr(usage,'total_tokens',None),
+                 'elapsed_sec': round(time.monotonic()-started,3),
+                 'error': str(error) if error else None})
 
 
-def apply_tts_filter(text: str, filter_config_path: Path = Path("tts_filter.yaml"), progress_callback=None) -> str:
+def apply_tts_filter(text: str, filter_config_path: Path = Path("tts_filter.yaml"), progress_callback=None, project_dir: Path | None = None) -> str:
     if not filter_config_path.exists():
         return text
 
     filter_cfg = load_tts_filter_config(filter_config_path)
+    if project_dir is not None:
+        filter_cfg = merge_project_dictionary(filter_cfg, load_project_json(project_dir))
     client = make_tts_filter_client(filter_cfg)
     model = filter_cfg.get("server", {}).get("model")
     if not model:
@@ -1652,7 +1669,8 @@ def generate_tts(
             _emit_communication_progress('[LLM_PROGRESS] ', metrics, progress_callback)
 
         tts_text = apply_tts_filter(raw_text, filter_config_path,
-                                    progress_callback=send_filter_progress) if lang == "ja" else raw_text
+                                    progress_callback=send_filter_progress,
+                                    project_dir=out_path.parent.parent) if lang == "ja" else raw_text
         limit_key = "max_input_chars" if lang == "ja" else "max_input_words"
         limit = max(0, int(tts_cfg.get(limit_key) or 0))
         chunks = split_tts_text(tts_text, lang, limit)
@@ -1705,6 +1723,12 @@ def generate_tts(
                 pass
             duration_log = f"{duration:.2f}" if duration is not None else "N/A"
             rtf_log = f"{elapsed / duration:.3f}" if duration and duration > 0 else "N/A"
+            record_statistics('tts', str(tts_cfg.get('model','')), 'success',
+                page=int(out_path.stem) if out_path.stem.isdecimal() else None,
+                tts={'chunk_index': i, 'chunk_total': len(chunks),
+                     'input_chars': len(chunk), 'audio_bytes': part.stat().st_size,
+                     'audio_duration_sec': duration, 'elapsed_sec': round(elapsed,3),
+                     'rtf': round(elapsed/duration,4) if duration and duration>0 else None})
             print(f"[TTS] page={out_path.stem} chunk={i}/{len(chunks)} "
                   f"input_chars={len(chunk)} audio_bytes={part.stat().st_size} "
                   f"duration_sec={duration_log} elapsed_sec={elapsed:.2f} rtf={rtf_log} "
@@ -1724,6 +1748,14 @@ def generate_tts(
         print(f"[TTS:{lang}] {out_path}")
         print(f"[TTS:{lang}] input text: {tts_text_path} ({len(chunks)} chunk(s))")
     except Exception as exc:
+        record_statistics('tts', str(tts_cfg.get('model','')), 'error',
+            page=int(out_path.stem) if out_path.stem.isdecimal() else None,
+            tts={'chunk_index': i if 'i' in locals() else None,
+                 'chunk_total': len(chunks) if 'chunks' in locals() else None,
+                 'input_chars': len(chunk) if 'chunk' in locals() else None,
+                 'audio_bytes': received_bytes if 'received_bytes' in locals() else None,
+                 'elapsed_sec': round(time.monotonic()-t0,3) if 't0' in locals() else None,
+                 'error': str(exc)})
         print(f"[TTS] page={out_path.stem} status=error reason={type(exc).__name__}: {exc}", flush=True)
         raise
     finally:
@@ -2087,15 +2119,26 @@ def _run_video_stage(
         all_page_subtitles.append((accumulated_offset, page_subtitles))
         accumulated_offset += duration
 
-        generate_page_video(
-            image,
-            mp3_file,
-            out,
-            schedule,
-            laser_img,
-            video_cfg,
-            force,
-        )
+        video_started = time.monotonic()
+        try:
+            generate_page_video(
+                image,
+                mp3_file,
+                out,
+                schedule,
+                laser_img,
+                video_cfg,
+                force,
+            )
+        except Exception as exc:
+            record_statistics('video', 'ffmpeg', 'error', page=page_num,
+                video={'elapsed_sec':round(time.monotonic()-video_started,3),
+                       'error':str(exc)})
+            raise
+        record_statistics('video', 'ffmpeg', 'success', page=page_num,
+            video={'elapsed_sec':round(time.monotonic()-video_started,3),
+                   'audio_duration_sec':duration,
+                   'video_bytes':out.stat().st_size if out.exists() else None})
         videos.append(out)
         video_slide_indices.append(page_num)
 
@@ -2151,6 +2194,10 @@ def main() -> int:
     check_ffmpeg()
     cfg = load_config(args.config)
     root = args.output or args.pdf.with_name(args.pdf.stem + "_lecture")
+    import os
+    import uuid
+    os.environ['SLIDE_STATISTICS_PATH'] = str((root / 'statistics.jsonl').resolve())
+    os.environ['SLIDE_STATISTICS_RUN_ID'] = uuid.uuid4().hex
     filter_config_path = Path("tts_filter.yaml")
 
     proj_cfg = load_project_json(root)

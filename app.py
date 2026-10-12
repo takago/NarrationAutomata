@@ -39,6 +39,8 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from nicegui import app, run, ui, background_tasks
 from PIL import Image, ImageDraw, ImageFont
 
+from statistics_store import run_with_statistics, export_xlsx
+
 from slide_lecture import (
     generate_single_alignment,
     generate_single_explanation,
@@ -56,6 +58,7 @@ from slide_lecture import (
 )
 from tts_filter import (
     build_system_prompt as build_tts_filter_prompt,
+    merge_project_dictionary,
     load_config as load_tts_filter_config,
     make_client as make_tts_filter_client,
     transform_text as tts_filter_transform,
@@ -683,6 +686,8 @@ class SlideNarratorApp:
         self.user_manage_container = None
         self.uploader = None
         self.project_select = None
+        self.project_dict_area = None
+        self.project_dict_save_button = None
         self.project_prompt_area = None
         self.project_prompt_save_button = None
         self.project_name_input = None
@@ -1680,7 +1685,132 @@ class SlideNarratorApp:
         except Exception as exc:
             safe_notify(f'前回のプロジェクトを復元できませんでした: {exc}', type='warning')
 
+    def save_project_dictionary(self) -> None:
+        """プロジェクトのヨミ辞書を保存する（共通辞書は変更しない）．"""
+        if not self.write_access_allowed() or not self.paths or not self.pdf:
+            return
+        if self.processing or GLOBAL_EXECUTION_LOCK.is_locked():
+            safe_notify('処理中はヨミ辞書を変更できません．', type='warning')
+            return
+        try:
+            raw = yaml.safe_load(self.project_dict_area.value or '') or {}
+            if not isinstance(raw, dict) or any(
+                not isinstance(k, str) or not isinstance(v, str) or not k.strip() or not v.strip()
+                for k, v in raw.items()
+            ):
+                raise ValueError('「単語: ヨミ」のYAML形式で記入してください．')
+            project = load_project_json(self.paths.root)
+            if raw:
+                project['tts_dictionary'] = raw
+            else:
+                project.pop('tts_dictionary', None)
+            save_project_json(self.paths.root, project)
+            self.proj_cfg = project
+            safe_notify(f'プロジェクトヨミ辞書を保存しました（{len(raw)}件）．', type='positive')
+        except Exception as exc:
+            safe_notify(f'ヨミ辞書を保存できませんでした: {exc}', type='negative')
+
+    async def test_project_dictionary(self) -> None:
+        """保存済みプロジェクト辞書と共通辞書を実際の生成と同じように統合する．"""
+        if not self.paths:
+            safe_notify('プロジェクトを選択してください．', type='warning')
+            return
+        test_text = str(self.project_dict_test_input.value or '').strip()
+        if not test_text:
+            safe_notify('テスト文を入力してください．', type='warning')
+            return
+        try:
+            # 編集中の辞書ではなく保存済みの辞書を使用し，本番の音声生成と一致させる．
+            cfg = load_tts_filter_config(TTS_FILTER_PATH)
+            cfg = merge_project_dictionary(cfg, load_project_json(self.paths.root))
+            model = cfg.get('server', {}).get('model')
+            if not model:
+                raise RuntimeError('ヨミ変換用LLMが未設定です．')
+            def convert():
+                client = make_tts_filter_client(cfg)
+                return tts_filter_transform(
+                    client=client, model=model,
+                    system_prompt=build_tts_filter_prompt(cfg),
+                    text=test_text, generation=cfg.get('generation', {}))
+            self.project_dict_test_result.text = 'ヨミ変換中…'
+            self.project_dict_audio_container.clear()
+            self.project_dict_audio_button.disable()
+            result = await run.io_bound(convert)
+            self.project_dict_test_result.text = result
+            if result.strip():
+                self.project_dict_audio_button.enable()
+        except Exception as exc:
+            self.project_dict_test_result.text = f'【エラー】{exc}'
+            self.project_dict_audio_button.disable()
+            safe_notify(f'ヨミ変換テスト失敗: {exc}', type='negative')
+
+    async def test_project_dictionary_audio(self) -> None:
+        """ヨミ変換テストの結果を現在の日本語TTS設定で音声合成して再生する．"""
+        if not self.paths:
+            safe_notify('プロジェクトを選択してください．', type='warning')
+            return
+        text = str(self.project_dict_test_result.text or '').strip()
+        if not text or text.startswith(('【エラー】', 'ヨミ変換中')):
+            safe_notify('先にヨミ変換テストを実行してください．', type='warning')
+            return
+        # 設定画面で保存された日本語TTSの設定を利用する．
+        tts_cfg = load_config(CONFIG_PATH).get('tts', {}).get('ja', {})
+        model = str(tts_cfg.get('model') or '').strip()
+        voice = str(tts_cfg.get('voice') or '').strip()
+        if not tts_cfg.get('base_url') or not model or not voice:
+            safe_notify('「設定」タブで日本語TTSの接続先・モデル・話者を設定してください．', type='warning')
+            return
+        self.project_dict_audio_button.disable()
+        self.project_dict_audio_container.clear()
+        with self.project_dict_audio_container:
+            ui.label('音声を合成中…').classes('text-xs text-zinc-400')
+        try:
+            # テスト専用ファイル．講義用の生成済み音声は上書きしない．
+            out_path = self.test_audio_dir / f'project_yomi_{secrets.token_hex(8)}.mp3'
+
+            def synthesize() -> None:
+                client = make_client(tts_cfg)
+                temp_path = out_path.with_suffix('.tmp.mp3')
+                try:
+                    with client.audio.speech.with_streaming_response.create(
+                        model=model, voice=voice, input=text, response_format='mp3',
+                    ) as response:
+                        response.stream_to_file(temp_path)
+                    if not temp_path.exists() or temp_path.stat().st_size == 0:
+                        raise RuntimeError('TTSから空の音声データが返されました．')
+                    temp_path.replace(out_path)
+                finally:
+                    temp_path.unlink(missing_ok=True)
+
+            await run.io_bound(synthesize)
+            self.project_dict_audio_container.clear()
+            with self.project_dict_audio_container:
+                ui.audio(file_url(out_path)).props('autoplay').classes('w-full')
+                ui.label(f'日本語TTS：{model} / {voice}').classes('text-xs text-zinc-400')
+            safe_notify('ヨミ変換結果の音声合成が完了しました．', type='positive')
+        except Exception as exc:
+            self.project_dict_audio_container.clear()
+            with self.project_dict_audio_container:
+                ui.label(f'【音声合成エラー】{exc}').classes('text-xs text-red-400')
+            safe_notify(f'音声合成テスト失敗: {exc}', type='negative')
+        finally:
+            self.project_dict_audio_button.enable()
+
     def refresh_project_widgets(self) -> None:
+        if self.project_dict_area is not None:
+            dictionary = self.proj_cfg.get('tts_dictionary', {}) if self.pdf else {}
+            if not isinstance(dictionary, dict):
+                dictionary = {}
+            self.project_dict_area.value = yaml.safe_dump(dictionary, allow_unicode=True, sort_keys=False).strip() if dictionary else ''
+            if self.pdf and not self.read_only:
+                self.project_dict_area.enable()
+            else:
+                self.project_dict_area.disable()
+        if self.project_dict_save_button is not None:
+            if self.pdf and not self.read_only:
+                self.project_dict_save_button.enable()
+            else:
+                self.project_dict_save_button.disable()
         if self.project_prompt_area is not None:
             prompt = self.proj_cfg.get('project_prompt', '') if self.pdf else ''
             self.project_prompt_area.value = prompt if isinstance(prompt, str) else ''
@@ -2309,6 +2439,8 @@ class SlideNarratorApp:
             self.update_job_status('running', stage='explain', message=f'スライド {page} をLLM推論中…', progress=0.6, current_page=page)
 
             new_narration = await run.io_bound(
+                run_with_statistics,
+                self.paths.root / 'statistics.jsonl', page,
                 generate_single_explanation,
                 client=client,
                 cfg=cfg['llm'],
@@ -2379,6 +2511,8 @@ class SlideNarratorApp:
             client._slide_progress_callback = self.make_individual_llm_progress_callback()
             dpi = int(self.cfg.get('pdf', {}).get('dpi', 150))
             data = await run.io_bound(
+                run_with_statistics,
+                self.paths.root / 'statistics.jsonl', page,
                 generate_single_alignment,
                 client, self.cfg['llm'], self.pdf, page,
                 self.paths.page_image(page), text.strip(), dpi, self.lang_code,
@@ -2449,6 +2583,8 @@ class SlideNarratorApp:
             out_mp3 = self.paths.audio(page)
 
             await run.io_bound(
+                run_with_statistics,
+                self.paths.root / 'statistics.jsonl', page,
                 generate_single_tts,
                 progress_callback=self.make_individual_tts_progress_callback(),
                 text_path=txt_path,
@@ -2963,6 +3099,23 @@ class SlideNarratorApp:
                         await self.save_alignment(page, out, align_data)
 
                     self.register_main_action_button(ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2'))
+
+    async def download_statistics(self) -> None:
+        """現在のプロジェクトの追記統計を分析用XLSXとして出力する．"""
+        if not self.paths:
+            safe_notify('プロジェクトを選択してください．', type='warning')
+            return
+        source = self.paths.root / 'statistics.jsonl'
+        if not source.exists() or source.stat().st_size == 0:
+            safe_notify('このプロジェクトにはまだ統計記録がありません．', type='warning')
+            return
+        destination = self.paths.root / 'statistics.xlsx'
+        try:
+            await run.io_bound(export_xlsx, source, destination)
+            ui.download(str(destination), filename='statistics.xlsx')
+        except Exception as exc:
+            self.append_job_log(f'[STATISTICS ERROR] {type(exc).__name__}: {exc}')
+            safe_notify(f'統計XLSXの作成に失敗しました: {exc}', type='negative')
 
     async def refresh_final_video(self) -> None:
         if not self._widget_available(self.final_video_container):
@@ -3595,6 +3748,7 @@ class SlideNarratorApp:
                 filter_connect_timeout = ui.number('接続タイムアウト（秒）', value=server_cfg.get('connect_timeout', 5), min=1, step=1).classes('w-48')
                 filter_read_timeout = ui.number('受信タイムアウト（秒）', value=server_cfg.get('read_timeout', 30), min=1, step=1).classes('w-48')
                 filter_write_timeout = ui.number('送信タイムアウト（秒）', value=server_cfg.get('write_timeout', 30), min=1, step=1).classes('w-48')
+                filter_max_chars = ui.number('出力文字数上限（思考＋回答）', value=gen_cfg.get('max_output_chars', 4096), min=1, step=256).classes('w-64')
 
             async def fetch_filter_models() -> None:
                 b = (filter_base.value or '').strip()
@@ -3653,7 +3807,8 @@ class SlideNarratorApp:
                                        'connect_timeout': float(filter_connect_timeout.value),
                                        'read_timeout': float(filter_read_timeout.value),
                                        'write_timeout': float(filter_write_timeout.value)},
-                            'generation': {**gen_cfg, 'temperature': float(filter_temp.value or 0), 'reasoning_effort': filter_reason.value},
+                            'generation': {**gen_cfg, 'temperature': float(filter_temp.value or 0), 'reasoning_effort': filter_reason.value,
+                                           'max_output_chars': int(filter_max_chars.value)},
                             'dictionary': filter_dict,
                             'prompt': filter_cfg.get('prompt'),
                         }
@@ -3736,6 +3891,7 @@ class SlideNarratorApp:
                     })
                     latest.setdefault('generation', {})['temperature'] = float(filter_temp.value or 0)
                     latest['generation']['reasoning_effort'] = filter_reason.value
+                    latest['generation']['max_output_chars'] = int(filter_max_chars.value)
                     latest['dictionary'] = new_dict
                     save_config(TTS_FILTER_PATH, latest)
 
@@ -3774,41 +3930,57 @@ class SlideNarratorApp:
             (ja_base, ja_key, ja_model, ja_voice, ja_limit), (en_base, en_key, en_model, en_voice, en_limit) = self._build_tts_settings()
 
             def save_main_config() -> None:
-                self.cfg['llm']['base_url'] = (llm_base.value or '').strip()
-                self.cfg['llm']['api_key'] = (llm_key.value or '').strip() or 'dummy'
-                self.cfg['llm']['model'] = (str(llm_model.value) if llm_model.value is not None else '').strip()
-                self.cfg['llm']['temperature'] = llm_temp.value
-                self.cfg['llm']['reasoning_effort'] = llm_reason.value
-                self.cfg['llm']['connect_timeout'] = float(self._llm_connect.value)
-                self.cfg['llm']['read_timeout'] = float(self._llm_read.value)
-                self.cfg['llm']['write_timeout'] = 30
-                self.cfg['llm']['max_output_chars'] = int(self._llm_limit.value)
-                tts_timeout_values = {
-                    lang: {key: float(self.cfg['tts'][lang]['_' + key + '_widget'].value)
-                           for key in ('connect', 'read', 'write')}
-                    for lang in ('ja', 'en')
-                }
-                self.cfg['tts']['ja'] = {
-                    'base_url': (ja_base.value or '').strip(),
-                    'api_key': (ja_key.value or '').strip() or 'dummy',
-                    'model': (str(ja_model.value) if ja_model.value is not None else '').strip(),
-                    'voice': (str(ja_voice.value) if ja_voice.value is not None else '').strip(),
-                    'response_format': 'mp3',
-                    'max_input_chars': int(ja_limit.value or 0),
-                }
-                self.cfg['tts']['en'] = {
-                    'base_url': (en_base.value or '').strip(),
-                    'api_key': (en_key.value or '').strip() or 'dummy',
-                    'model': (str(en_model.value) if en_model.value is not None else '').strip(),
-                    'voice': (str(en_voice.value) if en_voice.value is not None else '').strip(),
-                    'response_format': 'mp3',
-                    'max_input_words': int(en_limit.value or 0),
-                }
-                for lang in ('ja', 'en'):
-                    for key, value in tts_timeout_values[lang].items():
-                        self.cfg['tts'][lang][key + '_timeout'] = value
-                save_config(CONFIG_PATH, self.cfg)
-                ui.notify('config.yaml を保存しました．', type='positive')
+                """基本設定を保存し，結果を通知する．"""
+                try:
+                    # UI参照を含むself.cfgをそのままYAMLへ書き出さない．
+                    # 画面の値から保存用データを構成し，既存の他設定は保持する．
+                    tts_timeout_values = {
+                        lang: {key: float(self.cfg['tts'][lang]['_' + key + '_widget'].value)
+                               for key in ('connect', 'read', 'write')}
+                        for lang in ('ja', 'en')
+                    }
+                    config_to_save = load_config(CONFIG_PATH)
+                    llm_saved = config_to_save.setdefault('llm', {})
+                    llm_saved.update({
+                        'base_url': (llm_base.value or '').strip(),
+                        'api_key': (llm_key.value or '').strip() or 'dummy',
+                        'model': (str(llm_model.value) if llm_model.value is not None else '').strip(),
+                        'temperature': llm_temp.value,
+                        'reasoning_effort': llm_reason.value,
+                        'connect_timeout': float(self._llm_connect.value),
+                        'read_timeout': float(self._llm_read.value),
+                        'write_timeout': 30,
+                        'max_output_chars': int(self._llm_limit.value),
+                    })
+                    tts_saved = config_to_save.setdefault('tts', {})
+                    for lang, base, key, model, voice, limit, limit_key in (
+                        ('ja', ja_base, ja_key, ja_model, ja_voice, ja_limit, 'max_input_chars'),
+                        ('en', en_base, en_key, en_model, en_voice, en_limit, 'max_input_words'),
+                    ):
+                        section = tts_saved.setdefault(lang, {})
+                        section.update({
+                            'base_url': (base.value or '').strip(),
+                            'api_key': (key.value or '').strip() or 'dummy',
+                            'model': (str(model.value) if model.value is not None else '').strip(),
+                            'voice': (str(voice.value) if voice.value is not None else '').strip(),
+                            'response_format': 'mp3',
+                            limit_key: int(limit.value or 0),
+                        })
+                        for timeout_key, timeout_value in tts_timeout_values[lang].items():
+                            section[timeout_key + '_timeout'] = timeout_value
+
+                    save_config(CONFIG_PATH, config_to_save)
+                    verified = load_config(CONFIG_PATH)
+                    if verified.get('tts', {}).get('ja', {}).get('voice') != tts_saved['ja']['voice']:
+                        raise RuntimeError('日本語Voiceの保存後検証に失敗しました．')
+                    # 既存の表示用ウィジェット参照は保持し，保存対象の値だけ反映する．
+                    self.cfg['llm'].update(llm_saved)
+                    for lang in ('ja', 'en'):
+                        self.cfg['tts'][lang].update(tts_saved[lang])
+                    ui.notify('config.yaml に基本設定を保存しました．', type='positive')
+                except Exception as err:
+                    LOGGER.exception('基本設定(config.yaml)の保存に失敗しました')
+                    ui.notify(f'config.yaml の保存に失敗しました: {err}', type='negative')
 
             ui.button('💾 基本設定 (config.yaml) を一括保存', on_click=save_main_config).props('color=primary size=lg').classes('w-full mt-2 mb-2')
             self._build_dict_editor()
@@ -4038,7 +4210,7 @@ class SlideNarratorApp:
             ui.label('TAKAGO_LAB. 2026').classes('text-subtitle2 font-mono tracking-wider text-slate-300 mr-2')
 
         # 左サイドドロワー
-        with ui.left_drawer(value=True).props('width=320').classes('p-4'):
+        with ui.left_drawer(value=True).props('width=380').classes('p-4'):
             if self.read_only:
                 ui.label('閲覧モード：利用可能時間外のため編集・生成はできません．').classes('text-sm text-amber-400')
             ui.timer(1.0, self.refresh_job_status)
@@ -4077,21 +4249,43 @@ class SlideNarratorApp:
             self.refresh_project_list()
             self.refresh_project_name_input()
 
+            self.mode_select = ui.radio({'lecture': '🎓 講義', 'research': '🔬 研究発表'}, value=self.mode_code).props('inline')
+            self.mode_select.on_value_change(lambda e: self._mode_changed(e.value))
+            self.lang_select = ui.radio({'ja': '🇯🇵 日本語', 'en': '🇺🇸 英語'}, value=self.lang_code).props('inline')
+            self.lang_select.on_value_change(lambda e: self._lang_changed(e.value))
+            ui.separator().classes('w-full my-3')
             with ui.expansion('プロジェクト全体の追加プロンプト', icon='edit_note').classes('w-full mt-2'):
                 ui.label('全スライドのナレーション生成に適用します．変更は次回の生成・再生成から有効になります．').classes('text-xs text-zinc-400')
                 self.project_prompt_area = ui.textarea(
                     label='共通の追加指示',
                     placeholder='例：情報工学科3年生を対象とし，専門用語を正確に使い，具体例を交えて説明してください．',
-                ).props('outlined autogrow').classes('w-full')
+                ).props('outlined autogrow input-style="min-height: 170px"').classes('w-full')
                 self.project_prompt_save_button = ui.button(
                     '追加プロンプトを保存', icon='save', on_click=self.save_project_prompt,
                 ).props('outline color=primary dense').classes('w-full')
+            with ui.expansion('プロジェクトのヨミ辞書', icon='translate').classes('w-full mt-2'):
+                ui.label('単語: ヨミ のYAML形式で入力します．同じ単語は共通辞書より優先されます．').classes('text-xs text-zinc-400')
+                self.project_dict_area = ui.textarea(
+                    label='プロジェクト専用の読み',
+                    placeholder='語1: ヨミ1\n語2: ヨミ2',
+                    value='KIT: ケイ・アイ・ティー\nI2C: アイ・スクエアド・シー'
+                ).props('outlined autogrow input-style="min-height: 190px"').classes('w-full font-mono')
+                self.project_dict_save_button = ui.button(
+                    'ヨミ辞書を保存', icon='save', on_click=self.save_project_dictionary,
+                ).props('outline color=primary dense').classes('w-full')
+                ui.label('テストは保存済み辞書を使用します．').classes('text-xs text-zinc-400')
+                self.project_dict_test_input = ui.textarea(
+                    label='ヨミ変換テスト文',
+                    value='私は今，KITの情報工学科でI2Cの講習を受けています．CLK/DATA/GNDの３本のWireで通信できるのはとても面白いですね．',
+                ).props('outlined autogrow input-style="min-height: 120px"').classes('w-full')
+                ui.button('ヨミ変換をテスト', icon='play_arrow', on_click=self.test_project_dictionary).props('outline dense').classes('w-full')
+                self.project_dict_test_result = ui.label('').classes('w-full whitespace-pre-wrap text-sm text-zinc-300')
+                self.project_dict_audio_button = ui.button(
+                    '音声合成をテスト', icon='volume_up', on_click=self.test_project_dictionary_audio,
+                ).props('outline dense').classes('w-full')
+                self.project_dict_audio_button.disable()
+                self.project_dict_audio_container = ui.column().classes('w-full')
             self.refresh_project_widgets()
-
-            self.mode_select = ui.radio({'lecture': '🎓 講義', 'research': '🔬 研究発表'}, value=self.mode_code).props('inline')
-            self.mode_select.on_value_change(lambda e: self._mode_changed(e.value))
-            self.lang_select = ui.radio({'ja': '🇯🇵 日本語', 'en': '🇺🇸 英語'}, value=self.lang_code).props('inline')
-            self.lang_select.on_value_change(lambda e: self._lang_changed(e.value))
 
             with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2'):
                 self.default_vlm_switch = ui.switch('VLMを活用してポインタ配置を決定する', value=self.default_use_vlm).props('dense color=primary')
@@ -4141,6 +4335,9 @@ class SlideNarratorApp:
                         'detail': p_detail,
                         'error': p_error,
                     }
+
+            ui.button('統計データ(xlsx)', icon='table_view', on_click=self.download_statistics) \
+                .props('outline color=primary').classes('w-full mt-2')
 
             self.reset_generated_button = self.register_main_action_button(
                 ui.button('生成データを削除', icon='delete_outline', on_click=self.confirm_reset_generated_data)
