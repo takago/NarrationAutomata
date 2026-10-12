@@ -758,6 +758,8 @@ class SlideNarratorApp:
         self.statistics_notice = None
         self.statistics_scale_switch = None
         self.statistics_scale_max_input = None
+        self.pointer_breakdown_switch = None
+        self.pointer_breakdown_mode = None
         self._statistics_signature = None
         self.pages_input = None
         self.pipeline_buttons: list[Any] = []
@@ -1581,7 +1583,11 @@ class SlideNarratorApp:
     @staticmethod
     def _statistics_chart_options(records: list[dict], total_pages: int, *, common_scale: bool = True,
                                   common_max: int | None = None,
-                                  image_urls: dict[str, str] | None = None) -> dict:
+                                  image_urls: dict[str, str] | None = None,
+                                  pointer_image_urls: dict[str, str] | None = None,
+                                  pointer_counts: dict[int, dict[str, int]] | None = None,
+                                  show_pointer_breakdown: bool = False,
+                                  pointer_percent: bool = True) -> dict:
         """処理別に最新の成功記録を表示する．異なる工程の文字数は合算しない．
 
         同一ページ・同一タスクの再実行については，JSONLの最後の成功記録を採用する．
@@ -1622,6 +1628,9 @@ class SlideNarratorApp:
             latest[(page, key)] = details
 
         pages = [str(i) for i in range(1, total_pages + 1)]
+        pointer_grid = 3 if show_pointer_breakdown else None
+        def grid_slot(stage_index: int) -> int:
+            return stage_index + (1 if show_pointer_breakdown and stage_index >= 3 else 0)
         series = []
         maxima = []
         valid_counts = []
@@ -1647,12 +1656,33 @@ class SlideNarratorApp:
             valid_counts.append(count)
             series.extend([
                 {'name': f'{key} 思考文字数', 'type': 'bar', 'stack': f'stage_{index}',
-                 'xAxisIndex': index, 'yAxisIndex': index, 'data': reasoning,
+                 'xAxisIndex': grid_slot(index), 'yAxisIndex': grid_slot(index), 'data': reasoning,
                  'itemStyle': {'color': '#60a5fa'}},
                 {'name': f'{key} 回答文字数', 'type': 'bar', 'stack': f'stage_{index}',
-                 'xAxisIndex': index, 'yAxisIndex': index, 'data': answer,
+                 'xAxisIndex': grid_slot(index), 'yAxisIndex': grid_slot(index), 'data': answer,
                  'itemStyle': {'color': '#34d399'}},
             ])
+
+        if show_pointer_breakdown:
+            pointer_counts = pointer_counts or {}
+            for source, label, color in (
+                ('pdf', 'PDF由来', '#16a34a'),
+                ('vlm', 'VLM由来', '#dc2626'),
+                ('none', 'ポインタなし', '#80838b'),
+            ):
+                values = []
+                for page in range(1, total_pages + 1):
+                    counts = pointer_counts.get(page)
+                    if counts is None:
+                        values.append(None)
+                        continue
+                    total = sum(counts.get(k, 0) for k in ('pdf', 'vlm', 'none'))
+                    n = counts.get(source, 0)
+                    values.append(round(n * 100 / total, 5) if pointer_percent and total else
+                                  (0 if pointer_percent else n))
+                series.append({'name': label, 'type': 'bar', 'stack': 'pointer_source',
+                               'xAxisIndex': pointer_grid, 'yAxisIndex': pointer_grid,
+                               'data': values, 'itemStyle': {'color': color}})
 
         import math
         largest = max(maxima, default=0)
@@ -1667,39 +1697,54 @@ class SlideNarratorApp:
             shared_max = common_max
 
         slide_images = json.dumps(image_urls or {}, ensure_ascii=False)
+        pointer_images = json.dumps(pointer_image_urls or {}, ensure_ascii=False)
         titles = json.dumps([title for _, title in definitions], ensure_ascii=False)
         formatter = r"""function(params) {
             const list = Array.isArray(params) ? params : [params];
             if (!list.length) return '';
             const item = list[0];
             const page = String(item.axisValue ?? item.name ?? '');
+            const number = value => Number(value || 0).toLocaleString('ja-JP');
+            const imgHtml = url => url ? '<img src="' + url + '" style="display:block;width:260px;max-width:100%;height:auto;max-height:160px;object-fit:contain;background:#fff;margin:7px 0;border-radius:4px" />' : '';
+            if (item.seriesIndex >= 10) {
+                const totals = __POINTER_COUNTS__;
+                const counts = totals[page] || {};
+                const total = (counts.pdf || 0) + (counts.vlm || 0) + (counts.none || 0);
+                const url = (__POINTER_IMAGES__)[page] || (__IMAGES__)[page];
+                const names = [['none', 'ポインタなし'], ['vlm', 'VLM由来'], ['pdf', 'PDF由来']];
+                return '<div style="min-width:230px;color:#e2e8f0"><strong>スライド ' + page + ' ／ ポインタ採用元</strong>' + imgHtml(url) +
+                    names.map(([key, name]) => '<div>' + name + '：' + number(counts[key] || 0) + '件（' +
+                      (total ? (100 * (counts[key] || 0) / total).toFixed(1) : '0.0') + '%）</div>').join('') +
+                    '<div>合計：' + number(total) + '件</div></div>';
+            }
             const group = Math.floor(item.seriesIndex / 2);
             const titles = __TITLES__;
             const url = (__IMAGES__)[page];
-            const number = value => Number(value || 0).toLocaleString('ja-JP');
             const items = list.filter(p => Math.floor(p.seriesIndex / 2) === group);
             let reasoning = 0, content = 0;
             for (const p of items) {
                 if (p.seriesIndex % 2 === 0) reasoning += Number(p.value || 0);
                 else content += Number(p.value || 0);
             }
-            const img = url ? '<img src="' + url + '" style="display:block;width:260px;max-width:100%;height:auto;max-height:160px;object-fit:contain;background:#fff;margin:7px 0;border-radius:4px" />' : '';
             return '<div style="min-width:230px;color:#e2e8f0">' +
-                   '<strong>スライド ' + page + ' ／ ' + titles[group] + '</strong>' + img +
-                   '<div>思考文字数：' + number(reasoning) + '</div>' +
+                   '<strong>スライド ' + page + ' ／ ' + titles[group] + '</strong>' + imgHtml(url) +
                    '<div>回答文字数：' + number(content) + '</div>' +
+                   '<div>思考文字数：' + number(reasoning) + '</div>' +
                    '<div>合計：' + number(reasoning + content) + '</div></div>';
-        }""".replace('__TITLES__', titles).replace('__IMAGES__', slide_images)
+        }""".replace('__TITLES__', titles).replace('__IMAGES__', slide_images).replace(
+            '__POINTER_IMAGES__', pointer_images).replace(
+            '__POINTER_COUNTS__', json.dumps({str(k): v for k, v in (pointer_counts or {}).items()}))
 
         # 各グリッドの位置と高さを同じ規則で計算し，横軸をそろえる．
-        grid_height = 12
-        gap = 6
-        starts = [6 + index * (grid_height + gap) for index in range(len(definitions))]
+        total_grids = len(definitions) + int(show_pointer_breakdown)
+        grid_height = 10 if show_pointer_breakdown else 12
+        gap = 5 if show_pointer_breakdown else 6
+        starts = [6 + index * (grid_height + gap) for index in range(total_grids)]
         axes = []
-        for index in range(len(definitions)):
+        for index in range(total_grids):
             x = {'type': 'category', 'gridIndex': index, 'data': pages,
                  'axisLabel': {'color': '#94a3b8', 'hideOverlap': True}}
-            if index == len(definitions) - 1:
+            if index == total_grids - 1:
                 x.update({'name': 'スライド番号', 'nameLocation': 'middle', 'nameGap': 30})
             axes.append(x)
         axis_color = {'color': '#94a3b8'}
@@ -1720,13 +1765,15 @@ class SlideNarratorApp:
             'grid': [{'top': f'{top}%', 'left': 95, 'right': 28, 'height': f'{grid_height}%'} for top in starts],
             # グラフ見出しはNiceGUI側に描画し，ⓘツールチップを添える．
             'xAxis': axes,
-            'yAxis': [{'type': 'value', 'gridIndex': index, 'name': '文字数',
-                       'nameTextStyle': axis_color, 'axisLabel': axis_color, **limits}
-                      for index in range(len(definitions))],
+            'yAxis': [{'type': 'value', 'gridIndex': index, 'name': ('割合（%）' if pointer_percent else '件数') if index == pointer_grid else '文字数',
+                       'nameTextStyle': axis_color, 'axisLabel': axis_color,
+                       **(({'min': 0, 'max': 100, 'splitNumber': 4} if pointer_percent else {'min': 0, 'minInterval': 1})
+                          if index == pointer_grid else limits)}
+                      for index in range(total_grids)],
             'dataZoom': [
-                {'type': 'inside', 'xAxisIndex': list(range(len(definitions))),
+                {'type': 'inside', 'xAxisIndex': list(range(total_grids)),
                  'filterMode': 'none', 'start': 0, 'end': 100},
-                {'type': 'slider', 'xAxisIndex': list(range(len(definitions))),
+                {'type': 'slider', 'xAxisIndex': list(range(total_grids)),
                  'bottom': 8, 'height': 17, 'textStyle': axis_color,
                  'filterMode': 'none', 'start': 0, 'end': 100},
             ],
@@ -1783,12 +1830,31 @@ class SlideNarratorApp:
             sheet.append(['スライド番号',
                           'ナレーション生成（画像・テキスト解析） 思考', 'ナレーション生成（画像・テキスト解析） 回答',
                           'Bbox検出（スライド要素の位置検出） 思考', 'Bbox検出（スライド要素の位置検出） 回答',
-                          '字幕用翻訳 思考', '字幕用翻訳 回答',
                           'ポインタ位置選定 思考', 'ポインタ位置選定 回答',
+                          '字幕用翻訳 思考', '字幕用翻訳 回答',
                           'TTSヨミ変換 思考', 'TTSヨミ変換 回答'])
-            series = options['series']
+            # 保存済みアライメントから実件数と割合を集計（グラフの表示設定には依存しない）．
+            headers = ['PDF由来件数', 'VLM由来件数', 'ポインタなし件数', '合計件数',
+                       'PDF由来割合', 'VLM由来割合', 'ポインタなし割合']
+            for index, header in enumerate(headers, 12):
+                sheet.cell(1, index, header)
+            counts_by_page = self._pointer_source_counts(page_count)
+            series = options['series'][:2 * len(STATISTICS_STAGE_INFO)]
             for index in range(page_count):
-                sheet.append([index + 1] + [part['data'][index] for part in series])
+                page = index + 1
+                counts = counts_by_page.get(page)
+                values = [part['data'][index] for part in series]
+                if counts is None:
+                    extra = [None] * 7
+                else:
+                    pdf_count = counts.get('pdf', 0)
+                    vlm_count = counts.get('vlm', 0)
+                    none_count = counts.get('none', 0)
+                    total = pdf_count + vlm_count + none_count
+                    extra = [pdf_count, vlm_count, none_count, total] + ([pdf_count / total, vlm_count / total, none_count / total] if total else [None] * 3)
+                sheet.append([page] + values + extra)
+                for column in range(16, 19):
+                    sheet.cell(page + 1, column).number_format = '0.0%'
             sheet.freeze_panes = 'B2'
             sheet.auto_filter.ref = sheet.dimensions
             sheet.row_dimensions[1].height = 28
@@ -1797,11 +1863,11 @@ class SlideNarratorApp:
                 cell.fill = PatternFill('solid', fgColor='17324D')
                 cell.alignment = Alignment(vertical='center', wrap_text=True)
             sheet.column_dimensions['A'].width = 17
-            for column in range(2, len(series) + 2):
+            for column in range(2, 19):
                 sheet.column_dimensions[get_column_letter(column)].width = 22
             for row in sheet.iter_rows(min_row=2, min_col=2):
                 for cell in row:
-                    cell.number_format = '#,##0'
+                    cell.number_format = '0.0%' if cell.column >= 16 else '#,##0'
             temporary = destination.with_name('.statistics_chart_export.xlsx')
             try:
                 workbook.save(temporary)
@@ -1816,6 +1882,32 @@ class SlideNarratorApp:
             LOGGER.exception('工程別統計Excelの出力に失敗')
             safe_notify(f'工程別統計のダウンロードに失敗しました：{exc}', type='negative')
 
+    def _pointer_source_counts(self, page_count: int) -> dict[int, dict[str, int]]:
+        """保存済みアライメントを読み込み，文単位でポインタ採用元を数える．"""
+        result: dict[int, dict[str, int]] = {}
+        if not self.paths:
+            return result
+        for page in range(1, page_count + 1):
+            path = self.paths.alignment(page)
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+                blocks, alignments = data.get('blocks', []), data.get('alignments', [])
+                if not isinstance(blocks, list) or not isinstance(alignments, list):
+                    continue
+                result[page], _ = alignment_source_statistics(blocks, alignments)
+            except (OSError, ValueError, TypeError, AttributeError):
+                LOGGER.warning('ポインタ採用元統計を読み込めません: %s', path, exc_info=True)
+        return result
+
+    def _pointer_display_changed(self) -> None:
+        shown = bool(self.pointer_breakdown_switch.value)
+        mode = str(self.pointer_breakdown_mode.value or 'percent')
+        app.storage.user[f'pointer_breakdown_visible_{self.username}'] = shown
+        app.storage.user[f'pointer_breakdown_mode_{self.username}'] = mode
+        self.refresh_statistics_chart(force=True)
+
     def refresh_statistics_chart(self, force: bool = False) -> None:
         """統計タブ表示中のみ統計レコードを再読込し，工程別グラフを更新する．"""
         if not self._widget_available(self.statistics_chart_container):
@@ -1823,7 +1915,9 @@ class SlideNarratorApp:
         if self._active_tab != 'statistics' and not force:
             return
         source = self.paths.root / 'statistics.jsonl' if self.paths else None
-        signature = (str(source), self._file_signature(source)) if source else None
+        signature = ((str(source), self._file_signature(source),
+                      tuple(self._file_signature(self.paths.alignment(p)) for p in range(1, len(self.images) + 1)))
+                     if source and self.paths else None)
         if not force and signature == self._statistics_signature and self._widget_available(self.statistics_chart):
             return
         self._statistics_signature = signature
@@ -1848,11 +1942,45 @@ class SlideNarratorApp:
                 path = self.paths.page_image(page)
                 if path.is_file():
                     image_urls[str(page)] = file_url(path)
+        pointer_image_urls = {}
+        if self.paths:
+            for page in range(1, page_count + 1):
+                preview = self.paths.page_preview(page)
+                used_preview = preview.with_name(f'{preview.stem}_used{preview.suffix}')
+                source_alignment = self.paths.alignment(page)
+                original_image = self.paths.page_image(page)
+                needs_preview = source_alignment.is_file() and original_image.is_file() and (
+                    not used_preview.is_file() or
+                    used_preview.stat().st_mtime_ns < max(source_alignment.stat().st_mtime_ns,
+                                                          original_image.stat().st_mtime_ns))
+                if needs_preview:
+                    # 詳細画面を開いていなくても，採用ID付きプレビューを作成できるようにする．
+                    try:
+                        data = json.loads(self.paths.alignment(page).read_text(encoding='utf-8'))
+                        blocks = data.get('blocks', [])
+                        alignments = data.get('alignments', [])
+                        if isinstance(blocks, list) and isinstance(alignments, list):
+                            _, usage = alignment_source_statistics(blocks, alignments)
+                            draw_block_preview(self.paths.page_image(page), blocks, set(usage)).save(used_preview)
+                            pointer_image_urls[str(page)] = file_url(used_preview)
+                    except Exception:
+                        LOGGER.warning('採用IDプレビュー生成に失敗: %s', page, exc_info=True)
+                elif used_preview.is_file():
+                    pointer_image_urls[str(page)] = file_url(used_preview)
         common_scale = bool(self.statistics_scale_switch.value) if self._widget_available(self.statistics_scale_switch) else True
         common_max = self._statistics_custom_axis_max() if common_scale else None
+        show_pointer = (bool(self.pointer_breakdown_switch.value)
+                        if self._widget_available(self.pointer_breakdown_switch) else False)
+        pointer_percent = (str(self.pointer_breakdown_mode.value) != 'count'
+                           if self._widget_available(self.pointer_breakdown_mode) else True)
+        counts_by_page = self._pointer_source_counts(page_count) if show_pointer else {}
         options = self._statistics_chart_options(records, page_count, common_scale=common_scale,
-                                                 common_max=common_max, image_urls=image_urls)
-        names = ('ナレーション', 'Bbox検出', '字幕用翻訳', 'ポインタ', 'ヨミ変換')
+                                                 common_max=common_max, image_urls=image_urls,
+                                                 pointer_image_urls=pointer_image_urls,
+                                                 pointer_counts=counts_by_page,
+                                                 show_pointer_breakdown=show_pointer,
+                                                 pointer_percent=pointer_percent)
+        names = tuple(info['title'] for info in STATISTICS_STAGE_INFO)
         counts = [sum(options['series'][2 * i]['data'][j] is not None for j in range(page_count))
                   for i in range(len(names))]
         if self._widget_available(self.statistics_notice):
@@ -1867,9 +1995,11 @@ class SlideNarratorApp:
                 # EChartsの5段グリッドと同じ位置に見出しを重ねる．
                 # 見出しはNiceGUI要素とし，説明をhoverで表示可能にする．
                 with ui.element('div').classes('relative w-full'):
-                    self.statistics_chart = ui.echart(options).classes('w-full h-[1350px]')
+                    self.statistics_chart = ui.echart(options).classes(
+                        'w-full h-[1500px]' if show_pointer else 'w-full h-[1350px]')
                     for index, info in enumerate(STATISTICS_STAGE_INFO):
-                        top_percent = 2 + index * 18
+                        slot = index + (1 if show_pointer and index >= 3 else 0)
+                        top_percent = (2 + slot * 15) if show_pointer else (2 + index * 18)
                         with ui.row().classes('absolute items-center gap-1 flex-nowrap').style(
                             f'top: {top_percent}%; left: 8px; z-index: 2;'
                         ):
@@ -1883,6 +2013,17 @@ class SlideNarratorApp:
                                     ui.label(f"入力：{info['input']}").classes('whitespace-normal')
                                     ui.label(f"出力：{info['output']}").classes('whitespace-normal')
                                     ui.label(f"目的：{info['purpose']}").classes('whitespace-normal')
+                    if show_pointer:
+                        with ui.row().classes('absolute items-center gap-1 flex-nowrap').style(
+                            'top: 47%; left: 8px; z-index: 2;'
+                        ):
+                            ui.label('ポインタ採用元の内訳').classes('text-xs text-slate-200')
+                            ui.label('■ PDF由来').style('color: #16a34a; font-size: 11px;')
+                            ui.label('■ VLM由来').style('color: #dc2626; font-size: 11px;')
+                            ui.label('■ ポインタなし').style('color: #80838b; font-size: 11px;')
+                            ui.icon('info_outline', size='16px').tooltip(
+                                '各ナレーション文で採用された対象をPDF由来／VLM由来／ポインタなしに分類します．'
+                                'VLM由来とは，VLMが検出した要素をポインタ位置選定LLMが採用したことを意味します．')
 
     # --- プロジェクト一覧・名前・削除 ---
 
@@ -3705,12 +3846,12 @@ class SlideNarratorApp:
         final = self.paths.final_video
         with self.final_video_container:
             if final.is_file():
-                ui.button('▶ 完成版ビデオを再生',
-                          on_click=lambda: self.show_video_dialog(final, '完成版ビデオ')) \
+                ui.button('▶ 完成ビデオを再生',
+                          on_click=lambda: self.show_video_dialog(final, '完成ビデオ')) \
                     .props('color=primary').classes('w-full')
-                ui.link('🎬 MP4をダウンロード',
-                        '/download/' + final.resolve().relative_to(Path.cwd().resolve()).as_posix(),
-                        new_tab=True).classes('text-primary font-bold text-xs')
+                ui.button('MP4ダウンロード', icon='download',
+                          on_click=lambda: ui.download(str(final), filename=final.name)) \
+                    .props('dense outline').classes('w-full')
             else:
                 ui.label('動画未生成').classes('text-xs text-zinc-500')
 
@@ -4955,9 +5096,6 @@ class SlideNarratorApp:
                         'error': p_error,
                     }
 
-            self.statistics_button = ui.button('統計データ(xlsx)', icon='table_view', on_click=self.download_statistics) \
-                .props('outline color=primary').classes('w-full mt-2')
-
             self.reset_generated_button = self.register_main_action_button(
                 ui.button('生成データを削除', icon='delete_outline', on_click=self.confirm_reset_generated_data)
                 .props('outline color=negative').classes('w-full mt-2')
@@ -5026,7 +5164,22 @@ class SlideNarratorApp:
                         self.statistics_scale_max_input.on('change', lambda _: self.refresh_statistics_chart(force=True))
                         ui.button('Excelダウンロード', icon='download',
                                   on_click=self.download_statistics_chart).props('dense outline')
+                    ui.label('下記のグラフのデータは，Excelファイルの「工程別グラフ」シート（シート1）にまとめてあります．').classes('text-caption text-slate-400')
                     ui.label('上限が空欄または0の場合は自動調整します．').classes('text-caption text-slate-400')
+                    with ui.row().classes('w-full items-center gap-4 flex-wrap'):
+                        self.pointer_breakdown_switch = ui.switch(
+                            'ポインタ採用元の内訳を表示',
+                            value=bool(app.storage.user.get(f'pointer_breakdown_visible_{self.username}', True))
+                        ).props('dense')
+                        mode_saved = app.storage.user.get(f'pointer_breakdown_mode_{self.username}', 'percent')
+                        self.pointer_breakdown_mode = ui.toggle(
+                            {'percent': '百分率（%）', 'count': '実件数（件）'},
+                            value=mode_saved if mode_saved in ('percent', 'count') else 'percent'
+                        ).props('dense no-caps')
+                        self.pointer_breakdown_switch.on('update:model-value',
+                                                         lambda _: self._pointer_display_changed())
+                        self.pointer_breakdown_mode.on('update:model-value',
+                                                       lambda _: self._pointer_display_changed())
                     self.statistics_notice = ui.label('プロジェクトを選択してください．').classes('text-caption text-slate-400')
                     self.statistics_chart_container = ui.column().classes('w-full')
                     self.statistics_chart = None
