@@ -695,6 +695,19 @@ class SlideNarratorApp:
         self.mode_select = None
         self.lang_select = None
         self.default_vlm_switch = None
+        self.view_mode = 'easy'
+        self.advanced_sidebar_sections: list[Any] = []
+        self.advanced_stage_buttons: list[Any] = []
+        self.advanced_stage_rows: list[Any] = []
+        self.easy_generate_button = None
+        self.easy_cancel_button = None
+        self.easy_progress_box = None
+        self.easy_progress_label = None
+        self.easy_progress_bar = None
+        self.easy_progress_spinner = None
+        self.easy_progress_detail = None
+        self.easy_progress_metrics = None
+        self.statistics_button = None
         self.pages_input = None
         self.pipeline_buttons: list[Any] = []
         self.stage_widgets: dict[str, dict[str, Any]] = {}
@@ -841,6 +854,15 @@ class SlideNarratorApp:
                 received_at, base_elapsed = clock
                 elapsed = max(elapsed, base_elapsed + max(0.0, time.monotonic() - received_at))
         return f'{elapsed:.1f}'
+
+    def format_llm_progress(self, metrics: dict[str, Any], error: bool = False, running: bool = False) -> str:
+        """Easy / Advanced 共通のLLM受信状況表示．"""
+        return (f'処理：{metrics.get("task") or "LLM処理"}\n'
+                f'状態：{"エラー停止" if error else "LLM受信中"}\n'
+                f'経過時間：{self._display_elapsed("llm", metrics, running)}秒\n'
+                f'思考文字数：{metrics.get("reasoning_chars", 0):,}文字\n'
+                f'回答文字数：{metrics.get("content_chars", 0):,}文字\n'
+                f'合計文字数：{metrics.get("total_chars", 0):,} / {metrics.get("limit_chars", 40000):,}文字')
 
     def format_tts_progress(self, metrics: dict[str, Any], error: bool = False, running: bool = False) -> str:
         state = 'エラー停止' if error else str(metrics.get('state') or '音声合成中')
@@ -1079,55 +1101,120 @@ class SlideNarratorApp:
         dialog.on('hide', cleanup)
         dialog.open()
 
-    def refresh_job_status(self) -> None:
-        """ポーリング時に画面上のボタン・進捗バー群を同期"""
-        allowed_now = self.write_access_allowed(notify=False)
-        if self.read_only != (not allowed_now):
-            safe_notify('利用可能時間が変わったため，画面を更新します．', type='info')
-            try:
-                ui.navigate.reload()
-            except Exception:
-                pass
-            return
-
-        globally_busy = GLOBAL_EXECUTION_LOCK.is_locked()
-        owner_name = GLOBAL_EXECUTION_LOCK.current_user or '' if globally_busy else ''
-
-        if globally_busy:
-            status = read_user_job_status(owner_name) if owner_name else {}
-            status = {**status, 'stage': status.get('stage') or GLOBAL_EXECUTION_LOCK.task_name or '処理中'}
+    def _refresh_easy_action_visibility(self) -> None:
+        """Easyでは同じ位置の「全自動生成／中断」を実行状態に応じて切り替える．"""
+        if self.view_mode != 'easy':
+            show_cancel = False
+            show_generate = False
         else:
-            status = read_user_job_status(self.username)
-            if status.get('state') == 'running':
-                status = {**status, 'state': 'failed', 'message': '実行中状態を確認できません（サーバ再起動等の可能性があります）'}
+            show_cancel = (GLOBAL_EXECUTION_LOCK.is_locked()
+                           and GLOBAL_EXECUTION_LOCK.current_user == self.username)
+            show_generate = not show_cancel
+        if self._widget_available(self.easy_generate_button):
+            self.easy_generate_button.classes(remove='hidden') if show_generate else self.easy_generate_button.classes(add='hidden')
+        if self._widget_available(self.easy_cancel_button):
+            self.easy_cancel_button.classes(remove='hidden') if show_cancel else self.easy_cancel_button.classes(add='hidden')
 
-        # 再ログイン後の新しい画面にも，状態ファイルの内容を反映する．
-        own_status = read_user_job_status(self.username)
-        if self._widget_available(self.job_status_label):
-            self._safe_view_update(
-                lambda: setattr(self.job_status_label, 'text', self.format_job_status(
-                    status if globally_busy and owner_name == self.username else own_status)),
-                '再接続後の処理状態表示',
-            )
-
-        active_key = self.get_active_stage_key(status)
-        owner_is_self = globally_busy and owner_name == self.username
-
-        if self.pipeline_busy_row is not None and self.pipeline_busy_notice is not None:
-            try:
-                if globally_busy and not owner_is_self:
-                    self.pipeline_busy_notice.text = f'他のユーザ（{owner_name or "xxxx"}）が処理中です．'
-                    self.pipeline_busy_row.classes(remove='hidden')
+    def set_sidebar_view_mode(self, mode: str) -> None:
+        """表示内容だけを変更する．生成設定と実行中のジョブには触れない．"""
+        self.view_mode = mode if mode in ('easy', 'advanced') else 'easy'
+        # 同一利用者の次回アクセスでも選択状態を復元する．
+        app.storage.user[f'sidebar_mode_{self.username}'] = self.view_mode
+        advanced = self.view_mode == 'advanced'
+        for section in self.advanced_sidebar_sections:
+            if self._widget_available(section):
+                if advanced:
+                    section.classes(remove='hidden')
                 else:
-                    self.pipeline_busy_row.classes(add='hidden')
-            except Exception:
-                pass
+                    section.classes(add='hidden')
+        # ボタンだけ隠すと親の column の余白が残るため，行全体を切り替える．
+        for stage_row in self.advanced_stage_rows:
+            if self._widget_available(stage_row):
+                if advanced:
+                    stage_row.classes(remove='hidden')
+                else:
+                    stage_row.classes(add='hidden')
+        self._refresh_easy_action_visibility()
+        if self._widget_available(self.statistics_button):
+            if advanced:
+                self.statistics_button.classes(remove='hidden')
+            else:
+                self.statistics_button.classes(add='hidden')
+        if self._widget_available(self.easy_progress_box):
+            self.easy_progress_box.classes(remove='hidden') if not advanced else self.easy_progress_box.classes(add='hidden')
+        self.refresh_job_status()
 
-        if owner_name == self.username and globally_busy:
-            self.processing = True  # 表示のためだけ．実行主体はowner_appのまま変更しない．
-        elif not globally_busy:
-            self.processing = False
+    def _refresh_easy_progress(self, status: dict[str, Any], own_status: dict[str, Any],
+                               owner_is_self: bool) -> None:
+        """Easyモードの処理進捗とLLM/TTSメトリクスを同期する．"""
+        if self._widget_available(self.easy_progress_box):
+            own_display = status if owner_is_self else own_status
+            display_state = own_display.get('state', 'idle')
+            if self._widget_available(self.easy_progress_spinner):
+                if self.view_mode == 'easy' and display_state == 'running' and owner_is_self:
+                    self.easy_progress_spinner.classes(remove='hidden')
+                else:
+                    self.easy_progress_spinner.classes(add='hidden')
+            if display_state in ('running', 'failed', 'completed', 'cancelled'):
+                self.easy_progress_box.classes(remove='hidden') if self.view_mode == 'easy' else self.easy_progress_box.classes(add='hidden')
+                key = self.get_active_stage_key(own_display)
+                stage_names = {'explain': 'ナレーション原稿の生成', 'align': '翻訳・字幕・ポインタ配置', 'tts': '音声合成', 'video': '動画の生成'}
+                stage_name = stage_names.get(key, '生成処理')
+                progress = own_display.get('progress')
+                current_index = own_display.get('current_index')
+                total_count = own_display.get('total_count')
+                if display_state == 'running':
+                    self.easy_progress_label.text = f'処理中：{stage_name}'
+                elif display_state == 'completed':
+                    self.easy_progress_label.text = '生成完了'
+                elif display_state == 'failed':
+                    self.easy_progress_label.text = f'エラー停止：{stage_name}'
+                else:
+                    self.easy_progress_label.text = '処理を中断しました'
+                stage_index = ORDERED_STAGES.index(key) if key in ORDERED_STAGES else 0
+                fraction = max(0.0, min(1.0, float(progress))) if isinstance(progress, (int, float)) else 0.0
+                self.easy_progress_bar.value = 1.0 if display_state == 'completed' else (stage_index + fraction) / len(ORDERED_STAGES)
+                pieces = []
+                if current_index and total_count:
+                    pieces.append(f'スライド {current_index} / {total_count}枚')
+                started = own_display.get('started_at')
+                if started:
+                    try:
+                        # 終了後は終了時刻で固定し，ポーリングで経過時間が増えないようにする．
+                        finished = own_display.get('finished_at')
+                        end_time = (datetime.now() if display_state == 'running' else
+                                    datetime.fromisoformat(finished) if finished else None)
+                        if end_time is not None:
+                            elapsed = max(0, int((end_time - datetime.fromisoformat(started)).total_seconds()))
+                            pieces.append(f'経過時間 {elapsed // 60}分{elapsed % 60:02d}秒')
+                    except (ValueError, TypeError):
+                        pass
+                if display_state == 'failed':
+                    pieces.append(str(own_display.get('error_detail') or own_display.get('message') or '詳細不明')[:200])
+                self.easy_progress_detail.text = ' ／ '.join(pieces)
+                # Advancedと同じLLM/TTS情報を，Easyの進捗バー下にも表示する．
+                if self._widget_available(self.easy_progress_metrics):
+                    detail = ''
+                    if display_state == 'running' and owner_is_self:
+                        llm_metrics = own_display.get('llm_metrics')
+                        tts_metrics = own_display.get('tts_metrics') if key == 'tts' else None
+                        if isinstance(tts_metrics, dict):
+                            detail = self.format_tts_progress(tts_metrics, running=True)
+                        elif isinstance(llm_metrics, dict):
+                            detail = self.format_llm_progress(llm_metrics, running=True)
+                    self.easy_progress_metrics.text = detail
+                    if detail:
+                        self.easy_progress_metrics.classes(remove='hidden')
+                    else:
+                        self.easy_progress_metrics.classes(add='hidden')
+            else:
+                self.easy_progress_box.classes(add='hidden')
+                if self._widget_available(self.easy_progress_metrics):
+                    self.easy_progress_metrics.classes(add='hidden')
 
+    def _refresh_advanced_stages(self, status: dict[str, Any], active_key: str | None,
+                                 globally_busy: bool, owner_is_self: bool) -> bool:
+        """Advancedモードの各工程を描画し，中断待ち状態を返す．"""
         owner_app = GLOBAL_EXECUTION_LOCK.owner_app if globally_busy else None
         cancel_pending = bool(owner_app and owner_app.cancellation_requested)
         completed_stages = status.get('completed_stages', [])
@@ -1135,6 +1222,9 @@ class SlideNarratorApp:
         active_idx = ORDERED_STAGES.index(active_key) if (active_key in ORDERED_STAGES) else -1
 
         for key, w in self.stage_widgets.items():
+            if self.view_mode == 'easy':
+                w['box'].classes(add='hidden')
+                continue
             btn = w['button']
             box = w['box']
             p_label = w['label']
@@ -1143,6 +1233,7 @@ class SlideNarratorApp:
             p_indet = w['indeterminate']
             p_detail = w['detail']
             p_error = w['error']
+            p_easy_elapsed = w['easy_elapsed']
 
             try:
                 btn.classes(remove='animate-pulse rotate-infinite')
@@ -1152,6 +1243,7 @@ class SlideNarratorApp:
 
                 p_detail.classes(add='hidden')
                 p_error.classes(add='hidden')
+                p_easy_elapsed.classes(add='hidden')
                 if status.get('state') == 'failed' and key == active_key and (not globally_busy or owner_is_self):
                     box.classes(remove='hidden')
                     p_spinner.classes(add='hidden')
@@ -1164,17 +1256,14 @@ class SlideNarratorApp:
                     p_error.classes(remove='hidden')
                     metrics = status.get('llm_metrics')
                     if isinstance(metrics, dict):
-                        p_detail.text = (f'処理：{metrics.get("task") or "LLM処理"}\n'
-                            f'状態：エラー停止\n'
-                            f'経過時間：{self._display_elapsed("llm", metrics, False)}秒\n'
-                            f'思考文字数：{metrics.get("reasoning_chars", 0):,}文字\n'
-                            f'回答文字数：{metrics.get("content_chars", 0):,}文字\n'
-                            f'合計文字数：{metrics.get("total_chars", 0):,} / {metrics.get("limit_chars", 40000):,}文字')
-                        p_detail.classes(remove='hidden')
+                        p_detail.text = self.format_llm_progress(metrics, error=True, running=False)
+                        if self.view_mode == 'advanced':
+                            p_detail.classes(remove='hidden')
                     tts_metrics = status.get('tts_metrics') if key == 'tts' else None
                     if isinstance(tts_metrics, dict):
                         p_detail.text = self.format_tts_progress(tts_metrics, error=True)
-                        p_detail.classes(remove='hidden')
+                        if self.view_mode == 'advanced':
+                            p_detail.classes(remove='hidden')
                     self.set_button_enabled_visual(btn, not self.read_only)
 
                 elif owner_is_self and status.get('state') == 'running' and key == active_key:
@@ -1208,18 +1297,24 @@ class SlideNarratorApp:
 
                     metrics = status.get('llm_metrics')
                     if isinstance(metrics, dict):
-                        p_detail.text = (f'処理：{metrics.get("task") or "LLM処理"}\n'
-                            f'状態：LLM受信中\n'
-                            f'経過時間：{self._display_elapsed("llm", metrics, True)}秒\n'
-                            f'思考文字数：{metrics.get("reasoning_chars", 0):,}文字\n'
-                            f'回答文字数：{metrics.get("content_chars", 0):,}文字\n'
-                            f'合計文字数：{metrics.get("total_chars", 0):,} / {metrics.get("limit_chars", 40000):,}文字')
-                        p_detail.classes(remove='hidden')
+                        p_detail.text = self.format_llm_progress(metrics, error=False, running=True)
+                        if self.view_mode == 'advanced':
+                            p_detail.classes(remove='hidden')
 
                     tts_metrics = status.get('tts_metrics') if key == 'tts' else None
                     if isinstance(tts_metrics, dict):
                         p_detail.text = self.format_tts_progress(tts_metrics, running=True)
-                        p_detail.classes(remove='hidden')
+                        if self.view_mode == 'advanced':
+                            p_detail.classes(remove='hidden')
+                    if self.view_mode == 'easy':
+                        started = status.get('started_at')
+                        if started:
+                            try:
+                                elapsed_seconds = max(0, int((datetime.now() - datetime.fromisoformat(started)).total_seconds()))
+                                p_easy_elapsed.text = f'経過時間：{elapsed_seconds // 60}分{elapsed_seconds % 60:02d}秒'
+                                p_easy_elapsed.classes(remove='hidden')
+                            except (ValueError, TypeError):
+                                pass
                     self.set_button_enabled_visual(btn, not cancel_pending)
 
                 elif owner_is_self and (key in completed_stages or (active_idx >= 0 and key_idx < active_idx)):
@@ -1242,6 +1337,68 @@ class SlideNarratorApp:
                         self.set_button_enabled_visual(btn, not self.read_only)
             except Exception:
                 pass
+        return cancel_pending
+
+    def refresh_job_status(self) -> None:
+        """ポーリング時に画面上のボタン・進捗バー群を同期"""
+        allowed_now = self.write_access_allowed(notify=False)
+        if self.read_only != (not allowed_now):
+            safe_notify('利用可能時間が変わったため，画面を更新します．', type='info')
+            try:
+                ui.navigate.reload()
+            except Exception:
+                pass
+            return
+
+        globally_busy = GLOBAL_EXECUTION_LOCK.is_locked()
+        owner_name = GLOBAL_EXECUTION_LOCK.current_user or '' if globally_busy else ''
+
+        if globally_busy:
+            status = read_user_job_status(owner_name) if owner_name else {}
+            status = {**status, 'stage': status.get('stage') or GLOBAL_EXECUTION_LOCK.task_name or '処理中'}
+        else:
+            status = read_user_job_status(self.username)
+            if status.get('state') == 'running':
+                status = {**status, 'state': 'failed', 'message': '実行中状態を確認できません（サーバ再起動等の可能性があります）'}
+
+        # 再ログイン後の新しい画面にも，状態ファイルの内容を反映する．
+        own_status = read_user_job_status(self.username)
+        if self._widget_available(self.job_status_label):
+            self._safe_view_update(
+                lambda: setattr(self.job_status_label, 'text', self.format_job_status(
+                    status if globally_busy and owner_name == self.username else own_status)),
+                '再接続後の処理状態表示',
+            )
+
+        active_key = self.get_active_stage_key(status)
+        owner_is_self = globally_busy and owner_name == self.username
+        self._refresh_easy_action_visibility()
+        self._refresh_easy_progress(status, own_status, owner_is_self)
+
+        if self.pipeline_busy_row is not None and self.pipeline_busy_notice is not None:
+            try:
+                if globally_busy and not owner_is_self:
+                    self.pipeline_busy_notice.text = f'他のユーザ（{owner_name or "xxxx"}）が処理中です．'
+                    self.pipeline_busy_row.classes(remove='hidden')
+                else:
+                    self.pipeline_busy_row.classes(add='hidden')
+            except Exception:
+                pass
+
+        if owner_name == self.username and globally_busy:
+            self.processing = True  # 表示のためだけ．実行主体はowner_appのまま変更しない．
+        elif not globally_busy:
+            self.processing = False
+
+        cancel_pending = self._refresh_advanced_stages(status, active_key, globally_busy, owner_is_self)
+
+        if self._widget_available(self.easy_generate_button):
+            self.set_button_enabled_visual(self.easy_generate_button, not (globally_busy or self.read_only))
+        if self._widget_available(self.easy_cancel_button):
+            self.set_button_enabled_visual(
+                self.easy_cancel_button,
+                owner_is_self and not cancel_pending,
+            )
 
         for button in self.main_action_buttons:
             self.set_button_enabled_visual(button, not (globally_busy or self.read_only))
@@ -2005,6 +2162,16 @@ class SlideNarratorApp:
         elif not GLOBAL_EXECUTION_LOCK.is_locked():
             status = {**status, 'state': 'idle'}
         active_key = self.get_active_stage_key(status)
+        self._refresh_easy_action_visibility()
+        if self._widget_available(self.easy_generate_button):
+            self.set_button_enabled_visual(self.easy_generate_button, not value and not self.read_only)
+        if self._widget_available(self.easy_cancel_button):
+            self.set_button_enabled_visual(
+                self.easy_cancel_button,
+                GLOBAL_EXECUTION_LOCK.is_locked()
+                and GLOBAL_EXECUTION_LOCK.current_user == self.username
+                and not self.cancellation_requested,
+            )
         for key, button in zip(('explain', 'align', 'tts', 'video'), self.pipeline_buttons):
             try:
                 if value:
@@ -2122,7 +2289,7 @@ class SlideNarratorApp:
             current_page=self.active_pages[0],
             current_index=1,
             total_count=total_active_slides,
-            started_at=datetime.now().isoformat(timespec='seconds'),
+            started_at=datetime.now().isoformat(timespec='seconds'), finished_at=None,
         )
         self.set_processing(True)
 
@@ -2426,7 +2593,7 @@ class SlideNarratorApp:
             message=f'スライド {page} の原稿を作成中…',
             progress=0.2,
             current_page=page,
-            started_at=datetime.now().isoformat(timespec='seconds'), llm_metrics=None, tts_metrics=None, error_detail=None,
+            started_at=datetime.now().isoformat(timespec='seconds'), finished_at=None, llm_metrics=None, tts_metrics=None, error_detail=None,
         )
         self.append_job_log(f'[REGEN] スライド {page} ナレーション再生成開始')
         self.set_processing(True)
@@ -2502,7 +2669,7 @@ class SlideNarratorApp:
             return
 
         mode_label = "VLM併用" if mode_str == 'vlm' else "PDF基準"
-        self.update_job_status('running', stage='align', message=f'スライド {page} 解析中（{mode_label}）', progress=0.3, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'), llm_metrics=None, tts_metrics=None, error_detail=None)
+        self.update_job_status('running', stage='align', message=f'スライド {page} 解析中（{mode_label}）', progress=0.3, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'), finished_at=None, llm_metrics=None, tts_metrics=None, error_detail=None)
         self.append_job_log(f'[ALIGN] スライド {page} の要素抽出 ({mode_label}) と視線誘導を再計算中...')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
@@ -2573,7 +2740,7 @@ class SlideNarratorApp:
             safe_notify(f'他のユーザーが処理を実行中です．完了するまでお待ちください．', type='negative', duration=5)
             return
 
-        self.update_job_status('running', stage='tts', message=f'スライド {page} 音声合成中…', progress=0.4, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'), llm_metrics=None, tts_metrics=None, error_detail=None)
+        self.update_job_status('running', stage='tts', message=f'スライド {page} 音声合成中…', progress=0.4, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'), finished_at=None, llm_metrics=None, tts_metrics=None, error_detail=None)
         self.append_job_log(f'[TTS] スライド {page} の音声合成を開始 (lang={self.lang_code})')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
@@ -4187,28 +4354,7 @@ class SlideNarratorApp:
 
     # --- 画面レイアウト構築 ---
 
-    def build(self) -> None:
-        ui.page_title('Slide Narrator')
-        ui.dark_mode().enable()
-        ui.colors(primary='#3b82f6')
-
-        current_username = app.storage.user.get('username', '')
-        is_admin = app.storage.user.get('is_admin', False)
-
-        def logout() -> None:
-            app.storage.user.clear()
-            ui.navigate.to('/login')
-
-        # ヘッダー
-        with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
-            ui.label('🎓 Slide Narrator').classes('text-h5 text-white')
-            ui.space()
-            if current_username:
-                badge_role = ' (管理者)' if is_admin else ''
-                ui.label(f'👤 {current_username}{badge_role}').classes('text-caption text-slate-400 mr-2')
-            ui.button('ログアウト', on_click=logout).props('dense outline size=sm color=white').classes('mr-3')
-            ui.label('TAKAGO_LAB. 2026').classes('text-subtitle2 font-mono tracking-wider text-slate-300 mr-2')
-
+    def _build_sidebar(self) -> None:
         # 左サイドドロワー
         with ui.left_drawer(value=True).props('width=380').classes('p-4'):
             if self.read_only:
@@ -4249,12 +4395,34 @@ class SlideNarratorApp:
             self.refresh_project_list()
             self.refresh_project_name_input()
 
-            self.mode_select = ui.radio({'lecture': '🎓 講義', 'research': '🔬 研究発表'}, value=self.mode_code).props('inline')
-            self.mode_select.on_value_change(lambda e: self._mode_changed(e.value))
-            self.lang_select = ui.radio({'ja': '🇯🇵 日本語', 'en': '🇺🇸 英語'}, value=self.lang_code).props('inline')
-            self.lang_select.on_value_change(lambda e: self._lang_changed(e.value))
+            # 設定行のラベル列とラジオ選択肢の列幅を揃える．
+            with ui.column().classes('w-full gap-1 mt-2'):
+                with ui.row().classes('w-full items-center gap-2 flex-nowrap min-h-[32px]'):
+                    ui.label('表示モード').classes('w-[88px] shrink-0 text-xs text-zinc-400 whitespace-nowrap')
+                    with ui.row().classes('items-center gap-2 flex-nowrap'):
+                        ui.label('Easy').classes('text-sm whitespace-nowrap')
+                        ui.switch(value=self.view_mode == 'advanced',
+                                  on_change=lambda e: self.set_sidebar_view_mode('advanced' if e.value else 'easy')).props('dense')
+                        ui.label('Advanced').classes('text-sm whitespace-nowrap')
+
+                with ui.row().classes('w-full items-center gap-2 flex-nowrap min-h-[32px]'):
+                    ui.label('発表スタイル').classes('w-[88px] shrink-0 text-xs text-zinc-400 whitespace-nowrap')
+                    self.mode_select = ui.radio(
+                        {'lecture': '講義', 'research': '研究発表'},
+                        value=self.mode_code,
+                    ).props('dense').style('display: grid; grid-template-columns: 78px max-content; align-items: center; column-gap: 0;')
+                self.mode_select.on_value_change(lambda e: self._mode_changed(e.value))
+
+                with ui.row().classes('w-full items-center gap-2 flex-nowrap min-h-[32px]'):
+                    ui.label('言語').classes('w-[88px] shrink-0 text-xs text-zinc-400 whitespace-nowrap')
+                    self.lang_select = ui.radio(
+                        {'ja': '日本語', 'en': '英語'},
+                        value=self.lang_code,
+                    ).props('dense').style('display: grid; grid-template-columns: 78px max-content; align-items: center; column-gap: 0;')
+                self.lang_select.on_value_change(lambda e: self._lang_changed(e.value))
             ui.separator().classes('w-full my-3')
-            with ui.expansion('プロジェクト全体の追加プロンプト', icon='edit_note').classes('w-full mt-2'):
+            with ui.expansion('プロジェクト全体の追加プロンプト', icon='edit_note').classes('w-full mt-2') as prompt_expansion:
+                self.advanced_sidebar_sections.append(prompt_expansion)
                 ui.label('全スライドのナレーション生成に適用します．変更は次回の生成・再生成から有効になります．').classes('text-xs text-zinc-400')
                 self.project_prompt_area = ui.textarea(
                     label='共通の追加指示',
@@ -4263,7 +4431,8 @@ class SlideNarratorApp:
                 self.project_prompt_save_button = ui.button(
                     '追加プロンプトを保存', icon='save', on_click=self.save_project_prompt,
                 ).props('outline color=primary dense').classes('w-full')
-            with ui.expansion('プロジェクトのヨミ辞書', icon='translate').classes('w-full mt-2'):
+            with ui.expansion('プロジェクトのヨミ辞書', icon='translate').classes('w-full mt-2') as dictionary_expansion:
+                self.advanced_sidebar_sections.append(dictionary_expansion)
                 ui.label('単語: ヨミ のYAML形式で入力します．同じ単語は共通辞書より優先されます．').classes('text-xs text-zinc-400')
                 self.project_dict_area = ui.textarea(
                     label='プロジェクト専用の読み',
@@ -4287,7 +4456,8 @@ class SlideNarratorApp:
                 self.project_dict_audio_container = ui.column().classes('w-full')
             self.refresh_project_widgets()
 
-            with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2'):
+            with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2') as vlm_card:
+                self.advanced_sidebar_sections.append(vlm_card)
                 self.default_vlm_switch = ui.switch('VLMを活用してポインタ配置を決定する', value=self.default_use_vlm).props('dense color=primary')
                 self.default_vlm_switch.tooltip('ONにすると図形・数式・グラフの内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
                 self.default_vlm_switch.on_value_change(lambda e: self._default_vlm_changed(e.value))
@@ -4306,13 +4476,34 @@ class SlideNarratorApp:
                 ui.spinner(size='xs', color='warning')
                 self.pipeline_busy_notice = ui.label('').classes('text-xs font-bold text-amber-400')
 
+            self.easy_generate_button = ui.button(
+                '全自動生成', icon='play_arrow',
+                on_click=lambda: self.handle_pipeline_button('video', '④ ナレーションビデオを作成中…'),
+            ).props('color=primary').classes('w-full')
+            self.easy_generate_button.tooltip('必要な前工程から動画完成まで一括して実行します．')
+            self.easy_cancel_button = ui.button(
+                '中断', icon='stop', on_click=self.confirm_cancel,
+            ).props('outline color=negative').classes('w-full hidden')
+            self.easy_cancel_button.tooltip('実行中の生成処理に中断を要求します．')
+            self.easy_cancel_button.disable()
+            with ui.column().classes('w-full gap-2 rounded-lg p-2 bg-zinc-900 border border-zinc-800 hidden') as self.easy_progress_box:
+                self.easy_progress_label = ui.label('生成処理中…').classes('font-bold text-sm')
+                with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
+                    self.easy_progress_spinner = ui.spinner(size='sm', color='primary').classes('hidden shrink-0')
+                    self.easy_progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=8px color=positive').classes('flex-1 min-w-0')
+                self.easy_progress_detail = ui.label('').classes('text-xs text-zinc-400 whitespace-pre-wrap')
+                self.easy_progress_metrics = ui.label('').classes('hidden text-xs text-zinc-400 whitespace-pre-wrap')
+
             self.stage_widgets.clear()
             self.pipeline_buttons.clear()
+            self.advanced_stage_rows.clear()
 
             for key, label, initial_msg in STAGE_DEFINITIONS:
-                with ui.column().classes('w-full gap-1 mb-2'):
+                with ui.column().classes('w-full gap-1 mb-2') as stage_row:
+                    self.advanced_stage_rows.append(stage_row)
                     btn = ui.button(label, on_click=lambda k=key, m=initial_msg: self.handle_pipeline_button(k, m)).props('color=primary').classes('w-full')
                     self.pipeline_buttons.append(btn)
+                    self.advanced_stage_buttons.append(btn)
 
                     with ui.column().classes('w-full px-1 hidden gap-1') as progress_box:
                         with ui.row().classes('w-full items-center justify-between text-[11px]'):
@@ -4322,6 +4513,7 @@ class SlideNarratorApp:
 
                         p_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=6px color=positive').classes('w-full hidden')
                         p_indet = ui.linear_progress(value=0.0, show_value=False).props('indeterminate rounded size=6px color=positive').classes('w-full')
+                        p_easy_elapsed = ui.label('').classes('text-[11px] text-zinc-400 hidden')
                         p_detail = ui.label('').classes('text-[11px] text-zinc-400 whitespace-pre-wrap hidden')
                         p_error = ui.label('').classes('text-[11px] text-red-400 whitespace-pre-wrap hidden')
 
@@ -4333,10 +4525,11 @@ class SlideNarratorApp:
                         'bar': p_bar,
                         'indeterminate': p_indet,
                         'detail': p_detail,
+                        'easy_elapsed': p_easy_elapsed,
                         'error': p_error,
                     }
 
-            ui.button('統計データ(xlsx)', icon='table_view', on_click=self.download_statistics) \
+            self.statistics_button = ui.button('統計データ(xlsx)', icon='table_view', on_click=self.download_statistics) \
                 .props('outline color=primary').classes('w-full mt-2')
 
             self.reset_generated_button = self.register_main_action_button(
@@ -4345,7 +4538,10 @@ class SlideNarratorApp:
             )
             self.reset_generated_button.tooltip('元PDF，プロジェクト設定，ページ画像を残し，生成済みの原稿・字幕・音声・動画を削除します．')
 
+            self.set_sidebar_view_mode(self.view_mode)
+
             if self.read_only:
+                self.easy_generate_button.disable()
                 for button in self.pipeline_buttons:
                     button.disable()
                 self.mode_select.disable()
@@ -4360,6 +4556,7 @@ class SlideNarratorApp:
             ui.label('TAKAGO LAB., KIT, Japan.').classes('text-caption')
             ui.link('GitHub: takago/slide-narrator', 'https://github.com/takago/slide-narrator', new_tab=True)
 
+    def _build_main_tabs(self, is_admin: bool) -> None:
         # メインタブエリア
         with ui.column().classes('w-full p-6'):
             with ui.tabs().classes('w-full') as tabs:
@@ -4417,6 +4614,33 @@ class SlideNarratorApp:
             if not self.read_only:
                 tab_simple_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('simple'))
                 tab_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('detail'))
+
+    def build(self) -> None:
+        ui.page_title('Slide Narrator')
+        ui.dark_mode().enable()
+        ui.colors(primary='#3b82f6')
+
+        current_username = app.storage.user.get('username', '')
+        is_admin = app.storage.user.get('is_admin', False)
+
+        def logout() -> None:
+            app.storage.user.clear()
+            ui.navigate.to('/login')
+
+        # ヘッダー
+        with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
+            ui.label('🎓 Slide Narrator').classes('text-h5 text-white')
+            ui.space()
+            if current_username:
+                badge_role = ' (管理者)' if is_admin else ''
+                ui.label(f'👤 {current_username}{badge_role}').classes('text-caption text-slate-400 mr-2')
+            ui.button('ログアウト', on_click=logout).props('dense outline size=sm color=white').classes('mr-3')
+            ui.label('TAKAGO_LAB. 2026').classes('text-subtitle2 font-mono tracking-wider text-slate-300 mr-2')
+
+        self.view_mode = app.storage.user.get(f'sidebar_mode_{self.username}', 'easy')
+        self._build_sidebar()
+
+        self._build_main_tabs(is_admin)
 
         if is_admin and not self.read_only:
             self.refresh_settings()
