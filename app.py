@@ -618,18 +618,18 @@ STATISTICS_STAGE_INFO = [
         'purpose': 'ポインタの候補となる図表・数式・図内部品などの位置を検出する',
     },
     {
-        'task': '字幕翻訳',
-        'title': '字幕用翻訳',
-        'input': '生成済みナレーション文章',
-        'output': '字幕用の翻訳文章',
-        'purpose': '元のナレーションをもう一方の言語の字幕に翻訳する',
-    },
-    {
         'task': 'ポインタ位置選定',
         'title': 'ポインタ位置選定',
         'input': 'ナレーション文章，スライド画像，PDF・VLM由来の要素一覧',
         'output': 'ナレーションの各文とスライド要素の対応関係',
         'purpose': '話している内容に対応するレーザーポインタの対象を決める',
+    },
+    {
+        'task': '字幕翻訳',
+        'title': '字幕用翻訳',
+        'input': '生成済みナレーション文章',
+        'output': '字幕用の翻訳文章',
+        'purpose': '元のナレーションをもう一方の言語の字幕に翻訳する',
     },
     {
         'task': 'tts_filter',
@@ -724,7 +724,13 @@ class SlideNarratorApp:
         self.settings_container = None
         self.user_manage_container = None
         self.uploader = None
+        self.upload_status_box = None
+        self.upload_status_label = None
+        self.upload_status_detail = None
+        self.upload_status_bar = None
+        self._upload_active = False
         self.project_select = None
+        self.project_id_label = None
         self.project_dict_area = None
         self.project_dict_save_button = None
         self.project_prompt_area = None
@@ -1911,6 +1917,8 @@ class SlideNarratorApp:
             self.project_select.update()
         except Exception:
             pass
+        if self._widget_available(self.project_id_label):
+            self.project_id_label.set_text(f'プロジェクトID：{current_value or "未選択"}')
 
     def refresh_project_name_input(self) -> None:
         if self.project_name_input is not None:
@@ -2111,18 +2119,60 @@ class SlideNarratorApp:
 
     # --- PDF 読み込み & 復元 ---
 
+    def _set_upload_status(self, message: str, detail: str = '') -> None:
+        """PDF取り込みの状況を表示する．通信中は割合を推測せず不定進捗で示す．"""
+        if self._widget_available(self.upload_status_box):
+            self.upload_status_box.classes(remove='hidden')
+        if self._widget_available(self.upload_status_label):
+            self.upload_status_label.text = message
+        if self._widget_available(self.upload_status_detail):
+            self.upload_status_detail.text = detail
+
+    def _upload_added(self) -> None:
+        self._upload_active = True
+        self._set_upload_status('PDFをアップロード中…', 'ファイルを送信しています')
+
+    def _upload_failed(self) -> None:
+        self._upload_active = False
+        self._set_upload_status('アップロードに失敗しました', 'ファイルを確認して再試行してください')
+        self._reset_uploader()
+
+    def _upload_finished(self) -> None:
+        """通信の完了後もPDF解析処理中なら進捗を隠さない．"""
+        if self._upload_active:
+            self._set_upload_status('PDFを処理中…', 'プロジェクト作成を進めています')
+
+    def _reset_uploader(self) -> None:
+        """選択済みファイルをクリアし，次のPDFを同じ画面から追加可能にする．"""
+        if self._widget_available(self.uploader):
+            try:
+                self.uploader.reset()
+            except Exception:
+                LOGGER.exception('PDFアップローダーのリセットに失敗しました')
+
+    def _upload_complete(self) -> None:
+        self._upload_active = False
+        self._reset_uploader()
+        if self._widget_available(self.upload_status_box):
+            self.upload_status_box.classes(add='hidden')
+
     async def load_pdf(self, e) -> None:
         """アップロードPDFごとに一意のIDを発行し，新規プロジェクトとして保存する．"""
         if not self.write_access_allowed():
+            self._upload_complete()
             return
         if GLOBAL_EXECUTION_LOCK.is_locked():
             ui.notify('処理中は新しいプロジェクトを作成できません．', type='warning')
+            self._upload_complete()
             return
         filename = Path(e.file.name).name
         if not filename or filename in ('.', '..') or Path(filename).suffix.lower() != '.pdf':
             ui.notify('PDFファイルを選択してください．', type='warning')
+            self._upload_complete()
             return
 
+        self._upload_active = True
+        self._set_upload_status('PDFを保存中…', filename)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         while True:
             project_id = datetime.now().strftime('%Y%m%d') + '.' + ''.join(secrets.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_') for _ in range(6))
@@ -2160,6 +2210,7 @@ class SlideNarratorApp:
             saved_vmode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'vlm')
             self.default_use_vlm = saved_vmode in ('vlm', 'auto', True, 'true')
             self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
+            self._set_upload_status('スライド画像を準備中…', filename)
             self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
             self.apply_pages_spec(self.proj_cfg.get('pages', ''), save_and_refresh=False)
             self.refresh_project_widgets()
@@ -2171,6 +2222,8 @@ class SlideNarratorApp:
             shutil.rmtree(project_dir, ignore_errors=True)
             ui.notify(f'プロジェクトの作成に失敗しました: {exc}', type='negative')
             self.refresh_project_list()
+        finally:
+            self._upload_complete()
 
     async def _initial_restore(self) -> None:
         """最後に開いていたプロジェクトを復元する．"""
@@ -3697,6 +3750,7 @@ class SlideNarratorApp:
             with ui.row().classes('w-full items-center gap-4'):
                 self._llm_connect = ui.number('LLM接続タイムアウト（秒）', value=llm.get('connect_timeout', 5), min=1, step=1).classes('w-48')
                 self._llm_read = ui.number('LLM受信タイムアウト（秒）', value=llm.get('read_timeout', 30), min=1, step=1).classes('w-48')
+                self._llm_attempts = ui.number('LLM最大試行回数（初回含む）', value=llm.get('max_attempts', 3), min=1, max=10, step=1, precision=0).classes('w-56')
                 self._llm_limit = ui.number('LLM出力上限（思考＋回答，文字）', value=llm.get('max_output_chars', 40000), min=100, step=1000).classes('w-64')
 
             async def fetch_llm_models() -> None:
@@ -4270,6 +4324,7 @@ class SlideNarratorApp:
                 ui.label('ヨミ変換用LLMの通信タイムアウト').classes('text-sm font-semibold text-zinc-300')
                 filter_connect_timeout = ui.number('接続タイムアウト（秒）', value=server_cfg.get('connect_timeout', 5), min=1, step=1).classes('w-48')
                 filter_read_timeout = ui.number('受信タイムアウト（秒）', value=server_cfg.get('read_timeout', 30), min=1, step=1).classes('w-48')
+                filter_max_attempts = ui.number('最大試行回数（初回含む）', value=gen_cfg.get('max_attempts', 3), min=1, max=10, step=1, precision=0).classes('w-56')
                 filter_write_timeout = ui.number('送信タイムアウト（秒）', value=server_cfg.get('write_timeout', 30), min=1, step=1).classes('w-48')
                 filter_max_chars = ui.number('出力文字数上限（思考＋回答）', value=gen_cfg.get('max_output_chars', 4096), min=1, step=256).classes('w-64')
 
@@ -4331,7 +4386,7 @@ class SlideNarratorApp:
                                        'read_timeout': float(filter_read_timeout.value),
                                        'write_timeout': float(filter_write_timeout.value)},
                             'generation': {**gen_cfg, 'temperature': float(filter_temp.value or 0), 'reasoning_effort': filter_reason.value,
-                                           'max_output_chars': int(filter_max_chars.value)},
+                                           'max_output_chars': int(filter_max_chars.value), 'max_attempts': int(filter_max_attempts.value or 3)},
                             'dictionary': filter_dict,
                             'prompt': filter_cfg.get('prompt'),
                         }
@@ -4415,6 +4470,7 @@ class SlideNarratorApp:
                     latest.setdefault('generation', {})['temperature'] = float(filter_temp.value or 0)
                     latest['generation']['reasoning_effort'] = filter_reason.value
                     latest['generation']['max_output_chars'] = int(filter_max_chars.value)
+                    latest['generation']['max_attempts'] = int(filter_max_attempts.value or 3)
                     latest['dictionary'] = new_dict
                     save_config(TTS_FILTER_PATH, latest)
 
@@ -4472,6 +4528,7 @@ class SlideNarratorApp:
                         'reasoning_effort': llm_reason.value,
                         'connect_timeout': float(self._llm_connect.value),
                         'read_timeout': float(self._llm_read.value),
+                        'max_attempts': int(self._llm_attempts.value or 3),
                         'write_timeout': 30,
                         'max_output_chars': int(self._llm_limit.value),
                     })
@@ -4731,7 +4788,15 @@ class SlideNarratorApp:
             if self.read_only:
                 self.uploader.disable()
 
-            self.uploader.on('added', lambda: self.uploader.run_method('eval', 'if (this.files.length > 1) { this.removeFile(this.files[0]); }'))
+            self.uploader.on('added', self._upload_added)
+            self.uploader.on('failed', self._upload_failed)
+            # 既存の hidden アップローダーを維持し，進捗は独立したパネルに表示する．
+            with ui.column().classes('w-full gap-1 hidden mt-2 rounded-lg border border-blue-500/60 bg-slate-900 p-3') as self.upload_status_box:
+                with ui.row().classes('w-full items-center gap-2'):
+                    ui.spinner(size='sm', color='blue-4')
+                    self.upload_status_label = ui.label('PDFをアップロード中…').classes('text-sm font-semibold text-white')
+                self.upload_status_bar = ui.linear_progress(value=None, color='blue-5').props('indeterminate rounded size=10px').classes('w-full')
+                self.upload_status_detail = ui.label('').classes('text-xs text-slate-300 break-all')
 
             with ui.row().classes('w-full items-center justify-between mt-2'):
                 ui.label('プロジェクト').classes('text-h6')
@@ -4751,10 +4816,15 @@ class SlideNarratorApp:
             self.refresh_project_list()
             self.refresh_project_name_input()
 
+            # 選択中のプロジェクトを名前とは独立した一意のIDで確認できるようにする．
+            current_id = self.pdf.parent.name if self.pdf and self.pdf.exists() else None
+            self.project_id_label = ui.label(f'プロジェクトID：{current_id or "未選択"}') \
+                .classes('w-full text-xs text-zinc-400 font-mono mt-2 select-text')
+
             # 設定行のラベル列とラジオ選択肢の列幅を揃える．
             with ui.column().classes('w-full gap-1 mt-2'):
                 with ui.row().classes('w-full items-center gap-2 flex-nowrap min-h-[32px]'):
-                    ui.label('表示モード').classes('w-[88px] shrink-0 text-xs text-zinc-400 whitespace-nowrap')
+                    ui.label('操作モード').classes('w-[88px] shrink-0 text-xs text-zinc-400 whitespace-nowrap')
                     with ui.row().classes('items-center gap-2 flex-nowrap'):
                         ui.label('Easy').classes('text-sm whitespace-nowrap')
                         ui.switch(value=self.view_mode == 'advanced',

@@ -401,9 +401,24 @@ def transform(
                   f"total_chars={reasoning_chars+content_chars} {tokens} elapsed_sec={time.monotonic()-started:.2f}",
                   file=sys.stderr, flush=True)
 
+    from openai import APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
+    max_attempts = max(1, min(10, int(generation.get('max_attempts', 3))))
     last_reason = ""
-    for attempt in range(2):
-        result = request(strict=attempt > 0)
+    for attempt in range(max_attempts):
+        try:
+            result = request(strict=attempt > 0)
+        except Exception as exc:
+            retryable = isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError))
+            if isinstance(exc, RuntimeError):
+                retryable = ('LLMストリーム異常終了' in str(exc) or
+                             'LLMから空の応答' in str(exc))
+            if not retryable or attempt + 1 >= max_attempts:
+                raise
+            last_reason = str(exc)
+            delay = min(2 ** attempt, 4)
+            print(f'[TTS_FILTER RETRY] 試行{attempt+1}/{max_attempts}: {exc}', file=sys.stderr, flush=True)
+            time.sleep(delay)
+            continue
         last_reason = _suspicious_change(core_text, result) or ""
         if not last_reason:
             return leading + result + trailing

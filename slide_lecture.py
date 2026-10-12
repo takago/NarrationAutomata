@@ -329,6 +329,7 @@ def make_client(cfg: dict) -> OpenAI:
     client = OpenAI(base_url=cfg["base_url"], api_key=cfg.get("api_key", "dummy"),
                     http_client=http_client, timeout=timeout, max_retries=0)
     client._slide_max_output_chars = int(cfg.get("max_output_chars", 40000))
+    client._slide_max_attempts = max(1, min(10, int(cfg.get("max_attempts", 3))))
     return client
 
 
@@ -340,7 +341,7 @@ def _emit_communication_progress(prefix: str, metrics: dict, callback=None) -> N
         print(prefix + json.dumps(metrics, ensure_ascii=False), flush=True)
 
 
-def stream_chat(client: OpenAI, *, task: str = "chat", max_chars: int | None = None, **kwargs):
+def _stream_chat_once(client: OpenAI, *, task: str = "chat", max_chars: int | None = None, **kwargs):
     """思考＋回答を設定された文字数上限まで受信する．最後のfinish_reasonを検査する．"""
     started = time.monotonic()
     if max_chars is None:
@@ -414,6 +415,31 @@ def stream_chat(client: OpenAI, *, task: str = "chat", max_chars: int | None = N
                  'total_tokens': getattr(usage,'total_tokens',None),
                  'elapsed_sec': round(time.monotonic()-started,3),
                  'error': str(error) if error else None})
+
+
+
+def stream_chat(client: OpenAI, *, task: str = "chat", max_chars: int | None = None, retry_attempts: int | None = None, **kwargs):
+    """一時的な通信／ストリーム異常に限り，再生成する．不正な引数等は即時停止．"""
+    from openai import APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
+    attempts = max(1, min(10, int(retry_attempts if retry_attempts is not None else getattr(client, '_slide_max_attempts', 3))))
+    for attempt in range(1, attempts + 1):
+        try:
+            return _stream_chat_once(client, task=task, max_chars=max_chars, **kwargs)
+        except Exception as exc:
+            retryable = isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError))
+            if isinstance(exc, RuntimeError):
+                retryable = any(s in str(exc) for s in (
+                    'LLMストリームが終了通知なし', 'LLMの回答が空',
+                    'finish_reason=length', 'finish_reason=None',
+                    'finish_reason=error', 'finish_reason=timeout',
+                ))
+            if not retryable or attempt == attempts:
+                raise
+            delay = min(2 ** (attempt - 1), 4)
+            print(f'[LLM RETRY] task={task} attempt={attempt}/{attempts} '
+                  f'reason={type(exc).__name__}: {exc} delay={delay}s', flush=True)
+            time.sleep(delay)
+    raise AssertionError('unreachable')
 
 
 def apply_tts_filter(text: str, filter_config_path: Path = Path("tts_filter.yaml"), progress_callback=None, project_dir: Path | None = None) -> str:
@@ -868,28 +894,57 @@ def split_en_subtitle_chunks(text: str, max_chars_per_line: int = 48, max_lines_
 
 
 def translate_sentences(client: OpenAI, cfg: dict, sentences: list[str], target_lang: str) -> list[str]:
+    """JSON型と入力数を検証し，不正応答では修正指示を加えて再生成する．"""
     if not sentences:
         return []
-
     sys_prompt = TRANSLATE_TO_JA_SYSTEM if target_lang == "ja" else TRANSLATE_TO_EN_SYSTEM
     prompt = json.dumps(sentences, ensure_ascii=False)
-    try:
-        response = stream_chat(client, task="字幕翻訳", 
-            model=cfg["model"],
-            temperature=0.1,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            **reasoning_extra_kwargs(cfg.get("reasoning_effort", "none")),
-        )
-        translations = extract_json(response.choices[0].message.content)
-        if isinstance(translations, list) and len(translations) == len(sentences):
-            return [str(s).strip() for s in translations]
-    except Exception:
-        raise
-
-    raise ValueError(f"字幕翻訳 ({target_lang}) のJSON配列が不正です")
+    attempts = max(1, min(10, int(cfg.get('max_attempts', 3))))
+    reason = ''
+    for attempt in range(1, attempts + 1):
+        messages = [{"role": "system", "content": sys_prompt}]
+        if attempt > 1:
+            messages.append({"role": "system", "content": (
+                f"前回の字幕翻訳結果は不正でした（{reason}）．"
+                f"必ずちょうど{len(sentences)}個の空でない文字列からなるJSON配列のみを出力し，"
+                "Markdownや説明，番号は付けないでください．")})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            # JSON再生成と通信再試行を合わせて設定上限内に収める．
+            response = stream_chat(client, task="字幕翻訳", retry_attempts=1,
+                model=cfg["model"], temperature=0.1, messages=messages,
+                **reasoning_extra_kwargs(cfg.get("reasoning_effort", "none")))
+        except Exception as exc:
+            from openai import APIConnectionError, APITimeoutError, RateLimitError, InternalServerError
+            retryable = isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError))
+            if isinstance(exc, RuntimeError):
+                retryable = any(part in str(exc) for part in (
+                    'LLMストリームが終了通知なし', 'LLMの回答が空',
+                    'finish_reason=length', 'finish_reason=None',
+                    'finish_reason=error', 'finish_reason=timeout',
+                ))
+            if not retryable or attempt == attempts:
+                raise
+            reason = f'通信／ストリーム異常: {exc}'
+            print(f'[LLM RETRY] task=字幕翻訳 attempt={attempt}/{attempts} reason={reason}', flush=True)
+            time.sleep(min(2 ** (attempt - 1), 4))
+            continue
+        raw = response.choices[0].message.content
+        try:
+            translations = extract_json(raw)
+            if not isinstance(translations, list):
+                reason = f'配列ではありません（{type(translations).__name__}）'
+            elif len(translations) != len(sentences):
+                reason = f'要素数が異なります（期待{len(sentences)}，実際{len(translations)}）'
+            elif not all(isinstance(x, str) and x.strip() for x in translations):
+                reason = '空文字列または文字列以外の要素があります'
+            else:
+                return [x.strip() for x in translations]
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            reason = f'JSON解析失敗: {exc}'
+        print(f'[LLM RETRY] task=字幕翻訳 validation_attempt={attempt}/{attempts} '
+              f'reason={reason} response_preview={raw[:200]!r}', flush=True)
+    raise ValueError(f"字幕翻訳 ({target_lang}) のJSON配列が不正です（{attempts}回試行）: {reason}")
 
 
 def create_full_srt(
