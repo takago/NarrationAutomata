@@ -39,7 +39,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from nicegui import app, run, ui, background_tasks
 from PIL import Image, ImageDraw, ImageFont
 
-from statistics_store import run_with_statistics, export_xlsx
+from statistics_store import run_with_statistics, export_xlsx, read_records
 
 from slide_lecture import (
     generate_single_alignment,
@@ -601,6 +601,45 @@ STAGE_DEFINITIONS = [
 
 ORDERED_STAGES = [key for key, _, _ in STAGE_DEFINITIONS]
 
+# 統計タブの表示名と各処理の入出力説明．内部task識別名は変更しない．
+STATISTICS_STAGE_INFO = [
+    {
+        'task': 'ナレーション生成',
+        'title': 'ナレーション生成（画像・テキスト解析）',
+        'input': 'スライド画像，PDF抽出テキスト，講義全体の概要，前後のスライドの文脈，追加指示',
+        'output': '各スライドのナレーション原稿',
+        'purpose': '画像と文字情報を踏まえて，スライドの説明文を作成する',
+    },
+    {
+        'task': 'VLM画像解析',
+        'title': 'Bbox検出（スライド要素の位置検出）',
+        'input': 'スライド画像（必要に応じて解析対象の画像領域）',
+        'output': '要素名，種類，位置座標（Bbox）',
+        'purpose': 'ポインタの候補となる図表・数式・図内部品などの位置を検出する',
+    },
+    {
+        'task': '字幕翻訳',
+        'title': '字幕用翻訳',
+        'input': '生成済みナレーション文章',
+        'output': '字幕用の翻訳文章',
+        'purpose': '元のナレーションをもう一方の言語の字幕に翻訳する',
+    },
+    {
+        'task': 'ポインタ位置選定',
+        'title': 'ポインタ位置選定',
+        'input': 'ナレーション文章，スライド画像，PDF・VLM由来の要素一覧',
+        'output': 'ナレーションの各文とスライド要素の対応関係',
+        'purpose': '話している内容に対応するレーザーポインタの対象を決める',
+    },
+    {
+        'task': 'tts_filter',
+        'title': 'TTSヨミ変換',
+        'input': 'ナレーション文章，共通・プロジェクト別ヨミ辞書',
+        'output': '音声合成用の読み上げ文章',
+        'purpose': '技術用語やコードなどを自然な読み方に変換する',
+    },
+]
+
 
 class SlideNarratorApp:
     def __init__(self, username: str) -> None:
@@ -708,6 +747,12 @@ class SlideNarratorApp:
         self.easy_progress_detail = None
         self.easy_progress_metrics = None
         self.statistics_button = None
+        self.statistics_chart = None
+        self.statistics_chart_container = None
+        self.statistics_notice = None
+        self.statistics_scale_switch = None
+        self.statistics_scale_max_input = None
+        self._statistics_signature = None
         self.pages_input = None
         self.pipeline_buttons: list[Any] = []
         self.stage_widgets: dict[str, dict[str, Any]] = {}
@@ -1521,6 +1566,317 @@ class SlideNarratorApp:
             self._refresh_sidebar_final_video_if_changed()
         elif self._active_tab == 'logs':
             self.refresh_history_log()
+        elif self._active_tab == 'statistics':
+            ui.timer(0.15, lambda: self._safe_view_update(
+                lambda: self.refresh_statistics_chart(force=True), '統計グラフ表示'), once=True)
+
+    # --- スライド別生成統計（工程別の積み上げ棒グラフ） ---
+
+    @staticmethod
+    def _statistics_chart_options(records: list[dict], total_pages: int, *, common_scale: bool = True,
+                                  common_max: int | None = None,
+                                  image_urls: dict[str, str] | None = None) -> dict:
+        """処理別に最新の成功記録を表示する．異なる工程の文字数は合算しない．
+
+        同一ページ・同一タスクの再実行については，JSONLの最後の成功記録を採用する．
+        講義概要生成など，特定ページを持たない処理は対象外とする．
+        """
+        # 表示名はモデルの種類ではなく処理の目的を示す．
+        # 記録上のtask識別子は変更せず，過去の統計データとの互換性を維持する．
+        definitions = [(info['task'], info['title']) for info in STATISTICS_STAGE_INFO]
+
+        def classify(task: str) -> str | None:
+            if task.startswith('ポインタ位置選定'):
+                return 'ポインタ位置選定'
+            if task in ('TTSヨミ変換', 'tts_filter'):
+                return 'tts_filter'
+            for key, _ in definitions:
+                if task == key:
+                    return key
+            return None
+
+        latest: dict[tuple[int, str], dict] = {}
+        for record in records:
+            if record.get('status') != 'success':
+                continue
+            try:
+                page = int(record.get('page'))
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= page <= total_pages:
+                continue
+            key = classify(str(record.get('task') or ''))
+            if key is None:
+                continue
+            details = record.get('llm') or record.get('filter') or {}
+            if not details and any(k in record for k in ('reasoning_chars', 'content_chars')):
+                details = record
+            if not isinstance(details, dict) or not any(k in details for k in ('reasoning_chars', 'content_chars')):
+                continue
+            latest[(page, key)] = details
+
+        pages = [str(i) for i in range(1, total_pages + 1)]
+        series = []
+        maxima = []
+        valid_counts = []
+        for index, (key, title) in enumerate(definitions):
+            reasoning, answer = [], []
+            count = 0
+            for page in range(1, total_pages + 1):
+                details = latest.get((page, key))
+                if details is None:
+                    reasoning.append(None)
+                    answer.append(None)
+                    continue
+                def positive_int(field: str) -> int:
+                    try:
+                        return max(0, int(details.get(field) or 0))
+                    except (TypeError, ValueError):
+                        return 0
+                r, c = positive_int('reasoning_chars'), positive_int('content_chars')
+                reasoning.append(r)
+                answer.append(c)
+                count += 1
+                maxima.append(r + c)
+            valid_counts.append(count)
+            series.extend([
+                {'name': f'{key} 思考文字数', 'type': 'bar', 'stack': f'stage_{index}',
+                 'xAxisIndex': index, 'yAxisIndex': index, 'data': reasoning,
+                 'itemStyle': {'color': '#60a5fa'}},
+                {'name': f'{key} 回答文字数', 'type': 'bar', 'stack': f'stage_{index}',
+                 'xAxisIndex': index, 'yAxisIndex': index, 'data': answer,
+                 'itemStyle': {'color': '#34d399'}},
+            ])
+
+        import math
+        largest = max(maxima, default=0)
+        if largest <= 0:
+            shared_max = 100
+        else:
+            exponent = 10 ** math.floor(math.log10(largest))
+            shared_max = next((int(step * exponent) for step in (1, 2, 5, 10)
+                               if step * exponent >= largest), int(10 * exponent))
+
+        if common_scale and common_max is not None and common_max > 0:
+            shared_max = common_max
+
+        slide_images = json.dumps(image_urls or {}, ensure_ascii=False)
+        titles = json.dumps([title for _, title in definitions], ensure_ascii=False)
+        formatter = r"""function(params) {
+            const list = Array.isArray(params) ? params : [params];
+            if (!list.length) return '';
+            const item = list[0];
+            const page = String(item.axisValue ?? item.name ?? '');
+            const group = Math.floor(item.seriesIndex / 2);
+            const titles = __TITLES__;
+            const url = (__IMAGES__)[page];
+            const number = value => Number(value || 0).toLocaleString('ja-JP');
+            const items = list.filter(p => Math.floor(p.seriesIndex / 2) === group);
+            let reasoning = 0, content = 0;
+            for (const p of items) {
+                if (p.seriesIndex % 2 === 0) reasoning += Number(p.value || 0);
+                else content += Number(p.value || 0);
+            }
+            const img = url ? '<img src="' + url + '" style="display:block;width:260px;max-width:100%;height:auto;max-height:160px;object-fit:contain;background:#fff;margin:7px 0;border-radius:4px" />' : '';
+            return '<div style="min-width:230px;color:#e2e8f0">' +
+                   '<strong>スライド ' + page + ' ／ ' + titles[group] + '</strong>' + img +
+                   '<div>思考文字数：' + number(reasoning) + '</div>' +
+                   '<div>回答文字数：' + number(content) + '</div>' +
+                   '<div>合計：' + number(reasoning + content) + '</div></div>';
+        }""".replace('__TITLES__', titles).replace('__IMAGES__', slide_images)
+
+        # 各グリッドの位置と高さを同じ規則で計算し，横軸をそろえる．
+        grid_height = 12
+        gap = 6
+        starts = [6 + index * (grid_height + gap) for index in range(len(definitions))]
+        axes = []
+        for index in range(len(definitions)):
+            x = {'type': 'category', 'gridIndex': index, 'data': pages,
+                 'axisLabel': {'color': '#94a3b8', 'hideOverlap': True}}
+            if index == len(definitions) - 1:
+                x.update({'name': 'スライド番号', 'nameLocation': 'middle', 'nameGap': 30})
+            axes.append(x)
+        axis_color = {'color': '#94a3b8'}
+        limits = {'min': 0, 'max': shared_max, 'splitNumber': 5} if common_scale else {'min': 0, 'splitNumber': 5}
+        return {
+            'backgroundColor': 'transparent', 'animation': False,
+            # 凡例は最上段のみに配置する．系列名は工程ごとに一意のまま保ち，
+            # 表示文字列だけを簡潔にする（EChartsの系列識別との衝突を防ぐ）．
+            'legend': {
+                'top': f'{starts[0] - 4}%', 'left': 'center',
+                'data': [f'{definitions[0][0]} 思考文字数', f'{definitions[0][0]} 回答文字数'],
+                ':formatter': "function(name) { return name.endsWith('思考文字数') ? '思考文字数' : '回答文字数'; }",
+                'textStyle': {'color': '#cbd5e1', 'fontSize': 11},
+            },
+            'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'},
+                        'backgroundColor': '#1f2937', 'borderColor': '#475569',
+                        'confine': True, 'enterable': False, ':formatter': formatter},
+            'grid': [{'top': f'{top}%', 'left': 95, 'right': 28, 'height': f'{grid_height}%'} for top in starts],
+            # グラフ見出しはNiceGUI側に描画し，ⓘツールチップを添える．
+            'xAxis': axes,
+            'yAxis': [{'type': 'value', 'gridIndex': index, 'name': '文字数',
+                       'nameTextStyle': axis_color, 'axisLabel': axis_color, **limits}
+                      for index in range(len(definitions))],
+            'dataZoom': [
+                {'type': 'inside', 'xAxisIndex': list(range(len(definitions))),
+                 'filterMode': 'none', 'start': 0, 'end': 100},
+                {'type': 'slider', 'xAxisIndex': list(range(len(definitions))),
+                 'bottom': 8, 'height': 17, 'textStyle': axis_color,
+                 'filterMode': 'none', 'start': 0, 'end': 100},
+            ],
+            'series': series,
+        }
+
+    def _statistics_custom_axis_max(self) -> int | None:
+        """共通縦軸の上限．未入力または0の場合は自動計算する．"""
+        widget = self.statistics_scale_max_input
+        if not self._widget_available(widget):
+            return None
+        try:
+            value = float(widget.value or 0)
+        except (TypeError, ValueError):
+            return None
+        return int(value) if 1 <= value <= 100000000 else None
+
+    def _on_statistics_scale_change(self) -> None:
+        """スケール入力欄の有効状態とグラフを同期する．"""
+        common = bool(self.statistics_scale_switch.value)
+        if self._widget_available(self.statistics_scale_max_input):
+            if common:
+                self.statistics_scale_max_input.enable()
+            else:
+                self.statistics_scale_max_input.disable()
+        self.refresh_statistics_chart(force=True)
+
+    async def download_statistics_chart(self) -> None:
+        """全履歴のExcelに，工程別グラフと同じ最新成功データの表を追加する．"""
+        if not self.paths:
+            safe_notify('プロジェクトを選択してください．', type='warning')
+            return
+        source = self.paths.root / 'statistics.jsonl'
+        if not source.is_file() or source.stat().st_size == 0:
+            safe_notify('このプロジェクトにはまだ統計記録がありません．', type='warning')
+            return
+        page_count = len(self.images)
+        if page_count <= 0 and self.pdf:
+            with fitz.open(self.pdf) as document:
+                page_count = len(document)
+        destination = self.paths.root / 'statistics_chart.xlsx'
+
+        def create_workbook() -> None:
+            from openpyxl import load_workbook
+            from openpyxl.styles import Alignment, Font, PatternFill
+            from openpyxl.utils import get_column_letter
+
+            records = read_records(source)
+            options = self._statistics_chart_options(records, page_count)
+            # 既存の詳細統計（実行履歴・集計・エラー）も残す．
+            export_xlsx(source, destination)
+            workbook = load_workbook(destination)
+            sheet = workbook.create_sheet('工程別グラフ', 0)
+            sheet.append(['スライド番号',
+                          'ナレーション生成（画像・テキスト解析） 思考', 'ナレーション生成（画像・テキスト解析） 回答',
+                          'Bbox検出（スライド要素の位置検出） 思考', 'Bbox検出（スライド要素の位置検出） 回答',
+                          '字幕用翻訳 思考', '字幕用翻訳 回答',
+                          'ポインタ位置選定 思考', 'ポインタ位置選定 回答',
+                          'TTSヨミ変換 思考', 'TTSヨミ変換 回答'])
+            series = options['series']
+            for index in range(page_count):
+                sheet.append([index + 1] + [part['data'][index] for part in series])
+            sheet.freeze_panes = 'B2'
+            sheet.auto_filter.ref = sheet.dimensions
+            sheet.row_dimensions[1].height = 28
+            for cell in sheet[1]:
+                cell.font = Font(bold=True, color='FFFFFF')
+                cell.fill = PatternFill('solid', fgColor='17324D')
+                cell.alignment = Alignment(vertical='center', wrap_text=True)
+            sheet.column_dimensions['A'].width = 17
+            for column in range(2, len(series) + 2):
+                sheet.column_dimensions[get_column_letter(column)].width = 22
+            for row in sheet.iter_rows(min_row=2, min_col=2):
+                for cell in row:
+                    cell.number_format = '#,##0'
+            temporary = destination.with_name('.statistics_chart_export.xlsx')
+            try:
+                workbook.save(temporary)
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        try:
+            await run.io_bound(create_workbook)
+            ui.download(str(destination), filename='statistics_chart.xlsx')
+        except Exception as exc:
+            LOGGER.exception('工程別統計Excelの出力に失敗')
+            safe_notify(f'工程別統計のダウンロードに失敗しました：{exc}', type='negative')
+
+    def refresh_statistics_chart(self, force: bool = False) -> None:
+        """統計タブ表示中のみ統計レコードを再読込し，工程別グラフを更新する．"""
+        if not self._widget_available(self.statistics_chart_container):
+            return
+        if self._active_tab != 'statistics' and not force:
+            return
+        source = self.paths.root / 'statistics.jsonl' if self.paths else None
+        signature = (str(source), self._file_signature(source)) if source else None
+        if not force and signature == self._statistics_signature and self._widget_available(self.statistics_chart):
+            return
+        self._statistics_signature = signature
+        records = []
+        if source is not None and source.exists():
+            try:
+                records = read_records(source)
+            except (OSError, ValueError) as exc:
+                if self._widget_available(self.statistics_notice):
+                    self.statistics_notice.text = f'統計データの読み込みに失敗しました：{exc}'
+                return
+        page_count = len(self.images) if self.paths else 0
+        if page_count <= 0 and self.pdf:
+            try:
+                with fitz.open(self.pdf) as doc:
+                    page_count = len(doc)
+            except Exception:
+                pass
+        image_urls = {}
+        if self.paths:
+            for page in range(1, page_count + 1):
+                path = self.paths.page_image(page)
+                if path.is_file():
+                    image_urls[str(page)] = file_url(path)
+        common_scale = bool(self.statistics_scale_switch.value) if self._widget_available(self.statistics_scale_switch) else True
+        common_max = self._statistics_custom_axis_max() if common_scale else None
+        options = self._statistics_chart_options(records, page_count, common_scale=common_scale,
+                                                 common_max=common_max, image_urls=image_urls)
+        names = ('ナレーション', 'Bbox検出', '字幕用翻訳', 'ポインタ', 'ヨミ変換')
+        counts = [sum(options['series'][2 * i]['data'][j] is not None for j in range(page_count))
+                  for i in range(len(names))]
+        if self._widget_available(self.statistics_notice):
+            self.statistics_notice.text = (
+                f'全{page_count}スライド ／ 統計記録{len(records)}件 ／ ' +
+                '・'.join(f'{name} {count}枚' for name, count in zip(names, counts))
+                if page_count else 'プロジェクトを選択してください．'
+            )
+        if self._widget_available(self.statistics_chart_container):
+            self.statistics_chart_container.clear()
+            with self.statistics_chart_container:
+                # EChartsの5段グリッドと同じ位置に見出しを重ねる．
+                # 見出しはNiceGUI要素とし，説明をhoverで表示可能にする．
+                with ui.element('div').classes('relative w-full'):
+                    self.statistics_chart = ui.echart(options).classes('w-full h-[1350px]')
+                    for index, info in enumerate(STATISTICS_STAGE_INFO):
+                        top_percent = 2 + index * 18
+                        with ui.row().classes('absolute items-center gap-1 flex-nowrap').style(
+                            f'top: {top_percent}%; left: 8px; z-index: 2;'
+                        ):
+                            ui.label(info['title']).classes('text-xs text-slate-200')
+                            help_icon = ui.icon('info_outline', size='16px').classes(
+                                'text-slate-400 cursor-help'
+                            )
+                            with help_icon:
+                                with ui.tooltip().classes('bg-zinc-800 text-white p-3 max-w-sm'):
+                                    ui.label(info['title']).classes('font-bold mb-1')
+                                    ui.label(f"入力：{info['input']}").classes('whitespace-normal')
+                                    ui.label(f"出力：{info['output']}").classes('whitespace-normal')
+                                    ui.label(f"目的：{info['purpose']}").classes('whitespace-normal')
 
     # --- プロジェクト一覧・名前・削除 ---
 
@@ -4568,6 +4924,7 @@ class SlideNarratorApp:
                     self._tab_simple_edit = tab_simple_edit
                     tab_edit = ui.tab('📝 ナレーション修正（詳細）')
                     self._tab_edit = tab_edit
+                tab_statistics = ui.tab('📊 統計')
                 tab_logs = ui.tab('📜 ログ')
                 self._tab_logs = tab_logs
                 if is_admin and not self.read_only:
@@ -4585,6 +4942,25 @@ class SlideNarratorApp:
                         self.simple_edit_container = ui.column().classes('w-full')
                     with ui.tab_panel(tab_edit):
                         self.edit_container = ui.column().classes('w-full')
+                with ui.tab_panel(tab_statistics):
+                    ui.label('📊 スライド別生成統計').classes('text-h5')
+                    ui.label('工程別：ナレーション生成（画像・テキスト解析）／Bbox検出（スライド要素の位置検出）／字幕用翻訳／ポインタ位置選定／TTSヨミ変換').classes('text-caption text-slate-400')
+                    with ui.row().classes('w-full items-center gap-3 flex-wrap'):
+                        self.statistics_scale_switch = ui.switch('縦軸を共通スケールにする', value=False).props('dense')
+                        self.statistics_scale_switch.on('update:model-value', lambda _: self._on_statistics_scale_change())
+                        self.statistics_scale_max_input = ui.number(
+                            label='共通スケール上限（文字数）', value=None,
+                            min=0, max=100000000, step=1000,
+                            placeholder='自動', format='%.0f',
+                        ).props('dense outlined clearable').classes('w-56')
+                        self.statistics_scale_max_input.on('change', lambda _: self.refresh_statistics_chart(force=True))
+                        ui.button('Excelダウンロード', icon='download',
+                                  on_click=self.download_statistics_chart).props('dense outline')
+                    ui.label('上限が空欄または0の場合は自動調整します．').classes('text-caption text-slate-400')
+                    self.statistics_notice = ui.label('プロジェクトを選択してください．').classes('text-caption text-slate-400')
+                    self.statistics_chart_container = ui.column().classes('w-full')
+                    self.statistics_chart = None
+                    ui.timer(2.0, lambda: self._safe_view_update(self.refresh_statistics_chart, '統計グラフ更新'))
                 with ui.tab_panel(tab_logs):
                     with ui.row().classes('w-full items-center justify-between pb-2'):
                         ui.label('📜 実行ログ履歴').classes('text-h5')
@@ -4603,6 +4979,7 @@ class SlideNarratorApp:
                 mapping = {
                     tab_gallery.name: 'gallery',
                     tab_logs.name: 'logs',
+                    tab_statistics.name: 'statistics',
                 }
                 if not self.read_only:
                     mapping[tab_simple_edit.name] = 'simple'
@@ -4610,6 +4987,7 @@ class SlideNarratorApp:
                 self.refresh_output_views_on_tab_change(mapping.get(getattr(e.value, 'name', e.value), 'other'))
 
             tabs.on_value_change(handle_tab_change)
+            tab_statistics.on('click', lambda _: self.refresh_output_views_on_tab_change('statistics'))
             # Quasar/NiceGUI の tab 値イベントを受け取れない場合にも編集画面を生成する．
             if not self.read_only:
                 tab_simple_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('simple'))
