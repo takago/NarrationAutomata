@@ -1,4 +1,7 @@
+
 # NarrationAutomata
+
+> 当初は「slide-narrator」という名称で公開しましたが，同名のサービスが既に存在することが判明したため，混同を避ける目的で，リポジトリ名およびソフトウェア名を「NarrationAutomata」に変更しました．
 
 **Turn PDF slides into narrated videos automatically with AI.**
 
