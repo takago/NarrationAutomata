@@ -1,6 +1,6 @@
 # `app.py` プログラム解説
 
-> 対象：slide-narrator の NiceGUI WebUI．2026年10月11日に提供された `app.py` の構成に基づく．
+> 対象：NarrationAutomata の NiceGUI WebUI．2026年10月11日に提供された `app.py` の構成に基づく．
 
 ## 1．役割と全体像
 

@@ -1,12 +1,8 @@
-# slide-narrator
+# NarrationAutomata
 
 **Turn PDF slides into narrated videos automatically with AI.**
 
 講義や研究発表用のPDFスライドから，ナレーション音声，日本語・英語字幕，レーザーポインタ風の視線誘導を備えた動画を自動生成するシステムです．オンデマンド教材や研究発表動画の制作を想定しています．CLIとNiceGUIベースのWebUIを提供します．
-
-> **Note:** I chose the name `slide-narrator` when I created this repository, and only later discovered that several unrelated projects and packages use the same name. This project is independent of those projects.
->
-> **注意：** 本リポジトリを作成した後に，同じ `slide-narrator` という名称の無関係なプロジェクトやパッケージが存在することに気付きました．本プロジェクトはそれらとは独立しています．
 
 ## 主な機能
 
@@ -124,8 +120,8 @@ Python，Git，FFmpegを利用します．以下は `uv` を用いた一例で�
 ```bash
 sudo apt install ffmpeg git
 
-git clone --depth 1 https://github.com/takago/slide-narrator.git
-cd slide-narrator
+git clone --depth 1 https://github.com/takago/NarrationAutomata.git
+cd NarrationAutomata
 
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv -p 3.10 .venv

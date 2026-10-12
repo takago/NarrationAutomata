@@ -4910,7 +4910,7 @@ class SlideNarratorApp:
             self.final_video_container = ui.column().classes('w-full gap-2')
             ui.separator()
             ui.label('TAKAGO LAB., KIT, Japan.').classes('text-caption')
-            ui.link('GitHub: takago/slide-narrator', 'https://github.com/takago/slide-narrator', new_tab=True)
+            ui.link('GitHub: takago/NarrationAutomata', 'https://github.com/takago/NarrationAutomata', new_tab=True)
 
     def _build_main_tabs(self, is_admin: bool) -> None:
         # メインタブエリア
@@ -4994,7 +4994,7 @@ class SlideNarratorApp:
                 tab_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('detail'))
 
     def build(self) -> None:
-        ui.page_title('Slide Narrator')
+        ui.page_title('NarrationAutomata')
         ui.dark_mode().enable()
         ui.colors(primary='#3b82f6')
 
@@ -5007,7 +5007,7 @@ class SlideNarratorApp:
 
         # ヘッダー
         with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
-            ui.label('🎓 Slide Narrator').classes('text-h5 text-white')
+            ui.label('🎓 NarrationAutomata').classes('text-h5 text-white')
             ui.space()
             if current_username:
                 badge_role = ' (管理者)' if is_admin else ''
@@ -5086,7 +5086,7 @@ def login_page():
     if app.storage.user.get('authenticated', False):
         return RedirectResponse('/')
 
-    ui.page_title('Slide Narrator - ログイン')
+    ui.page_title('NarrationAutomata - ログイン')
     ui.dark_mode().enable()
     ui.colors(primary='#3b82f6')
 
@@ -5127,7 +5127,7 @@ def login_page():
                     ui.icon('picture_as_pdf', size='48px').classes('text-red-400')
                     ui.icon('arrow_forward', size='28px').classes('text-zinc-400')
                     ui.icon('movie', size='48px').classes('text-blue-400')
-                ui.label('Slide Narrator').classes('text-xl font-bold tracking-tight text-white')
+                ui.label('NarrationAutomata').classes('text-xl font-bold tracking-tight text-white')
                 # whitespace-nowrap を追加（1行維持）
                 ui.label('Turn PDF slides into narrated videos automatically with AI.').classes('text-xs text-zinc-400 whitespace-nowrap')
             # サーバーが実行中だった場合のみ静的にスピナーを表示
@@ -5153,7 +5153,7 @@ def login_page():
                 ui.label('Kanazawa Institute of Technology').classes('text-[12px] text-zinc-600')
 
 ui.run(
-    title='Slide Narrator',
+    title='NarrationAutomata',
     reload=False,
     show=False,
     port=17171,

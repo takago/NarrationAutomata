@@ -1956,8 +1956,8 @@ def concat_videos(
     if track_map:
         cmd.extend(["-c:s", "mov_text"])
     
-    credit_text = "Slide Narrator | TAKAGO LAB"
-    repo_url = "https://github.com/takago/slide-narrator"
+    credit_text = "NarrationAutomata | TAKAGO LAB"
+    repo_url = "https://github.com/takago/NarrationAutomata"
     comment_text = f"{credit_text}\n{repo_url}"
     cmd.extend([
         "-metadata", f"comment={comment_text}",
