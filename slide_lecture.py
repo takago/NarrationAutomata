@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import time
+from types import SimpleNamespace
 import re
 import shutil
 import subprocess
@@ -314,40 +316,111 @@ def reasoning_extra_kwargs(effort: str) -> dict:
 
 
 def make_client(cfg: dict) -> OpenAI:
-    http_client = httpx.Client(
-        trust_env=False,
-        verify=False,
-    )
-    return OpenAI(
-        base_url=cfg["base_url"],
-        api_key=cfg.get("api_key", "dummy"),
-        http_client=http_client,
-    )
+    """OpenAI互換API．ストリーム受信のアイドル時間を監視する．"""
+    timeout = httpx.Timeout(connect=float(cfg.get("connect_timeout", 5)),
+                            read=float(cfg.get("read_timeout", 120 if "voice" in cfg else 30)),
+                            write=float(cfg.get("write_timeout", 30)), pool=5.0)
+    http_client = httpx.Client(trust_env=False, verify=False, timeout=timeout)
+    client = OpenAI(base_url=cfg["base_url"], api_key=cfg.get("api_key", "dummy"),
+                    http_client=http_client, timeout=timeout, max_retries=0)
+    client._slide_max_output_chars = int(cfg.get("max_output_chars", 40000))
+    return client
 
 
-def apply_tts_filter(text: str, filter_config_path: Path = Path("tts_filter.yaml")) -> str:
+def _emit_communication_progress(prefix: str, metrics: dict, callback=None) -> None:
+    """通信経路に依存せず進捗を通知する．CLIでは従来どおり標準出力を使用．"""
+    if callback is not None:
+        callback(metrics)
+    else:
+        print(prefix + json.dumps(metrics, ensure_ascii=False), flush=True)
+
+
+def stream_chat(client: OpenAI, *, task: str = "chat", max_chars: int | None = None, **kwargs):
+    """思考＋回答を設定された文字数上限まで受信する．最後のfinish_reasonを検査する．"""
+    started = time.monotonic()
+    if max_chars is None:
+        max_chars = getattr(client, "_slide_max_output_chars", 40000)
+    reasoning_parts, content_parts = [], []
+    n_reasoning = n_content = 0
+    finish = None
+    usage = None
+    last_progress_report = 0.0
+    def report_progress(force=False):
+        nonlocal last_progress_report
+        now = time.monotonic()
+        if force or now - last_progress_report >= 1.0:
+            metrics = {
+                'task': task, 'reasoning_chars': n_reasoning,
+                'content_chars': n_content, 'total_chars': n_reasoning + n_content,
+                'limit_chars': max_chars, 'elapsed_sec': round(now - started, 1),
+            }
+            _emit_communication_progress(
+                '[LLM_PROGRESS] ', metrics,
+                getattr(client, '_slide_progress_callback', None),
+            )
+            last_progress_report = now
+    try:
+        with client.chat.completions.create(stream=True,
+                stream_options={"include_usage": True}, **kwargs) as stream:
+            for event in stream:
+                if getattr(event, "usage", None) is not None:
+                    usage = event.usage
+                for choice in event.choices:
+                    delta = choice.delta
+                    reason = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None) or ""
+                    content = delta.content or ""
+                    if reason:
+                        n_reasoning += len(reason)
+                        reasoning_parts.append(reason)
+                    if content:
+                        n_content += len(content)
+                        content_parts.append(content)
+                    report_progress()
+                    if n_reasoning + n_content > max_chars:
+                        raise RuntimeError(f"LLM出力が{max_chars}文字を超過しました（思考を含む）")
+                    if choice.finish_reason is not None:
+                        finish = choice.finish_reason
+        if finish is None:
+            raise RuntimeError("LLMストリームが終了通知なしで終了しました")
+        if finish != "stop":
+            raise RuntimeError(f"LLMが正常終了しませんでした: finish_reason={finish}")
+        result = "".join(content_parts)
+        if not result.strip():
+            raise RuntimeError("LLMの回答が空です")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=result), finish_reason=finish)])
+    except Exception as exc:
+        print(f"[LLM] task={task} status=error reason={type(exc).__name__}: {exc}", flush=True)
+        raise
+    finally:
+        report_progress(force=True)
+        total = n_reasoning + n_content
+        tokens = (f"prompt_tokens={usage.prompt_tokens} completion_tokens={usage.completion_tokens} "
+                  f"total_tokens={usage.total_tokens}" if usage else
+                  "prompt_tokens=N/A completion_tokens=N/A total_tokens=N/A")
+        print(f"[LLM] task={task} reasoning_chars={n_reasoning} content_chars={n_content} "
+              f"total_chars={total} {tokens} elapsed_sec={time.monotonic()-started:.2f}", flush=True)
+
+
+def apply_tts_filter(text: str, filter_config_path: Path = Path("tts_filter.yaml"), progress_callback=None) -> str:
     if not filter_config_path.exists():
         return text
 
-    try:
-        filter_cfg = load_tts_filter_config(filter_config_path)
-        client = make_tts_filter_client(filter_cfg)
-        model = filter_cfg.get("server", {}).get("model")
-        if not model:
-            return text
-        system_prompt = build_tts_filter_prompt(filter_cfg)
-        generation = filter_cfg.get("generation", {})
-
-        return tts_filter_transform(
-            client=client,
-            model=model,
-            system_prompt=system_prompt,
-            text=text,
-            generation=generation,
-        )
-    except Exception as e:
-        print(f"[TTS_FILTER WARN] フィルタ処理中にエラーが発生しました: {e}")
+    filter_cfg = load_tts_filter_config(filter_config_path)
+    client = make_tts_filter_client(filter_cfg)
+    model = filter_cfg.get("server", {}).get("model")
+    if not model:
         return text
+    system_prompt = build_tts_filter_prompt(filter_cfg)
+    generation = filter_cfg.get("generation", {})
+
+    return tts_filter_transform(
+        client=client,
+        model=model,
+        system_prompt=system_prompt,
+        text=text,
+        generation=generation,
+        progress_callback=progress_callback,
+    )
 
 
 def parse_page_ranges(spec: str) -> set[int]:
@@ -578,7 +651,7 @@ def run_vlm_element_detection(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": content})
 
-    response = client.chat.completions.create(
+    response = stream_chat(client, task="VLM画像解析", 
         model=model,
         temperature=temperature,
         messages=messages,
@@ -637,7 +710,7 @@ def run_vlm_element_detection(
                 "bbox": [xmin, ymin, xmax, ymax],
             })
     except Exception as e:
-        print(f"[VLM WARN] JSONパース失敗: {e}")
+        raise ValueError(f"VLM応答の解析に失敗しました: {e}") from e
 
     return summary_text, parsed_blocks
 
@@ -784,7 +857,7 @@ def translate_sentences(client: OpenAI, cfg: dict, sentences: list[str], target_
     sys_prompt = TRANSLATE_TO_JA_SYSTEM if target_lang == "ja" else TRANSLATE_TO_EN_SYSTEM
     prompt = json.dumps(sentences, ensure_ascii=False)
     try:
-        response = client.chat.completions.create(
+        response = stream_chat(client, task="字幕翻訳", 
             model=cfg["model"],
             temperature=0.1,
             messages=[
@@ -796,10 +869,10 @@ def translate_sentences(client: OpenAI, cfg: dict, sentences: list[str], target_
         translations = extract_json(response.choices[0].message.content)
         if isinstance(translations, list) and len(translations) == len(sentences):
             return [str(s).strip() for s in translations]
-    except Exception as e:
-        print(f"[WARN] 字幕翻訳 ({target_lang}) 中にエラーが発生しました: {e}")
+    except Exception:
+        raise
 
-    return sentences
+    raise ValueError(f"字幕翻訳 ({target_lang}) のJSON配列が不正です")
 
 
 def create_full_srt(
@@ -1007,7 +1080,7 @@ def align_narration_with_blocks(
     sys_prompt = ALIGN_SYSTEM_JA if lang == "ja" else ALIGN_SYSTEM_EN
 
     try:
-        response = client.chat.completions.create(
+        response = stream_chat(client, task=f"ポインタ位置選定（全{len(sentences)}文）", 
             model=cfg["model"],
             temperature=0.0,
             messages=[
@@ -1045,9 +1118,8 @@ def align_narration_with_blocks(
                 "block_id": bid,
             })
         return result
-    except Exception as e:
-        print(f"[ALIGN WARN] アライメント解析でエラーが発生しました: {e}")
-        return [{"sentence": s, "block_id": None} for s in sentences]
+    except Exception:
+        raise
 
 
 def build_pointer_schedule(
@@ -1127,7 +1199,7 @@ def build_course_overview(
 
     sys_prompt = get_overview_prompt(mode, lang)
 
-    response = client.chat.completions.create(
+    response = stream_chat(client, task="講義概要生成", 
         model=cfg["model"],
         temperature=cfg.get("temperature", 0.2),
         messages=[
@@ -1223,7 +1295,7 @@ Return ONLY the raw narration text.
 
     sys_prompt = get_narration_prompt(mode, lang)
 
-    response = client.chat.completions.create(
+    response = stream_chat(client, task="ナレーション生成", 
         model=cfg["model"],
         temperature=cfg.get("temperature", 0.3),
         messages=[
@@ -1351,6 +1423,7 @@ def generate_single_tts(
     filter_config_path: Path,
     force: bool,
     lang: str = "ja",
+    progress_callback=None,
 ) -> None:
     generate_tts(
         text_path=text_path,
@@ -1359,6 +1432,7 @@ def generate_single_tts(
         filter_config_path=filter_config_path,
         force=force,
         lang=lang,
+        progress_callback=progress_callback,
     )
 
 
@@ -1559,6 +1633,7 @@ def generate_tts(
     filter_config_path: Path,
     force: bool,
     lang: str = "ja",
+    progress_callback=None,
 ) -> None:
     if out_path.exists() and not force:
         print(f"[TTS] reuse {out_path}")
@@ -1573,20 +1648,67 @@ def generate_tts(
     try:
         client = make_client(tts_cfg)
         raw_text = text_path.read_text(encoding="utf-8").strip()
-        tts_text = apply_tts_filter(raw_text, filter_config_path) if lang == "ja" else raw_text
+        def send_filter_progress(metrics: dict) -> None:
+            _emit_communication_progress('[LLM_PROGRESS] ', metrics, progress_callback)
+
+        tts_text = apply_tts_filter(raw_text, filter_config_path,
+                                    progress_callback=send_filter_progress) if lang == "ja" else raw_text
         limit_key = "max_input_chars" if lang == "ja" else "max_input_words"
         limit = max(0, int(tts_cfg.get(limit_key) or 0))
         chunks = split_tts_text(tts_text, lang, limit)
         if not chunks:
             raise ValueError("TTSの入力テキストが空です")
+        def send_tts_progress(metrics: dict) -> None:
+            _emit_communication_progress('[TTS_PROGRESS] ', metrics, progress_callback)
+
         for i, chunk in enumerate(chunks, 1):
             part = out_path.with_name(f".{out_path.stem}.part{i:04d}.mp3") if len(chunks) > 1 else temp_out
             parts.append(part)
-            response = client.audio.speech.create(
+            t0 = time.monotonic()
+            received_bytes = 0
+            last_report = 0.0
+            def report_tts_progress(state="音声受信中", force=False):
+                nonlocal last_report
+                now = time.monotonic()
+                if force or now - last_report >= 1.0:
+                    send_tts_progress({
+                        "task": "音声合成", "state": state,
+                        "page": out_path.stem, "chunk_index": i,
+                        "chunk_total": len(chunks), "input_chars": len(chunk),
+                        "audio_bytes": received_bytes,
+                        "elapsed_sec": round(now - t0, 1),
+                    })
+                    last_report = now
+            report_tts_progress("音声合成待機中", force=True)
+            with client.audio.speech.with_streaming_response.create(
                 model=tts_cfg["model"], voice=tts_cfg["voice"], input=chunk,
                 response_format="mp3",
-            )
-            response.write_to_file(part)
+            ) as response:
+                with part.open("wb") as file:
+                    for audio_chunk in response.iter_bytes(chunk_size=65536):
+                        if audio_chunk:
+                            file.write(audio_chunk)
+                            received_bytes += len(audio_chunk)
+                            report_tts_progress()
+            report_tts_progress("音声受信完了", force=True)
+            if not part.exists() or part.stat().st_size == 0:
+                raise RuntimeError("TTSから空の音声が返されました")
+            elapsed = time.monotonic() - t0
+            duration = None
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(part)],
+                    capture_output=True, text=True, check=True)
+                duration = float(probe.stdout.strip())
+            except (OSError, ValueError, subprocess.CalledProcessError):
+                pass
+            duration_log = f"{duration:.2f}" if duration is not None else "N/A"
+            rtf_log = f"{elapsed / duration:.3f}" if duration and duration > 0 else "N/A"
+            print(f"[TTS] page={out_path.stem} chunk={i}/{len(chunks)} "
+                  f"input_chars={len(chunk)} audio_bytes={part.stat().st_size} "
+                  f"duration_sec={duration_log} elapsed_sec={elapsed:.2f} rtf={rtf_log} "
+                  "status=success", flush=True)
             print(f"[TTS:{lang}] part {i}/{len(chunks)} ({len(chunk)} chars, {len(chunk.split())} words)")
         if len(parts) > 1:
             # concat demuxer によるストリームコピー．途中ファイルはすべて一時ファイル．
@@ -1601,6 +1723,9 @@ def generate_tts(
         atomic_write_text(tts_text_path, tts_input_record)
         print(f"[TTS:{lang}] {out_path}")
         print(f"[TTS:{lang}] input text: {tts_text_path} ({len(chunks)} chunk(s))")
+    except Exception as exc:
+        print(f"[TTS] page={out_path.stem} status=error reason={type(exc).__name__}: {exc}", flush=True)
+        raise
     finally:
         for part in parts:
             part.unlink(missing_ok=True)

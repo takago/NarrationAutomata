@@ -46,6 +46,7 @@ from slide_lecture import (
     tts_text_stats,
     load_project_json,
     make_client,
+    stream_chat,
     reasoning_extra_kwargs,
     parse_page_ranges,
     run_vlm_element_detection,
@@ -633,6 +634,9 @@ class SlideNarratorApp:
         self.current_task: asyncio.Task | None = None
         self.cancellation_requested = False
         self._loaded_log_text: str | None = None
+        # 通信イベントの最終通知時刻．UI側の時計は受信処理から独立して進める．
+        self._metric_clock: dict[str, tuple[float, float]] = {}
+
         self._restore_started = False
         self._active_tab = 'gallery'
         self._simple_page = 0
@@ -808,6 +812,70 @@ class SlideNarratorApp:
                 lambda: self.history_log_widget.push(f'[{datetime.now():%H:%M:%S}] {line}'),
                 'ログ表示',
             )
+
+    def handle_llm_progress(self, metrics: dict[str, Any]) -> None:
+        """子プロセス／個別再生成に共通するLLM進捗イベントの受け口．"""
+        if not isinstance(metrics, dict):
+            return
+        status = read_user_job_status(self.username)
+        if status.get('state') != 'running':
+            return
+        self._metric_clock['llm'] = (time.monotonic(), float(metrics.get('elapsed_sec') or 0))
+        self._metric_clock.pop('tts', None)
+        self.update_job_status(
+            'running', llm_metrics=metrics, tts_metrics=None,
+            llm_metrics_page=status.get('current_page'),
+        )
+
+    def _display_elapsed(self, kind: str, metrics: dict[str, Any], running: bool) -> str:
+        """直近の通信通知を起点に表示時計だけ進める（ログ・状態ファイルは増やさない）．"""
+        elapsed = float(metrics.get('elapsed_sec') or 0)
+        if running:
+            clock = self._metric_clock.get(kind)
+            if clock:
+                received_at, base_elapsed = clock
+                elapsed = max(elapsed, base_elapsed + max(0.0, time.monotonic() - received_at))
+        return f'{elapsed:.1f}'
+
+    def format_tts_progress(self, metrics: dict[str, Any], error: bool = False, running: bool = False) -> str:
+        state = 'エラー停止' if error else str(metrics.get('state') or '音声合成中')
+        return (f'処理：音声合成（チャンク {metrics.get("chunk_index", "-")} / {metrics.get("chunk_total", "-")}）\n'
+                f'状態：{state}\n'
+                f'経過時間：{self._display_elapsed("tts", metrics, running)}秒\n'
+                f'入力文字数：{metrics.get("input_chars", 0):,}文字\n'
+                f'受信音声サイズ：{metrics.get("audio_bytes", 0):,}バイト')
+
+    def handle_tts_progress(self, metrics: dict[str, Any]) -> None:
+        """子プロセスと個別生成の双方からTTS受信状況を受け取る．"""
+        if not isinstance(metrics, dict):
+            return
+        status = read_user_job_status(self.username)
+        if status.get('state') != 'running' or status.get('stage') != 'tts':
+            return
+        self._metric_clock['tts'] = (time.monotonic(), float(metrics.get('elapsed_sec') or 0))
+        self._metric_clock.pop('llm', None)
+        self.update_job_status('running', tts_metrics=metrics, llm_metrics=None)
+
+    def _make_threadsafe_progress_callback(self, handler):
+        """ワーカースレッドのイベントをUIループに転送する共通アダプタ．
+
+        イベントはコピーして渡すため，ワーカースレッド側の辞書変更に影響されない．
+        UI更新そのものはイベントループ上の handler に一任する．
+        """
+        loop = asyncio.get_running_loop()
+
+        def callback(metrics: dict[str, Any]) -> None:
+            loop.call_soon_threadsafe(handler, dict(metrics))
+
+        return callback
+
+    def make_individual_tts_progress_callback(self):
+        """個別TTS再生成の進捗をUIに通知する．"""
+        return self._make_threadsafe_progress_callback(self.handle_tts_progress)
+
+    def make_individual_llm_progress_callback(self):
+        """個別LLM再生成の進捗をUIに通知する．"""
+        return self._make_threadsafe_progress_callback(self.handle_llm_progress)
 
     def clear_job_log(self) -> None:
         clear_user_job_log(self.username)
@@ -1068,6 +1136,8 @@ class SlideNarratorApp:
             p_spinner = w['spinner']
             p_bar = w['bar']
             p_indet = w['indeterminate']
+            p_detail = w['detail']
+            p_error = w['error']
 
             try:
                 btn.classes(remove='animate-pulse rotate-infinite')
@@ -1075,7 +1145,34 @@ class SlideNarratorApp:
 
                 key_idx = ORDERED_STAGES.index(key) if key in ORDERED_STAGES else -1
 
-                if owner_is_self and status.get('state') == 'running' and key == active_key:
+                p_detail.classes(add='hidden')
+                p_error.classes(add='hidden')
+                if status.get('state') == 'failed' and key == active_key and (not globally_busy or owner_is_self):
+                    box.classes(remove='hidden')
+                    p_spinner.classes(add='hidden')
+                    btn.props('color=negative')
+                    p_label.text = f'エラー停止：スライド {status.get("current_page") or "不明"}'
+                    p_bar.classes(add='hidden')
+                    p_indet.classes(add='hidden')
+                    error_text = str(status.get('error_detail') or status.get('message') or '詳細不明')
+                    p_error.text = f'エラー内容：{error_text[:600]}'
+                    p_error.classes(remove='hidden')
+                    metrics = status.get('llm_metrics')
+                    if isinstance(metrics, dict):
+                        p_detail.text = (f'処理：{metrics.get("task") or "LLM処理"}\n'
+                            f'状態：エラー停止\n'
+                            f'経過時間：{self._display_elapsed("llm", metrics, False)}秒\n'
+                            f'思考文字数：{metrics.get("reasoning_chars", 0):,}文字\n'
+                            f'回答文字数：{metrics.get("content_chars", 0):,}文字\n'
+                            f'合計文字数：{metrics.get("total_chars", 0):,} / {metrics.get("limit_chars", 40000):,}文字')
+                        p_detail.classes(remove='hidden')
+                    tts_metrics = status.get('tts_metrics') if key == 'tts' else None
+                    if isinstance(tts_metrics, dict):
+                        p_detail.text = self.format_tts_progress(tts_metrics, error=True)
+                        p_detail.classes(remove='hidden')
+                    self.set_button_enabled_visual(btn, not self.read_only)
+
+                elif owner_is_self and status.get('state') == 'running' and key == active_key:
                     btn.props('color=primary')
                     box.classes(remove='hidden')
                     p_spinner.classes(remove='hidden')
@@ -1104,6 +1201,20 @@ class SlideNarratorApp:
                         p_bar.classes(add='hidden')
                         p_indet.classes(remove='hidden')
 
+                    metrics = status.get('llm_metrics')
+                    if isinstance(metrics, dict):
+                        p_detail.text = (f'処理：{metrics.get("task") or "LLM処理"}\n'
+                            f'状態：LLM受信中\n'
+                            f'経過時間：{self._display_elapsed("llm", metrics, True)}秒\n'
+                            f'思考文字数：{metrics.get("reasoning_chars", 0):,}文字\n'
+                            f'回答文字数：{metrics.get("content_chars", 0):,}文字\n'
+                            f'合計文字数：{metrics.get("total_chars", 0):,} / {metrics.get("limit_chars", 40000):,}文字')
+                        p_detail.classes(remove='hidden')
+
+                    tts_metrics = status.get('tts_metrics') if key == 'tts' else None
+                    if isinstance(tts_metrics, dict):
+                        p_detail.text = self.format_tts_progress(tts_metrics, running=True)
+                        p_detail.classes(remove='hidden')
                     self.set_button_enabled_visual(btn, not cancel_pending)
 
                 elif owner_is_self and (key in completed_stages or (active_idx >= 0 and key_idx < active_idx)):
@@ -1866,6 +1977,7 @@ class SlideNarratorApp:
         total_active_slides = len(self.active_pages)
         completed_stages: list[str] = []
         all_logs: list[str] = []
+        last_error_line = ''
         current_phase = from_stage
         succeeded = True
         cancelled = False
@@ -1876,7 +1988,7 @@ class SlideNarratorApp:
             message='処理を開始します…',
             completed_stages=[],
             cancellation_requested=False,
-            progress=0.0,
+            progress=0.0, llm_metrics=None, tts_metrics=None, error_detail=None,
             current_page=self.active_pages[0],
             current_index=1,
             total_count=total_active_slides,
@@ -1904,7 +2016,7 @@ class SlideNarratorApp:
                 stage_message = next((msg for key, _, msg in STAGE_DEFINITIONS if key == run_stage), '処理中…')
                 self.update_job_status(
                     'running', stage=run_stage, completed_stages=list(completed_stages),
-                    message=stage_message, progress=0.0,
+                    message=stage_message, progress=0.0, llm_metrics=None, tts_metrics=None, error_detail=None,
                     current_page=self.active_pages[0], current_index=1,
                     total_count=total_active_slides,
                 )
@@ -1935,7 +2047,23 @@ class SlideNarratorApp:
                         break
                     line = line_bytes.decode('utf-8', errors='replace').rstrip()
                     all_logs.append(line)
+                    if '[ERROR]' in line or 'Traceback' in line or 'Error:' in line or 'status=error' in line:
+                        last_error_line = line[-500:]
                     self.append_job_log(line)
+
+                    if line.startswith('[TTS_PROGRESS]'):
+                        try:
+                            metrics = json.loads(line[len('[TTS_PROGRESS]'):].strip())
+                            self.handle_tts_progress(metrics)
+                        except (ValueError, TypeError):
+                            pass
+
+                    if line.startswith('[LLM_PROGRESS]'):
+                        try:
+                            metrics = json.loads(line[len('[LLM_PROGRESS]'):].strip())
+                            self.handle_llm_progress(metrics)
+                        except (ValueError, TypeError):
+                            pass
 
                     if line.startswith('[PROGRESS]'):
                         try:
@@ -1957,6 +2085,7 @@ class SlideNarratorApp:
                                 message=msg or ('完成動画を結合・生成中…' if phase == 'concat' else stage_message),
                                 progress=max(0.0, min(1.0, float(frac))),
                                 current_page=p_num,
+                                llm_metrics=None, tts_metrics=None,
                                 current_index=cur,
                                 total_count=tot,
                             )
@@ -1984,6 +2113,7 @@ class SlideNarratorApp:
                             'failed', stage=run_stage,
                             completed_stages=list(completed_stages),
                             message=f'工程「{stage_title}」が終了コード {rc} で失敗しました',
+                            error_detail=last_error_line or f'終了コード {rc}',
                             finished_at=datetime.now().isoformat(timespec='seconds'),
                         )
                         safe_notify(f'工程「{stage_title}」が終了コード {rc} で失敗したため，後続処理を中断しました．', type='negative')
@@ -2166,7 +2296,7 @@ class SlideNarratorApp:
             message=f'スライド {page} の原稿を作成中…',
             progress=0.2,
             current_page=page,
-            started_at=datetime.now().isoformat(timespec='seconds'),
+            started_at=datetime.now().isoformat(timespec='seconds'), llm_metrics=None, tts_metrics=None, error_detail=None,
         )
         self.append_job_log(f'[REGEN] スライド {page} ナレーション再生成開始')
         self.set_processing(True)
@@ -2174,6 +2304,7 @@ class SlideNarratorApp:
         try:
             cfg = self.cfg
             client = await run.io_bound(make_client, cfg['llm'])
+            client._slide_progress_callback = self.make_individual_llm_progress_callback()
 
             self.update_job_status('running', stage='explain', message=f'スライド {page} をLLM推論中…', progress=0.6, current_page=page)
 
@@ -2204,7 +2335,7 @@ class SlideNarratorApp:
             self.update_job_status('cancelled', message='ナレーション再生成を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify('ナレーション再生成を中断しました．', type='warning')
         except Exception as exc:
-            self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
+            self.update_job_status('failed', error_detail=f'{type(exc).__name__}: {exc}', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify(f'再生成に失敗しました: {exc}', type='negative')
         finally:
             self._finalize_cancel_request()
@@ -2239,12 +2370,13 @@ class SlideNarratorApp:
             return
 
         mode_label = "VLM併用" if mode_str == 'vlm' else "PDF基準"
-        self.update_job_status('running', stage='align', message=f'スライド {page} 解析中（{mode_label}）', progress=0.3, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'))
+        self.update_job_status('running', stage='align', message=f'スライド {page} 解析中（{mode_label}）', progress=0.3, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'), llm_metrics=None, tts_metrics=None, error_detail=None)
         self.append_job_log(f'[ALIGN] スライド {page} の要素抽出 ({mode_label}) と視線誘導を再計算中...')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
         try:
             client = await run.io_bound(make_client, self.cfg['llm'])
+            client._slide_progress_callback = self.make_individual_llm_progress_callback()
             dpi = int(self.cfg.get('pdf', {}).get('dpi', 150))
             data = await run.io_bound(
                 generate_single_alignment,
@@ -2266,7 +2398,7 @@ class SlideNarratorApp:
             self.update_job_status('cancelled', message='字幕・ポインタ再解析を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify('解析を中断しました．', type='warning')
         except Exception as exc:
-            self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
+            self.update_job_status('failed', error_detail=f'{type(exc).__name__}: {exc}', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify(f'再解析に失敗しました: {exc}', type='negative')
         finally:
             self._finalize_cancel_request()
@@ -2307,7 +2439,7 @@ class SlideNarratorApp:
             safe_notify(f'他のユーザーが処理を実行中です．完了するまでお待ちください．', type='negative', duration=5)
             return
 
-        self.update_job_status('running', stage='tts', message=f'スライド {page} 音声合成中…', progress=0.4, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'))
+        self.update_job_status('running', stage='tts', message=f'スライド {page} 音声合成中…', progress=0.4, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'), llm_metrics=None, tts_metrics=None, error_detail=None)
         self.append_job_log(f'[TTS] スライド {page} の音声合成を開始 (lang={self.lang_code})')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
@@ -2318,6 +2450,7 @@ class SlideNarratorApp:
 
             await run.io_bound(
                 generate_single_tts,
+                progress_callback=self.make_individual_tts_progress_callback(),
                 text_path=txt_path,
                 out_path=out_mp3,
                 tts_cfg=tts_cfg,
@@ -2337,7 +2470,7 @@ class SlideNarratorApp:
             self.update_job_status('cancelled', message='音声合成を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify('音声合成を中断しました．', type='warning')
         except Exception as exc:
-            self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
+            self.update_job_status('failed', error_detail=f'{type(exc).__name__}: {exc}', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify(f'音声合成に失敗しました: {exc}', type='negative')
         finally:
             self._finalize_cancel_request()
@@ -2885,6 +3018,11 @@ class SlideNarratorApp:
                 llm_temp = ui.number('Temperature', value=float(llm.get('temperature', 0.3)), min=0, max=2, step=0.1).classes('w-36')
                 llm_reason = ui.select(['auto', 'none', 'low', 'medium', 'high'], value=llm.get('reasoning_effort', 'none'), label='Reasoning effort').props('outlined dense').classes('w-40')
 
+            with ui.row().classes('w-full items-center gap-4'):
+                self._llm_connect = ui.number('LLM接続タイムアウト（秒）', value=llm.get('connect_timeout', 5), min=1, step=1).classes('w-48')
+                self._llm_read = ui.number('LLM受信タイムアウト（秒）', value=llm.get('read_timeout', 30), min=1, step=1).classes('w-48')
+                self._llm_limit = ui.number('LLM出力上限（思考＋回答，文字）', value=llm.get('max_output_chars', 40000), min=100, step=1000).classes('w-64')
+
             async def fetch_llm_models() -> None:
                 base = (llm_base.value or '').strip()
                 key = (llm_key.value or '').strip() or 'dummy'
@@ -2936,7 +3074,7 @@ class SlideNarratorApp:
                         client = await run.io_bound(make_client, test_cfg)
 
                         def call_llm() -> str:
-                            res = client.chat.completions.create(
+                            res = stream_chat(client, task="llm_test", max_chars=int(self.cfg.get("llm", {}).get("max_output_chars", 40000)), 
                                 model=selected_model,
                                 temperature=float(llm_temp.value or 0.3),
                                 messages=[{'role': 'user', 'content': prompt}],
@@ -3167,6 +3305,11 @@ class SlideNarratorApp:
                     limit_in = ui.number(limit_label, value=int(cfg_data.get(limit_key) or 0), min=0, step=1).props('dense outlined').classes('w-32')
                     auto_btn = ui.button('🔍 自動設定').props('dense outline')
 
+                with ui.row().classes('w-full items-center gap-4'):
+                    cfg_data['_connect_widget'] = ui.number('接続タイムアウト（秒）', value=cfg_data.get('connect_timeout', 5), min=1, step=1).classes('w-48')
+                    cfg_data['_read_widget'] = ui.number('受信タイムアウト（秒）', value=cfg_data.get('read_timeout', 120), min=1, step=1).classes('w-48')
+                    cfg_data['_write_widget'] = ui.number('送信タイムアウト（秒）', value=cfg_data.get('write_timeout', 30), min=1, step=1).classes('w-48')
+
                 async def fetch_models():
                     b = (base_in.value or '').strip()
                     k = (key_in.value or '').strip() or 'dummy'
@@ -3247,7 +3390,7 @@ class SlideNarratorApp:
                                   '段落を分け，繰り返しを避けてください．' if lang_tag == 'ja' else
                                   'Write a coherent university lecture narration in English. '
                                   'About 1300 words with several paragraphs, no repetition.')
-                        r = lc.chat.completions.create(
+                        r = stream_chat(lc, task="tts_test_text", max_chars=int(llm_cfg.get("max_output_chars", 40000)), 
                             model=llm_cfg['model'], messages=[{'role': 'user', 'content': prompt}],
                             **reasoning_extra_kwargs(llm_cfg.get("reasoning_effort", "none")))
                         return (r.choices[0].message.content or '').strip()
@@ -3263,7 +3406,8 @@ class SlideNarratorApp:
                                 if seed:
                                     append_result(f'LLM原稿生成完了：{len(seed)}文字，{len(seed.split())}単語')
                             except Exception as exc:
-                                append_result(f'LLM原稿生成失敗：{exc}．固定文章で測定します．')
+                                append_result(f'LLM原稿生成失敗：{exc}．TTS自動測定を中止します．')
+                                raise
                         else:
                             append_result('LLM未設定：固定文章で測定します．')
 
@@ -3381,13 +3525,23 @@ class SlideNarratorApp:
                                 'model': m,
                                 'voice': v,
                                 'response_format': 'mp3',
+                                'connect_timeout': float(cfg_data['_connect_widget'].value),
+                                'read_timeout': float(cfg_data['_read_widget'].value),
+                                'write_timeout': float(cfg_data['_write_widget'].value),
                             }
                             out_p = self.test_audio_dir / test_filename
 
                             def _call():
                                 cl = make_client(t_cfg)
-                                resp = cl.audio.speech.create(model=m, voice=v, input=txt, response_format='mp3')
-                                resp.write_to_file(out_p)
+                                temporary = out_p.with_name(f'.{out_p.stem}.tmp{out_p.suffix}')
+                                try:
+                                    with cl.audio.speech.with_streaming_response.create(model=m, voice=v, input=txt, response_format='mp3') as resp:
+                                        resp.stream_to_file(temporary)
+                                    if not temporary.exists() or temporary.stat().st_size == 0:
+                                        raise RuntimeError('TTSから空の音声データが返されました')
+                                    temporary.replace(out_p)
+                                finally:
+                                    temporary.unlink(missing_ok=True)
 
                             await run.io_bound(_call)
                             audio_container.clear()
@@ -3436,6 +3590,12 @@ class SlideNarratorApp:
                 filter_temp = ui.number('Temperature', value=float(gen_cfg.get('temperature', 0)), min=0, max=2, step=0.1).classes('w-36')
                 filter_reason = ui.select(['auto', 'none', 'low', 'medium', 'high'], value=gen_cfg.get('reasoning_effort', 'low'), label='Reasoning effort').props('outlined dense').classes('w-40')
 
+            with ui.row().classes('w-full items-center gap-4'):
+                ui.label('ヨミ変換用LLMの通信タイムアウト').classes('text-sm font-semibold text-zinc-300')
+                filter_connect_timeout = ui.number('接続タイムアウト（秒）', value=server_cfg.get('connect_timeout', 5), min=1, step=1).classes('w-48')
+                filter_read_timeout = ui.number('受信タイムアウト（秒）', value=server_cfg.get('read_timeout', 30), min=1, step=1).classes('w-48')
+                filter_write_timeout = ui.number('送信タイムアウト（秒）', value=server_cfg.get('write_timeout', 30), min=1, step=1).classes('w-48')
+
             async def fetch_filter_models() -> None:
                 b = (filter_base.value or '').strip()
                 k = (filter_key.value or '').strip() or 'dummy'
@@ -3444,7 +3604,10 @@ class SlideNarratorApp:
                     return
                 filter_fetch_btn.disable()
                 try:
-                    client = await run.io_bound(make_tts_filter_client, {'server': {'base_url': b, 'api_key': k}})
+                    client = await run.io_bound(make_tts_filter_client, {'server': {'base_url': b, 'api_key': k,
+                                                                    'connect_timeout': float(filter_connect_timeout.value),
+                                                                    'read_timeout': float(filter_read_timeout.value),
+                                                                    'write_timeout': float(filter_write_timeout.value)}})
                     resp = await run.io_bound(client.models.list)
                     m_ids = sorted([m.id for m in resp.data])
                     if not m_ids:
@@ -3486,7 +3649,10 @@ class SlideNarratorApp:
                     filter_test_res.text = 'ヨミ変換中…'
                     try:
                         t_cfg = {
-                            'server': {'base_url': b, 'api_key': k, 'model': m},
+                            'server': {'base_url': b, 'api_key': k, 'model': m,
+                                       'connect_timeout': float(filter_connect_timeout.value),
+                                       'read_timeout': float(filter_read_timeout.value),
+                                       'write_timeout': float(filter_write_timeout.value)},
                             'generation': {**gen_cfg, 'temperature': float(filter_temp.value or 0), 'reasoning_effort': filter_reason.value},
                             'dictionary': filter_dict,
                             'prompt': filter_cfg.get('prompt'),
@@ -3564,6 +3730,9 @@ class SlideNarratorApp:
                         'base_url': base_url,
                         'api_key': api_key,
                         'model': model,
+                        'connect_timeout': float(filter_connect_timeout.value),
+                        'read_timeout': float(filter_read_timeout.value),
+                        'write_timeout': float(filter_write_timeout.value),
                     })
                     latest.setdefault('generation', {})['temperature'] = float(filter_temp.value or 0)
                     latest['generation']['reasoning_effort'] = filter_reason.value
@@ -3610,6 +3779,15 @@ class SlideNarratorApp:
                 self.cfg['llm']['model'] = (str(llm_model.value) if llm_model.value is not None else '').strip()
                 self.cfg['llm']['temperature'] = llm_temp.value
                 self.cfg['llm']['reasoning_effort'] = llm_reason.value
+                self.cfg['llm']['connect_timeout'] = float(self._llm_connect.value)
+                self.cfg['llm']['read_timeout'] = float(self._llm_read.value)
+                self.cfg['llm']['write_timeout'] = 30
+                self.cfg['llm']['max_output_chars'] = int(self._llm_limit.value)
+                tts_timeout_values = {
+                    lang: {key: float(self.cfg['tts'][lang]['_' + key + '_widget'].value)
+                           for key in ('connect', 'read', 'write')}
+                    for lang in ('ja', 'en')
+                }
                 self.cfg['tts']['ja'] = {
                     'base_url': (ja_base.value or '').strip(),
                     'api_key': (ja_key.value or '').strip() or 'dummy',
@@ -3626,6 +3804,9 @@ class SlideNarratorApp:
                     'response_format': 'mp3',
                     'max_input_words': int(en_limit.value or 0),
                 }
+                for lang in ('ja', 'en'):
+                    for key, value in tts_timeout_values[lang].items():
+                        self.cfg['tts'][lang][key + '_timeout'] = value
                 save_config(CONFIG_PATH, self.cfg)
                 ui.notify('config.yaml を保存しました．', type='positive')
 
@@ -3860,7 +4041,7 @@ class SlideNarratorApp:
         with ui.left_drawer(value=True).props('width=320').classes('p-4'):
             if self.read_only:
                 ui.label('閲覧モード：利用可能時間外のため編集・生成はできません．').classes('text-sm text-amber-400')
-            ui.timer(2.0, self.refresh_job_status)
+            ui.timer(1.0, self.refresh_job_status)
             ui.timer(2.0, lambda: self._safe_view_update(
                 self.poll_visible_outputs, '表示タブの生成ファイル差分同期'))
 
@@ -3947,6 +4128,8 @@ class SlideNarratorApp:
 
                         p_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=6px color=positive').classes('w-full hidden')
                         p_indet = ui.linear_progress(value=0.0, show_value=False).props('indeterminate rounded size=6px color=positive').classes('w-full')
+                        p_detail = ui.label('').classes('text-[11px] text-zinc-400 whitespace-pre-wrap hidden')
+                        p_error = ui.label('').classes('text-[11px] text-red-400 whitespace-pre-wrap hidden')
 
                     self.stage_widgets[key] = {
                         'button': btn,
@@ -3955,6 +4138,8 @@ class SlideNarratorApp:
                         'label': p_label,
                         'bar': p_bar,
                         'indeterminate': p_indet,
+                        'detail': p_detail,
+                        'error': p_error,
                     }
 
             self.reset_generated_button = self.register_main_action_button(

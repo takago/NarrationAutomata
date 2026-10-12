@@ -16,6 +16,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import argparse
+import json
+import time
+import httpx
 import re
 import sys
 from pathlib import Path
@@ -240,10 +243,10 @@ def make_client(config: dict) -> OpenAI:
             "tts_filter.yaml の server.api_key が定義されていません．"
         )
 
-    return OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-    )
+    timeout = httpx.Timeout(connect=float(server.get("connect_timeout", 5)),
+                            read=float(server.get("read_timeout", 30)),
+                            write=float(server.get("write_timeout", 30)), pool=5.0)
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, max_retries=0)
 
 
 def _kanji_count(text: str) -> int:
@@ -267,12 +270,21 @@ def _suspicious_change(original: str, converted: str) -> str | None:
     return None
 
 
+def _emit_filter_progress(metrics: dict, progress_callback=None) -> None:
+    """単独実行時は標準出力，組み込み時は指定先へ進捗を渡す．"""
+    if progress_callback is not None:
+        progress_callback(metrics)
+    else:
+        print('[LLM_PROGRESS] ' + json.dumps(metrics, ensure_ascii=False), flush=True)
+
+
 def transform(
     client: OpenAI,
     model: str,
     system_prompt: str,
     text: str,
     generation: dict,
+    progress_callback=None,
 ) -> str:
     """一つの段落を変換し，異常時に厳格な指示で再試行する．"""
     if not text.strip():
@@ -301,14 +313,59 @@ def transform(
         for key in ("temperature", "max_tokens", "top_p", "seed"):
             if key in generation:
                 kwargs[key] = generation[key]
-        response = client.chat.completions.create(**kwargs)
-        choice = response.choices[0]
-        result = choice.message.content
-        if result is None:
-            raise RuntimeError("LLMから空の応答が返されました．")
-        if choice.finish_reason == "length":
-            raise RuntimeError("LLMの出力が上限に達して打ち切られました．")
-        return result.strip()
+        started = time.monotonic()
+        reasoning_chars = content_chars = 0
+        parts = []
+        finish_reason = None
+        usage = None
+        max_chars = int(generation.get("max_output_chars", 20000))
+        last_progress = 0.0
+        def report_progress(force=False):
+            nonlocal last_progress
+            now = time.monotonic()
+            if force or now - last_progress >= 1.0:
+                metrics = {
+                    "task": "TTSヨミ変換", "state": "LLM受信中",
+                    "reasoning_chars": reasoning_chars, "content_chars": content_chars,
+                    "total_chars": reasoning_chars + content_chars,
+                    "limit_chars": max_chars,
+                    "elapsed_sec": round(now - started, 1),
+                }
+                _emit_filter_progress(metrics, progress_callback)
+                last_progress = now
+        report_progress(force=True)
+        try:
+            with client.chat.completions.create(**kwargs, stream=True,
+                    stream_options={"include_usage": True}) as stream:
+                for event in stream:
+                    if getattr(event, "usage", None) is not None:
+                        usage = event.usage
+                    for choice in event.choices:
+                        delta = choice.delta
+                        r = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None) or ""
+                        c = delta.content or ""
+                        reasoning_chars += len(r)
+                        content_chars += len(c)
+                        if reasoning_chars + content_chars > max_chars:
+                            raise RuntimeError(f"TTSヨミ変換のLLM出力が{max_chars}文字を超過")
+                        if c:
+                            parts.append(c)
+                        report_progress()
+                        if choice.finish_reason is not None:
+                            finish_reason = choice.finish_reason
+            if finish_reason != "stop":
+                raise RuntimeError(f"LLMストリーム異常終了: {finish_reason}")
+            result = "".join(parts).strip()
+            if not result:
+                raise RuntimeError("LLMから空の応答が返されました．")
+            return result
+        finally:
+            report_progress(force=True)
+            tokens = (f"prompt_tokens={usage.prompt_tokens} completion_tokens={usage.completion_tokens} total_tokens={usage.total_tokens}"
+                      if usage else "prompt_tokens=N/A completion_tokens=N/A total_tokens=N/A")
+            print(f"[LLM] task=tts_filter reasoning_chars={reasoning_chars} content_chars={content_chars} "
+                  f"total_chars={reasoning_chars+content_chars} {tokens} elapsed_sec={time.monotonic()-started:.2f}",
+                  file=sys.stderr, flush=True)
 
     last_reason = ""
     for attempt in range(2):
@@ -317,9 +374,8 @@ def transform(
         if not last_reason:
             return leading + result + trailing
         print(f"[TTS_FILTER WARN] 変換異常（試行{attempt+1}）: {last_reason}", file=sys.stderr)
-    # 過剰変換されたテキストを音声合成へ渡さない．
-    print(f"[TTS_FILTER WARN] 再試行後も異常のため原文を保持: {last_reason}", file=sys.stderr)
-    return text
+    # 原文へのフォールバックは行わず，生成ジョブ全体を失敗として扱う．
+    raise RuntimeError(f"TTSヨミ変換の検証に失敗しました（再試行後）: {last_reason}")
 
 
 def split_paragraphs(text: str) -> list[str]:
@@ -343,14 +399,24 @@ def transform_text(
     system_prompt: str,
     text: str,
     generation: dict,
+    progress_callback=None,
 ) -> str:
     """空行で区切った段落ごとに変換し，段落内部は分割しない．"""
     paragraphs = split_paragraphs(text)
     if not paragraphs:
         return text
     converted = []
-    for paragraph in paragraphs:
-        converted.append(transform(client, model, system_prompt, paragraph, generation))
+    for paragraph_index, paragraph in enumerate(paragraphs, 1):
+        # 各段落のLLM呼び出しは独立しており，文字数・時間も段落単位で集計する．
+        paragraph_total = len(paragraphs)
+        def paragraph_progress(metrics, index=paragraph_index, total=paragraph_total):
+            event = dict(metrics)
+            event["paragraph_index"] = index
+            event["paragraph_total"] = total
+            event["task"] = f"TTSヨミ変換（段落 {index} / {total}）"
+            _emit_filter_progress(event, progress_callback)
+        converted.append(transform(client, model, system_prompt, paragraph, generation,
+                                   progress_callback=paragraph_progress))
     return "\n\n".join(converted)
 
 
