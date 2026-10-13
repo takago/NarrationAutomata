@@ -756,6 +756,7 @@ class SlideNarratorApp:
         self.statistics_chart = None
         self.statistics_chart_container = None
         self.statistics_notice = None
+        self.statistics_metric_toggle = None
         self.statistics_scale_switch = None
         self.statistics_scale_max_input = None
         self.pointer_breakdown_switch = None
@@ -1587,7 +1588,8 @@ class SlideNarratorApp:
                                   pointer_image_urls: dict[str, str] | None = None,
                                   pointer_counts: dict[int, dict[str, int]] | None = None,
                                   show_pointer_breakdown: bool = False,
-                                  pointer_percent: bool = True) -> dict:
+                                  pointer_percent: bool = True,
+                                  metric: str = "chars") -> dict:
         """処理別に最新の成功記録を表示する．異なる工程の文字数は合算しない．
 
         同一ページ・同一タスクの再実行については，JSONLの最後の成功記録を採用する．
@@ -1607,6 +1609,10 @@ class SlideNarratorApp:
                     return key
             return None
 
+        metric = 'tokens' if metric == 'tokens' else 'chars'
+        fields = ('prompt_tokens', 'completion_tokens') if metric == 'tokens' else ('reasoning_chars', 'content_chars')
+        labels = ('入力トークン（プロンプト・画像）', '出力トークン（思考・回答）') if metric == 'tokens' else ('思考文字数', '回答文字数')
+        unit = 'トークン数' if metric == 'tokens' else '文字数'
         latest: dict[tuple[int, str], dict] = {}
         for record in records:
             if record.get('status') != 'success':
@@ -1621,9 +1627,10 @@ class SlideNarratorApp:
             if key is None:
                 continue
             details = record.get('llm') or record.get('filter') or {}
-            if not details and any(k in record for k in ('reasoning_chars', 'content_chars')):
+            if not details and any(k in record for k in ('reasoning_chars', 'content_chars',
+                                                            'prompt_tokens', 'completion_tokens')):
                 details = record
-            if not isinstance(details, dict) or not any(k in details for k in ('reasoning_chars', 'content_chars')):
+            if not isinstance(details, dict):
                 continue
             latest[(page, key)] = details
 
@@ -1639,28 +1646,31 @@ class SlideNarratorApp:
             count = 0
             for page in range(1, total_pages + 1):
                 details = latest.get((page, key))
-                if details is None:
+                if details is None or not any(details.get(field) is not None for field in fields):
                     reasoning.append(None)
                     answer.append(None)
                     continue
-                def positive_int(field: str) -> int:
+                def positive_int(field: str) -> int | None:
+                    value = details.get(field)
+                    if value is None:
+                        return None
                     try:
-                        return max(0, int(details.get(field) or 0))
+                        return max(0, int(value))
                     except (TypeError, ValueError):
-                        return 0
-                r, c = positive_int('reasoning_chars'), positive_int('content_chars')
+                        return None
+                r, c = positive_int(fields[0]), positive_int(fields[1])
                 reasoning.append(r)
                 answer.append(c)
                 count += 1
-                maxima.append(r + c)
+                maxima.append((r or 0) + (c or 0))
             valid_counts.append(count)
             series.extend([
-                {'name': f'{key} 思考文字数', 'type': 'bar', 'stack': f'stage_{index}',
+                {'name': f'{key} {labels[0]}', 'type': 'bar', 'stack': f'stage_{index}',
                  'xAxisIndex': grid_slot(index), 'yAxisIndex': grid_slot(index), 'data': reasoning,
-                 'itemStyle': {'color': '#60a5fa'}},
-                {'name': f'{key} 回答文字数', 'type': 'bar', 'stack': f'stage_{index}',
+                 'itemStyle': {'color': '#B0BEC5' if metric == 'tokens' else '#60a5fa'}},
+                {'name': f'{key} {labels[1]}', 'type': 'bar', 'stack': f'stage_{index}',
                  'xAxisIndex': grid_slot(index), 'yAxisIndex': grid_slot(index), 'data': answer,
-                 'itemStyle': {'color': '#34d399'}},
+                 'itemStyle': {'color': '#6485A8' if metric == 'tokens' else '#34d399'}},
             ])
 
         if show_pointer_breakdown:
@@ -1728,10 +1738,10 @@ class SlideNarratorApp:
             }
             return '<div style="min-width:230px;color:#e2e8f0">' +
                    '<strong>スライド ' + page + ' ／ ' + titles[group] + '</strong>' + imgHtml(url) +
-                   '<div>回答文字数：' + number(content) + '</div>' +
-                   '<div>思考文字数：' + number(reasoning) + '</div>' +
+                   '<div>__LABEL2__：' + number(content) + '</div>' +
+                   '<div>__LABEL1__：' + number(reasoning) + '</div>' +
                    '<div>合計：' + number(reasoning + content) + '</div></div>';
-        }""".replace('__TITLES__', titles).replace('__IMAGES__', slide_images).replace(
+        }""".replace('__LABEL1__', labels[0]).replace('__LABEL2__', labels[1]).replace('__TITLES__', titles).replace('__IMAGES__', slide_images).replace(
             '__POINTER_IMAGES__', pointer_images).replace(
             '__POINTER_COUNTS__', json.dumps({str(k): v for k, v in (pointer_counts or {}).items()}))
 
@@ -1755,8 +1765,8 @@ class SlideNarratorApp:
             # 表示文字列だけを簡潔にする（EChartsの系列識別との衝突を防ぐ）．
             'legend': {
                 'top': f'{starts[0] - 4}%', 'left': 'center',
-                'data': [f'{definitions[0][0]} 思考文字数', f'{definitions[0][0]} 回答文字数'],
-                ':formatter': "function(name) { return name.endsWith('思考文字数') ? '思考文字数' : '回答文字数'; }",
+                'data': [f'{definitions[0][0]} {labels[0]}', f'{definitions[0][0]} {labels[1]}'],
+                ':formatter': "function(name) { return name.endsWith('__LABEL1__') ? '__LABEL1__' : '__LABEL2__'; }".replace('__LABEL1__', labels[0]).replace('__LABEL2__', labels[1]),
                 'textStyle': {'color': '#cbd5e1', 'fontSize': 11},
             },
             'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'},
@@ -1765,7 +1775,7 @@ class SlideNarratorApp:
             'grid': [{'top': f'{top}%', 'left': 95, 'right': 28, 'height': f'{grid_height}%'} for top in starts],
             # グラフ見出しはNiceGUI側に描画し，ⓘツールチップを添える．
             'xAxis': axes,
-            'yAxis': [{'type': 'value', 'gridIndex': index, 'name': ('割合（%）' if pointer_percent else '件数') if index == pointer_grid else '文字数',
+            'yAxis': [{'type': 'value', 'gridIndex': index, 'name': ('割合（%）' if pointer_percent else '件数') if index == pointer_grid else unit,
                        'nameTextStyle': axis_color, 'axisLabel': axis_color,
                        **(({'min': 0, 'max': 100, 'splitNumber': 4} if pointer_percent else {'min': 0, 'minInterval': 1})
                           if index == pointer_grid else limits)}
@@ -1790,6 +1800,16 @@ class SlideNarratorApp:
         except (TypeError, ValueError):
             return None
         return int(value) if 1 <= value <= 100000000 else None
+
+    def _on_statistics_metric_change(self) -> None:
+        """工程別グラフの表示単位と縦軸ラベルを同時に切り替える．"""
+        metric = str(self.statistics_metric_toggle.value or 'chars')
+        app.storage.user[f'statistics_metric_{self.username}'] = metric
+        if self._widget_available(self.statistics_scale_max_input):
+            self.statistics_scale_max_input.label = ('共通スケール上限（トークン数）' if metric == 'tokens'
+                                                     else '共通スケール上限（文字数）')
+            self.statistics_scale_max_input.update()
+        self.refresh_statistics_chart(force=True)
 
     def _on_statistics_scale_change(self) -> None:
         """スケール入力欄の有効状態とグラフを同期する．"""
@@ -1822,28 +1842,35 @@ class SlideNarratorApp:
             from openpyxl.utils import get_column_letter
 
             records = read_records(source)
-            options = self._statistics_chart_options(records, page_count)
+            options = self._statistics_chart_options(records, page_count, metric='chars')
+            token_options = self._statistics_chart_options(records, page_count, metric='tokens')
             # 既存の詳細統計（実行履歴・集計・エラー）も残す．
             export_xlsx(source, destination)
             workbook = load_workbook(destination)
             sheet = workbook.create_sheet('工程別グラフ', 0)
-            sheet.append(['スライド番号',
-                          'ナレーション生成（画像・テキスト解析） 思考', 'ナレーション生成（画像・テキスト解析） 回答',
-                          'Bbox検出（スライド要素の位置検出） 思考', 'Bbox検出（スライド要素の位置検出） 回答',
-                          'ポインタ位置選定 思考', 'ポインタ位置選定 回答',
-                          '字幕用翻訳 思考', '字幕用翻訳 回答',
-                          'TTSヨミ変換 思考', 'TTSヨミ変換 回答'])
+            metric_headers = ['スライド番号']
+            for info in STATISTICS_STAGE_INFO:
+                metric_headers.extend([f"{info['title']} 思考文字数", f"{info['title']} 回答文字数",
+                                       f"{info['title']} 入力トークン数", f"{info['title']} 出力トークン数"])
+            sheet.append(metric_headers)
             # 保存済みアライメントから実件数と割合を集計（グラフの表示設定には依存しない）．
             headers = ['PDF由来件数', 'VLM由来件数', 'ポインタなし件数', '合計件数',
                        'PDF由来割合', 'VLM由来割合', 'ポインタなし割合']
-            for index, header in enumerate(headers, 12):
+            pointer_start_column = 2 + 4 * len(STATISTICS_STAGE_INFO)
+            for index, header in enumerate(headers, pointer_start_column):
                 sheet.cell(1, index, header)
             counts_by_page = self._pointer_source_counts(page_count)
-            series = options['series'][:2 * len(STATISTICS_STAGE_INFO)]
+            char_series = options['series'][:2 * len(STATISTICS_STAGE_INFO)]
+            token_series = token_options['series'][:2 * len(STATISTICS_STAGE_INFO)]
             for index in range(page_count):
                 page = index + 1
                 counts = counts_by_page.get(page)
-                values = [part['data'][index] for part in series]
+                values = []
+                for stage_index in range(len(STATISTICS_STAGE_INFO)):
+                    for component in (0, 1):
+                        values.append(char_series[2 * stage_index + component]['data'][index])
+                    for component in (0, 1):
+                        values.append(token_series[2 * stage_index + component]['data'][index])
                 if counts is None:
                     extra = [None] * 7
                 else:
@@ -1853,7 +1880,8 @@ class SlideNarratorApp:
                     total = pdf_count + vlm_count + none_count
                     extra = [pdf_count, vlm_count, none_count, total] + ([pdf_count / total, vlm_count / total, none_count / total] if total else [None] * 3)
                 sheet.append([page] + values + extra)
-                for column in range(16, 19):
+                percent_start_column = pointer_start_column + 4
+                for column in range(percent_start_column, percent_start_column + 3):
                     sheet.cell(page + 1, column).number_format = '0.0%'
             sheet.freeze_panes = 'B2'
             sheet.auto_filter.ref = sheet.dimensions
@@ -1863,11 +1891,11 @@ class SlideNarratorApp:
                 cell.fill = PatternFill('solid', fgColor='17324D')
                 cell.alignment = Alignment(vertical='center', wrap_text=True)
             sheet.column_dimensions['A'].width = 17
-            for column in range(2, 19):
+            for column in range(2, pointer_start_column + len(headers)):
                 sheet.column_dimensions[get_column_letter(column)].width = 22
             for row in sheet.iter_rows(min_row=2, min_col=2):
                 for cell in row:
-                    cell.number_format = '0.0%' if cell.column >= 16 else '#,##0'
+                    cell.number_format = '0.0%' if percent_start_column <= cell.column < percent_start_column + 3 else '#,##0'
             temporary = destination.with_name('.statistics_chart_export.xlsx')
             try:
                 workbook.save(temporary)
@@ -1974,12 +2002,14 @@ class SlideNarratorApp:
         pointer_percent = (str(self.pointer_breakdown_mode.value) != 'count'
                            if self._widget_available(self.pointer_breakdown_mode) else True)
         counts_by_page = self._pointer_source_counts(page_count) if show_pointer else {}
+        metric = (str(self.statistics_metric_toggle.value or 'chars')
+                  if self._widget_available(self.statistics_metric_toggle) else 'chars')
         options = self._statistics_chart_options(records, page_count, common_scale=common_scale,
                                                  common_max=common_max, image_urls=image_urls,
                                                  pointer_image_urls=pointer_image_urls,
                                                  pointer_counts=counts_by_page,
                                                  show_pointer_breakdown=show_pointer,
-                                                 pointer_percent=pointer_percent)
+                                                 pointer_percent=pointer_percent, metric=metric)
         names = tuple(info['title'] for info in STATISTICS_STAGE_INFO)
         counts = [sum(options['series'][2 * i]['data'][j] is not None for j in range(page_count))
                   for i in range(len(names))]
@@ -5153,11 +5183,19 @@ class SlideNarratorApp:
                 with ui.tab_panel(tab_statistics):
                     ui.label('📊 スライド別生成統計').classes('text-h5')
                     ui.label('工程別：ナレーション生成（画像・テキスト解析）／Bbox検出（スライド要素の位置検出）／字幕用翻訳／ポインタ位置選定／TTSヨミ変換').classes('text-caption text-slate-400')
+                    saved_metric = app.storage.user.get(f'statistics_metric_{self.username}', 'chars')
+                    self.statistics_metric_toggle = ui.toggle(
+                        {'chars': '生成文字数', 'tokens': '入出力トークン数'},
+                        value=saved_metric if saved_metric in ('chars', 'tokens') else 'chars'
+                    ).props('dense no-caps')
+                    self.statistics_metric_toggle.on('update:model-value',
+                                                      lambda _: self._on_statistics_metric_change())
                     with ui.row().classes('w-full items-center gap-3 flex-wrap'):
                         self.statistics_scale_switch = ui.switch('縦軸を共通スケールにする', value=False).props('dense')
                         self.statistics_scale_switch.on('update:model-value', lambda _: self._on_statistics_scale_change())
                         self.statistics_scale_max_input = ui.number(
-                            label='共通スケール上限（文字数）', value=None,
+                            label=('共通スケール上限（トークン数）' if self.statistics_metric_toggle.value == 'tokens'
+                                   else '共通スケール上限（文字数）'), value=None,
                             min=0, max=100000000, step=1000,
                             placeholder='自動', format='%.0f',
                         ).props('dense outlined clearable').classes('w-56')
