@@ -1592,8 +1592,9 @@ class SlideNarratorApp:
                                   metric: str = "chars") -> dict:
         """処理別に最新の成功記録を表示する．異なる工程の文字数は合算しない．
 
-        同一ページ・同一タスクの再実行については，JSONLの最後の成功記録を採用する．
-        講義概要生成など，特定ページを持たない処理は対象外とする．
+        ヨミ変換だけは同じ実行(run_id)に属する成功した段落の値を積算する．
+        別実行のヨミ変換や失敗記録は合算せず，最新の成功実行を表示する．
+        その他は同一ページ・同一タスクの最後の成功記録を採用する．
         """
         # 表示名はモデルの種類ではなく処理の目的を示す．
         # 記録上のtask識別子は変更せず，過去の統計データとの互換性を維持する．
@@ -1614,6 +1615,14 @@ class SlideNarratorApp:
         labels = ('入力トークン（プロンプト・画像）', '出力トークン（思考・回答）') if metric == 'tokens' else ('思考文字数', '回答文字数')
         unit = 'トークン数' if metric == 'tokens' else '文字数'
         latest: dict[tuple[int, str], dict] = {}
+        # run_idはTTS実行単位で採番される．段落の成功記録を同じ実行内でのみ積算する．
+        # 古い実行の値を混ぜないよう，ページごとの最後の成功実行を採用する．
+        # 各段落の成功記録を実行(run_id)単位で積算する．
+        # 最終段落まで揃った実行のみ表示することで，途中失敗した生成を除外する．
+        filter_runs: dict[tuple[int, str], dict] = {}
+        filter_latest_run: dict[int, str] = {}
+        filter_fields = ('reasoning_chars', 'content_chars', 'total_chars',
+                         'prompt_tokens', 'completion_tokens', 'total_tokens', 'elapsed_sec')
         for record in records:
             if record.get('status') != 'success':
                 continue
@@ -1632,7 +1641,41 @@ class SlideNarratorApp:
                 details = record
             if not isinstance(details, dict):
                 continue
-            latest[(page, key)] = details
+            if key != 'tts_filter':
+                latest[(page, key)] = details
+                continue
+            run_id = str(record.get('run_id') or record.get('request_id') or id(record))
+            run_key = (page, run_id)
+            item = filter_runs.setdefault(run_key, {'values': {}, 'indices': set(), 'total': None,
+                                                     'legacy': False})
+            ix, total = details.get('paragraph_index'), details.get('paragraph_total')
+            try:
+                ix, total = int(ix), int(total)
+                if not 1 <= ix <= total:
+                    continue
+            except (ValueError, TypeError):
+                # 旧形式の記録は従来と同様，記録の存在を成功条件とする．
+                item['legacy'] = True
+                ix = total = None
+            if total is not None:
+                if item['total'] is not None and item['total'] != total:
+                    continue
+                if ix in item['indices']:
+                    # 同じ実行・段落の多重記録は二重計上しない．
+                    continue
+                item['total'] = total
+                item['indices'].add(ix)
+            for field in filter_fields:
+                value = details.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    values = item['values']
+                    values[field] = values.get(field, 0) + value
+            complete = item['legacy'] or (item['total'] is not None and
+                        len(item['indices']) == item['total'])
+            if complete:
+                filter_latest_run[page] = run_id
+        for page, run_id in filter_latest_run.items():
+            latest[(page, 'tts_filter')] = filter_runs[(page, run_id)]['values']
 
         pages = [str(i) for i in range(1, total_pages + 1)]
         pointer_grid = 3 if show_pointer_breakdown else None
@@ -5183,6 +5226,7 @@ class SlideNarratorApp:
                 with ui.tab_panel(tab_statistics):
                     ui.label('📊 スライド別生成統計').classes('text-h5')
                     ui.label('工程別：ナレーション生成（画像・テキスト解析）／Bbox検出（スライド要素の位置検出）／字幕用翻訳／ポインタ位置選定／TTSヨミ変換').classes('text-caption text-slate-400')
+                    ui.label('※ TTSヨミ変換は段落ごとにLLMを繰り返し呼び出すため，同一実行で採用された全段落の統計を積算して表示します．途中失敗した実行・再生成前の履歴は含めません．').classes('text-caption text-slate-400')
                     saved_metric = app.storage.user.get(f'statistics_metric_{self.username}', 'chars')
                     self.statistics_metric_toggle = ui.toggle(
                         {'chars': '生成文字数', 'tokens': '入出力トークン数'},

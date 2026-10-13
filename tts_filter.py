@@ -311,7 +311,10 @@ def transform(
     trailing = text[len(text.rstrip()):]
     core_text = text.strip()
 
+    accepted_candidate = None
+
     def request(strict: bool) -> str:
+        nonlocal accepted_candidate
         messages = [{"role": "system", "content": system_prompt}]
         if strict:
             messages.append({"role": "system", "content": (
@@ -383,18 +386,25 @@ def transform(
             raise
         finally:
             report_progress(force=True)
-            record_statistics('tts_filter', model, 'error' if request_error else 'success',
-                reasoning_effort=effort, filter={
-                    'reasoning_chars': reasoning_chars, 'content_chars': content_chars,
-                    'total_chars': reasoning_chars+content_chars,
-                    'prompt_tokens': getattr(usage,'prompt_tokens',None),
-                    'completion_tokens': getattr(usage,'completion_tokens',None),
-                    'total_tokens': getattr(usage,'total_tokens',None),
-                    'input_chars':len(core_text),
-                    'paragraph_index': paragraph_index,
-                    'paragraph_total': paragraph_total,
-                    'elapsed_sec':round(time.monotonic()-started,3),
-                    'error':str(request_error) if request_error else None})
+            details = {
+                'reasoning_chars': reasoning_chars, 'content_chars': content_chars,
+                'total_chars': reasoning_chars + content_chars,
+                'prompt_tokens': getattr(usage, 'prompt_tokens', None),
+                'completion_tokens': getattr(usage, 'completion_tokens', None),
+                'total_tokens': getattr(usage, 'total_tokens', None),
+                'input_chars': len(core_text),
+                'paragraph_index': paragraph_index,
+                'paragraph_total': paragraph_total,
+                'elapsed_sec': round(time.monotonic() - started, 3),
+                'error': str(request_error) if request_error else None,
+            }
+            if request_error:
+                # 失敗したAPI呼び出しは成功統計には含めない．
+                record_statistics('tts_filter', model, 'error',
+                                  reasoning_effort=effort, filter=details)
+            else:
+                # 応答の正常終了だけでは採用扱いにしない．本文保持検査後に記録する．
+                accepted_candidate = (effort, details)
             tokens = (f"prompt_tokens={usage.prompt_tokens} completion_tokens={usage.completion_tokens} total_tokens={usage.total_tokens}"
                       if usage else "prompt_tokens=N/A completion_tokens=N/A total_tokens=N/A")
             print(f"[LLM] task=tts_filter reasoning_chars={reasoning_chars} content_chars={content_chars} "
@@ -421,6 +431,11 @@ def transform(
             continue
         last_reason = _suspicious_change(core_text, result) or ""
         if not last_reason:
+            # 採用した段落の最後の試行だけを成功記録として残す．
+            if accepted_candidate is not None:
+                effort, details = accepted_candidate
+                record_statistics('tts_filter', model, 'success',
+                                  reasoning_effort=effort, filter=details)
             return leading + result + trailing
         print(f"[TTS_FILTER WARN] 変換異常（試行{attempt+1}）: {last_reason}", file=sys.stderr)
     # 原文へのフォールバックは行わず，生成ジョブ全体を失敗として扱う．
