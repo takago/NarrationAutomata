@@ -742,6 +742,10 @@ class SlideNarratorApp:
         self.lang_select = None
         self.default_vlm_switch = None
         self.pointer_default_select = None
+        self.pointer_image_panel = None
+        self.pointer_anchor_x = None
+        self.pointer_anchor_y = None
+        self.pointer_image_upload = None
         self.view_mode = 'easy'
         self.advanced_sidebar_sections: list[Any] = []
         self.advanced_stage_buttons: list[Any] = []
@@ -1177,6 +1181,10 @@ class SlideNarratorApp:
         # 同一利用者の次回アクセスでも選択状態を復元する．
         app.storage.user[f'sidebar_mode_{self.username}'] = self.view_mode
         advanced = self.view_mode == 'advanced'
+        for heading_part in (getattr(self, 'pipeline_heading_separator', None),
+                             getattr(self, 'pipeline_heading_label', None)):
+            if self._widget_available(heading_part):
+                heading_part.classes(remove='hidden') if advanced else heading_part.classes(add='hidden')
         for section in self.advanced_sidebar_sections:
             if self._widget_available(section):
                 if advanced:
@@ -2578,6 +2586,118 @@ class SlideNarratorApp:
         finally:
             self.project_dict_audio_button.enable()
 
+    def _invalidate_pointer_videos(self) -> None:
+        """変更後に既存MP4を誤って再利用しない．"""
+        if self.paths:
+            for video_file in self.paths.video_dir.glob('*.mp4'):
+                video_file.unlink(missing_ok=True)
+            self.paths.final_video.unlink(missing_ok=True)
+
+    async def upload_pointer_image(self, e) -> None:
+        if not self.paths or not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
+            safe_notify('処理中または閲覧専用状態では変更できません．', type='warning')
+            return
+        target = self.paths.root / 'custom_pointer.png'
+        temporary = self.paths.root / '.custom_pointer_upload.png'
+        try:
+            self.paths.root.mkdir(parents=True, exist_ok=True)
+            await e.file.save(temporary)
+            with Image.open(temporary) as img:
+                if img.format != 'PNG':
+                    raise ValueError('PNG形式を選択してください．')
+                w, h = img.size
+                if not (0 < w <= 2048 and 0 < h <= 2048):
+                    raise ValueError('画像の幅・高さは1〜2048ピクセルにしてください．')
+                img.verify()
+            if not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
+                raise RuntimeError('処理開始または権限変更のため，保存を中止しました．')
+            temporary.replace(target)
+            data = load_project_json(self.paths.root)
+            data['pointer_image'] = target.name
+            data['pointer_anchor'] = [w // 2, h // 2]
+            save_project_json(self.paths.root, data)
+            self.proj_cfg = data
+            self._invalidate_pointer_videos()
+            self.refresh_pointer_image_panel()
+            safe_notify('ポインタ画像を保存しました．指示点を指定してください．', type='positive')
+        except Exception as exc:
+            LOGGER.exception('ポインタ画像の保存に失敗')
+            safe_notify(f'画像を保存できませんでした: {exc}', type='negative')
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def refresh_pointer_image_panel(self) -> None:
+        if not self._widget_available(self.pointer_image_panel):
+            return
+        panel = self.pointer_image_panel
+        panel.clear()
+        with panel:
+            if not self.paths or not self.pdf:
+                ui.label('プロジェクトを選択すると設定できます．').classes('text-xs text-zinc-400')
+                return
+            data = self.proj_cfg
+            image_name = data.get('pointer_image')
+            image_path = self.paths.root / 'custom_pointer.png'
+            use_custom = image_name == image_path.name and image_path.is_file()
+            ui.label('現在: カスタムPNG' if use_custom else '現在: 標準レーザードット').classes('text-xs text-zinc-300')
+            if not use_custom:
+                ui.label('PNG画像をアップロードするとカスタムポインタに切り替わります．').classes('text-xs text-zinc-400')
+            else:
+                with Image.open(image_path) as im:
+                    width, height = im.size
+                anchor = data.get('pointer_anchor')
+                if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
+                    anchor = [width // 2, height // 2]
+                ui.label(f'画像サイズ: {width} × {height} px').classes('text-xs text-zinc-400')
+                with ui.row().classes('w-full gap-2'):
+                    self.pointer_anchor_x = ui.number('X (px)', value=anchor[0], min=0, max=width-1, step=1).props('outlined dense').classes('w-1/2')
+                    self.pointer_anchor_y = ui.number('Y (px)', value=anchor[1], min=0, max=height-1, step=1).props('outlined dense').classes('w-1/2')
+                def clicked(e):
+                    if e.type == 'click':
+                        self.pointer_anchor_x.value = max(0, min(width-1, round(e.image_x)))
+                        self.pointer_anchor_y.value = max(0, min(height-1, round(e.image_y)))
+                ui.interactive_image(file_url(image_path), on_mouse=clicked, events=['click']).classes('w-full').style('max-height: 210px; object-fit: contain')
+                ui.label('画像をクリックして指示点を選択し，保存してください．').classes('text-xs text-zinc-400')
+                with ui.row().classes('w-full gap-2'):
+                    ui.button('指示点を保存', icon='save', on_click=self.save_pointer_anchor).props('outline dense').classes('flex-1')
+                    ui.button('標準に戻す', icon='restart_alt', on_click=self.reset_pointer_image).props('outline dense').classes('flex-1')
+            self.pointer_image_upload = ui.upload(on_upload=self.upload_pointer_image, auto_upload=True, max_files=1).props('accept=.png').classes('w-full')
+            if self.read_only:
+                self.pointer_image_upload.disable()
+
+    def save_pointer_anchor(self) -> None:
+        if not self.paths or not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
+            return
+        path = self.paths.root / 'custom_pointer.png'
+        if not path.is_file():
+            return
+        try:
+            with Image.open(path) as image:
+                w, h = image.size
+            x, y = int(self.pointer_anchor_x.value), int(self.pointer_anchor_y.value)
+            if not (0 <= x < w and 0 <= y < h):
+                raise ValueError('指示点が画像範囲外です．')
+            data = load_project_json(self.paths.root)
+            data.update(pointer_image=path.name, pointer_anchor=[x, y])
+            save_project_json(self.paths.root, data)
+            self.proj_cfg = data
+            self._invalidate_pointer_videos()
+            safe_notify('指示点を保存しました．動画再生成で反映されます．', type='positive')
+        except (ValueError, TypeError) as exc:
+            safe_notify(f'座標を確認してください: {exc}', type='negative')
+
+    def reset_pointer_image(self) -> None:
+        if not self.paths or not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
+            return
+        data = load_project_json(self.paths.root)
+        data['pointer_image'] = ''
+        data.pop('pointer_anchor', None)
+        save_project_json(self.paths.root, data)
+        self.proj_cfg = data
+        self._invalidate_pointer_videos()
+        self.refresh_pointer_image_panel()
+        safe_notify('標準レーザードットに戻しました．', type='positive')
+
     def refresh_project_widgets(self) -> None:
         if self.project_dict_area is not None:
             dictionary = self.proj_cfg.get('tts_dictionary', {}) if self.pdf else {}
@@ -2611,6 +2731,7 @@ class SlideNarratorApp:
             self.lang_select.value = self.lang_code
         if self.default_vlm_switch:
             self.default_vlm_switch.value = self.default_use_vlm
+        self.refresh_pointer_image_panel()
         if self.pointer_default_select:
             default_mode = self.proj_cfg.get('pointer_default_mode', 'static') if self.pdf else 'static'
             if default_mode not in ('static', 'active', 'hidden'):
@@ -4806,6 +4927,20 @@ class SlideNarratorApp:
             llm_base, llm_key, llm_model, llm_temp, llm_reason = self._build_llm_settings()
             (ja_base, ja_key, ja_model, ja_voice, ja_limit), (en_base, en_key, en_model, en_voice, en_limit) = self._build_tts_settings()
 
+            with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-lg'):
+                ui.label('PDF・動画設定（システム共通）').classes('text-lg font-bold')
+                pdf_cfg = self.cfg.get('pdf', {})
+                video_cfg = self.cfg.get('video', {})
+                with ui.row().classes('w-full gap-3'):
+                    pdf_dpi = ui.number('PDF DPI', value=pdf_cfg.get('dpi', 81), min=36, max=600, step=1).props('outlined').classes('w-40')
+                    video_fps = ui.number('動画 FPS', value=video_cfg.get('fps', 10), min=1, max=60, step=1).props('outlined').classes('w-40')
+                    video_crf = ui.number('CRF（小さいほど高画質）', value=video_cfg.get('crf', 26), min=0, max=51, step=1).props('outlined').classes('w-52')
+                with ui.row().classes('w-full gap-3'):
+                    video_preset = ui.select(['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], value=video_cfg.get('preset', 'veryfast'), label='エンコード preset').props('outlined').classes('w-52')
+                    video_codec = ui.select(['aac', 'libmp3lame', 'ac3'], value=video_cfg.get('audio_codec', 'aac'), label='音声コーデック').props('outlined').classes('w-44')
+                    video_bitrate = ui.select(['64k', '96k', '128k', '160k', '192k', '256k', '320k'], value=video_cfg.get('audio_bitrate', '96k'), label='音声ビットレート').props('outlined').classes('w-44')
+                ui.label('設定は次回の画像・動画生成から適用されます．既存の生成ファイルは自動再生成されません．').classes('text-xs text-zinc-400')
+
             def save_main_config() -> None:
                 """基本設定を保存し，結果を通知する．"""
                 try:
@@ -4847,11 +4982,20 @@ class SlideNarratorApp:
                         for timeout_key, timeout_value in tts_timeout_values[lang].items():
                             section[timeout_key + '_timeout'] = timeout_value
 
+                    dpi_value, fps_value, crf_value = int(pdf_dpi.value), int(video_fps.value), int(video_crf.value)
+                    if not (36 <= dpi_value <= 600 and 1 <= fps_value <= 60 and 0 <= crf_value <= 51):
+                        raise ValueError('PDF DPI・FPS・CRFの値が範囲外です．')
+                    config_to_save.setdefault('pdf', {})['dpi'] = dpi_value
+                    video_saved = config_to_save.setdefault('video', {})
+                    video_saved.update(fps=fps_value, crf=crf_value, preset=video_preset.value,
+                                       audio_codec=video_codec.value, audio_bitrate=video_bitrate.value)
                     save_config(CONFIG_PATH, config_to_save)
                     verified = load_config(CONFIG_PATH)
                     if verified.get('tts', {}).get('ja', {}).get('voice') != tts_saved['ja']['voice']:
                         raise RuntimeError('日本語Voiceの保存後検証に失敗しました．')
                     # 既存の表示用ウィジェット参照は保持し，保存対象の値だけ反映する．
+                    self.cfg.setdefault('pdf', {}).update(config_to_save['pdf'])
+                    self.cfg.setdefault('video', {}).update(video_saved)
                     self.cfg['llm'].update(llm_saved)
                     for lang in ('ja', 'en'):
                         self.cfg['tts'][lang].update(tts_saved[lang])
@@ -5122,14 +5266,6 @@ class SlideNarratorApp:
             # 設定行のラベル列とラジオ選択肢の列幅を揃える．
             with ui.column().classes('w-full gap-1 mt-2'):
                 with ui.row().classes('w-full items-center gap-2 flex-nowrap min-h-[32px]'):
-                    ui.label('操作モード').classes('w-[88px] shrink-0 text-xs text-zinc-400 whitespace-nowrap')
-                    with ui.row().classes('items-center gap-2 flex-nowrap'):
-                        ui.label('Easy').classes('text-sm whitespace-nowrap')
-                        ui.switch(value=self.view_mode == 'advanced',
-                                  on_change=lambda e: self.set_sidebar_view_mode('advanced' if e.value else 'easy')).props('dense')
-                        ui.label('Advanced').classes('text-sm whitespace-nowrap')
-
-                with ui.row().classes('w-full items-center gap-2 flex-nowrap min-h-[32px]'):
                     ui.label('発表スタイル').classes('w-[88px] shrink-0 text-xs text-zinc-400 whitespace-nowrap')
                     self.mode_select = ui.radio(
                         {'lecture': '講義', 'research': '研究発表'},
@@ -5144,7 +5280,28 @@ class SlideNarratorApp:
                         value=self.lang_code,
                     ).props('dense').style('display: grid; grid-template-columns: 78px max-content; align-items: center; column-gap: 0;')
                 self.lang_select.on_value_change(lambda e: self._lang_changed(e.value))
+            # ビデオ化対象はプロジェクトの基本設定として，言語選択の直下に配置する．
+            self.pages_input = (
+                ui.input('ビデオ化対象', placeholder='例: 1-10,12', value=self.pages_spec)
+                .classes('w-full mt-2')
+                .props('outlined dense')
+                .on_value_change(lambda e: self._range_changed())
+            )
+            self.active_count_label = ui.label('対象スライド: 0 / 0 スライド')
             ui.separator().classes('w-full my-3')
+            # モード名は独立したラベル1個で表示し，スイッチのlabel属性は使用しない．
+            with ui.row().classes('w-full items-center justify-end gap-2 min-h-[32px]'):
+                self.sidebar_mode_label = ui.label(
+                    'Advanced Mode' if self.view_mode == 'advanced' else 'Easy Mode'
+                ).classes('text-sm')
+                self.sidebar_mode_toggle = ui.switch(
+                    value=self.view_mode == 'advanced',
+                    on_change=lambda e: (
+                        self.sidebar_mode_label.set_text('Advanced Mode' if e.value else 'Easy Mode'),
+                        self.set_sidebar_view_mode('advanced' if e.value else 'easy'),
+                    ),
+                ).props('dense').classes('shrink-0')
+
             with ui.expansion('プロジェクト全体の追加プロンプト', icon='edit_note').classes('w-full mt-2') as prompt_expansion:
                 self.advanced_sidebar_sections.append(prompt_expansion)
                 ui.label('全スライドのナレーション生成に適用します．変更は次回の生成・再生成から有効になります．').classes('text-xs text-zinc-400')
@@ -5180,6 +5337,11 @@ class SlideNarratorApp:
                 self.project_dict_audio_container = ui.column().classes('w-full')
             self.refresh_project_widgets()
 
+            with ui.expansion('ポインタ画像・指示点', icon='ads_click').classes('w-full mt-2') as pointer_expansion:
+                self.advanced_sidebar_sections.append(pointer_expansion)
+                self.pointer_image_panel = ui.column().classes('w-full gap-2')
+                self.refresh_pointer_image_panel()
+
             with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2') as vlm_card:
                 self.advanced_sidebar_sections.append(vlm_card)
                 self.default_vlm_switch = ui.switch('VLMを活用してポインタ配置を決定する', value=self.default_use_vlm).props('dense color=primary')
@@ -5195,15 +5357,12 @@ class SlideNarratorApp:
                 self.pointer_default_select.on_value_change(lambda e: self._pointer_default_changed(e.value))
                 ui.label('スライド・文ごとの個別設定が優先されます．').classes('text-xs text-zinc-400')
 
-            self.pages_input = (
-                ui.input('ビデオ化対象', placeholder='例: 1-10,12', value=self.pages_spec)
-                .classes('w-full mt-2')
-                .props('outlined dense')
-                .on_value_change(lambda e: self._range_changed())
-            )
-            self.active_count_label = ui.label('対象スライド: 0 / 0 スライド')
-            ui.separator()
-            ui.label('パイプライン実行').classes('text-h6')
+            # Easyでは見出しと付随する区切り線を隠し，余白を残さない．
+            self.pipeline_heading_separator = ui.separator()
+            self.pipeline_heading_label = ui.label('パイプライン実行').classes('text-h6')
+            if self.view_mode != 'advanced':
+                self.pipeline_heading_separator.classes(add='hidden')
+                self.pipeline_heading_label.classes(add='hidden')
 
             with ui.row().classes('hidden w-full items-center gap-2 p-2 bg-amber-500/10 border border-amber-500/30 rounded-lg mb-2') as self.pipeline_busy_row:
                 ui.spinner(size='xs', color='warning')

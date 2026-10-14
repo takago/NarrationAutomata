@@ -54,3 +54,33 @@ python3 -m py_compile app.py slide_lecture.py pointer_motion.py pointer_settings
 
 本体の依存ライブラリは従来どおり `requirements.txt` から導入してください．
 
+
+## 任意のポインタPNGと指示点
+
+`config.yaml` の `video` に次を指定できます．
+
+```yaml
+video:
+  pointer_image: mypointer.png
+  pointer_anchor: [12, 24]
+```
+
+- `pointer_image`：透明部分を持つPNGファイルを推奨します．相対パスは起動時の作業ディレクトリ基準です．
+- `pointer_anchor`：画像左上を `(0, 0)` としたピクセル座標で，スライド上の注目位置にこの点が一致します．省略時は画像中心です．
+- 既存の設定を変更しなければ，従来のレーザードットを使います．
+- 設定変更後は動画を再生成してください．
+
+## WebUIのカスタムポインタ（プロジェクト単位）
+
+サイドバーの「ポインタ画像・指示点」はAdvancedモードでのみ表示され，PNG画像をアップロードできます．
+Easyモードでは設定欄だけを非表示にし，プロジェクトに保存されたポインタ画像と指示点は動画生成に引き続き適用されます．
+画像はプロジェクトフォルダの `*_lecture/custom_pointer.png` に保存されます．
+画像の指示点をクリックするかX・Y座標を数値入力し，「指示点を保存」を押します．
+設定は同フォルダの `project.json` に `pointer_image` と `pointer_anchor` として保存されます．
+「標準に戻す」を使うと標準レーザードットになります．設定変更後は動画を再生成してください．
+
+管理者専用「設定」タブからは `pdf.dpi`，`video.fps`，`video.crf`，
+`video.preset`，`video.audio_codec`，`video.audio_bitrate` を編集できます．
+`video.preset` はソフトウェアエンコーダ（libx264）利用時に適用されます．
+GPUエンコーダ（NVENC / QSV）は各エンコーダ固有のpresetが優先されます．
+既存の画像や動画は管理者設定の変更だけでは再生成されません．

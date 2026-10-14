@@ -295,7 +295,8 @@ def _bezier_coord_expr(pts: Sequence[Point], k: int, u: str) -> str:
 
 
 def ffmpeg_position_expr(motion: Motion | Mapping[str, Any], start: float, end: float,
-                         width: int, height: int, pointer_size: int = 24) -> tuple[str, str]:
+                         width: int, height: int, pointer_size: int = 24,
+                         pointer_anchor: tuple[float, float] | None = None) -> tuple[str, str]:
     """Return FFmpeg overlay x/y expressions, evaluated each output frame.
 
     Coordinates refer to a square pointer PNG; formulas center it on the target.
@@ -344,8 +345,9 @@ def ffmpeg_position_expr(motion: Motion | Mapping[str, Any], start: float, end: 
     factor = _jitter_scale_expr(m, local, end-start)
     jx = f'+({factor})*{_jitter_expr(m, local, 0)}' if m.jitter_px else ''
     jy = f'+({factor})*{_jitter_expr(m, local, 1)}' if m.jitter_px else ''
-    return (f'({coords[0]})*{width}{jx}-{pointer_size/2:g}',
-            f'({coords[1]})*{height}{jy}-{pointer_size/2:g}')
+    ax, ay = pointer_anchor if pointer_anchor is not None else (pointer_size / 2, pointer_size / 2)
+    return (f'({coords[0]})*{width}{jx}-{ax:g}',
+            f'({coords[1]})*{height}{jy}-{ay:g}')
 
 
 def validate_schedule(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:

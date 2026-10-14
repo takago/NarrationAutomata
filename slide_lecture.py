@@ -1891,6 +1891,33 @@ def generate_tts(
         concat_list.unlink(missing_ok=True)
 
 
+def resolve_pointer_image(root: Path, video_cfg: dict) -> tuple[Path, tuple[float, float] | None]:
+    """Resolve an optional custom RGBA pointer and pixel-coordinate hot spot."""
+    custom = str(video_cfg.get("pointer_image", "") or "").strip()
+    if not custom:
+        dot = root / "laser_dot.png"
+        create_laser_dot_image(dot, radius=14)
+        return dot, None
+    path = Path(custom).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.is_file():
+        raise FileNotFoundError(f"ポインタ画像が見つかりません: {path}")
+    with Image.open(path) as im:
+        if im.format != "PNG":
+            raise ValueError("pointer_image はPNG形式を指定してください")
+        w, h = im.size
+    raw = video_cfg.get("pointer_anchor")
+    if raw is None:
+        return path, (w / 2, h / 2)
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        raise ValueError("video.pointer_anchor は [x, y] 形式で指定してください")
+    ax, ay = (float(v) for v in raw)
+    if not (0 <= ax < w and 0 <= ay < h):
+        raise ValueError(f"pointer_anchor は画像内の座標にしてください（画像サイズ: {w}x{h}）")
+    return path, (ax, ay)
+
+
 def generate_page_video(
     image: Path,
     audio: Path,
@@ -1914,6 +1941,11 @@ def generate_page_video(
     filter_script = out.parent / f".{out.stem}_filter.txt"
 
     vcodec, encoder_opts = detect_best_video_encoder()
+    if vcodec == 'libx264':
+        preset = str(cfg.get('preset', 'veryfast'))
+        if preset not in ('ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'):
+            raise ValueError(f'不正なvideo.presetです: {preset}')
+        encoder_opts = ['-preset', preset]
 
     crf = str(cfg.get("crf", 20))
     fps = str(cfg.get("fps", 15))
@@ -1957,6 +1989,12 @@ def generate_page_video(
                 pointer_width, pointer_height = pointer_image.size
             width -= width % 2
             height -= height % 2
+            anchor = cfg.get("_pointer_anchor")
+            # Use a real target hot spot for both static and animated movement.
+            if anchor is not None:
+                ax, ay = anchor
+            else:
+                ax, ay = pointer_width / 2, pointer_height / 2
             overlays = []
             previous = '[bg]'
             valid = [event for event in schedule if event['end'] > event['start']]
@@ -1970,14 +2008,19 @@ def generate_page_video(
                 if motion:
                     try:
                         x, y = ffmpeg_position_expr(motion, event['start'], event['end'],
-                                                    width, height, pointer_width)
+                                                    width, height, pointer_width, (ax, ay))
                     except (ValueError, TypeError, KeyError) as exc:
                         print(f'[POINTER] fallback to fixed: {exc}')
                         motion = None
                 if not motion:
                     # Preserve legacy location behavior while correcting hidden intervals.
-                    x = f"({event['x']}+2*sin(4*PI*t))"
-                    y = f"({event['y']}+2*cos(4*PI*t))"
+                    if anchor is None:
+                        # Legacy placement retained for existing projects.
+                        x = f"({event['x']}+2*sin(4*PI*t))"
+                        y = f"({event['y']}+2*cos(4*PI*t))"
+                    else:
+                        x = f"({event['x']}-{ax:g}+2*sin(4*PI*t))"
+                        y = f"({event['y']}-{ay:g}+2*cos(4*PI*t))"
                 dest = f'[p{i}]'
                 gate = f"gte(t,{event['start']:.12g})*lt(t,{event['end']:.12g})"
                 parts.append(f"{previous}[ptr{i}]overlay=x='{x}':y='{y}':eval=frame:enable='{gate}':eof_action=pass{dest}")
@@ -2459,8 +2502,23 @@ def main() -> int:
         print("次: python slide_lecture.py lecture.pdf --from video")
         return 0
 
-    laser_img = root / "laser_dot.png"
-    create_laser_dot_image(laser_img, radius=14)
+    # WebUIで保存したプロジェクト固有のポインタはグローバル設定より優先する．
+    if proj_cfg.get('pointer_image'):
+        local_name = proj_cfg.get('pointer_image')
+        if local_name == 'custom_pointer.png':
+            local_path = (root / local_name).resolve()
+            if local_path.parent != root.resolve():
+                raise ValueError('不正なポインタ画像パスです．')
+            cfg['video']['pointer_image'] = str(local_path)
+            cfg['video']['pointer_anchor'] = proj_cfg.get('pointer_anchor')
+        else:
+            raise ValueError('project.json の pointer_image が不正です．')
+    elif proj_cfg.get('pointer_image', None) == '':
+        # 「標準に戻す」を明示指定したプロジェクト．
+        cfg['video'].pop('pointer_image', None)
+        cfg['video'].pop('pointer_anchor', None)
+    laser_img, pointer_anchor = resolve_pointer_image(root, cfg["video"])
+    cfg["video"]["_pointer_anchor"] = pointer_anchor
 
     video_count = _run_video_stage(
         args.pdf,
