@@ -11,7 +11,7 @@
 
 - **PDFから動画を全自動生成**：講義／研究発表の発表スタイルと，日本語／英語のナレーション言語を選択できます．
 - **日本語・英語字幕**：主言語の字幕と翻訳字幕を生成し，対応するプレーヤで字幕表示を切り替えられる形で動画に収録します．
-- **視線誘導**：ナレーションの内容に合わせてレーザーポインタ風マーカーを配置します．PDF由来のテキスト・図形位置と，必要に応じたVLMによるスライド内要素の位置検出（Bbox）を利用します．検出や対応付けの精度は保証されません．
+- **視線誘導**：ナレーションの内容に合わせてレーザーポインタ風マーカーを配置します．カスタムPNG画像によるポインタ表示にも対応します．PDF由来のテキスト・図形位置と，必要に応じたVLMによるスライド内要素の位置検出（Bbox）を利用します．検出や対応付けの精度は保証されません．
 - **編集機能**：生成されたナレーション原稿，プロジェクト全体／スライド別の追加指示，TTS用ヨミ辞書などを編集できます．
 - **TTSヨミ変換**：日本語音声合成の前に，技術用語，コマンド，識別子などをLLMとヨミ辞書で読みやすく変換します．
 - **Easy / Advancedモード**：Easyは全自動生成を中心に，Advancedは工程別の操作や編集・詳細確認に利用します．生成中は進捗状況を確認できます．
@@ -19,9 +19,25 @@
 - **ローカル運用**：OpenAI互換APIを持つLLM・TTSサーバをローカルで動かせば，処理をローカル環境に閉じることができます．
 - **複数ユーザ・プロジェクト管理**：WebUIではユーザごとにプロジェクトを管理できます．生成ジョブはログアウト後もバックグラウンドで継続可能です．重い生成処理は同時実行を制限し，実行中の他ユーザの要求は待ち行列に入れず拒否します．管理者はユーザの利用可能期間を設定できます．
 
-![WebUI screenshot](screenshot.png)
-![WebUI screenshot](screenshot2.png)
-（画像をポインタに使うことも出来る）
+## スクリーンショット
+
+### WebUI（画面例 1）
+
+<table>
+<tr><td>
+<img src="screenshot.png" alt="NarrationAutomata WebUI スクリーンショット 1" />
+</td></tr>
+</table>
+
+---
+
+### WebUI（画面例 2）
+
+<table>
+<tr><td>
+<img src="screenshot2.png" alt="NarrationAutomata WebUI スクリーンショット 2" />
+</td></tr>
+</table>
 
 > 画面は開発中のものです．最新版と異なる場合があります．
 
@@ -177,3 +193,14 @@ python3 slide_lecture.py --help
 ## ライセンス（License）
 
 本プロジェクトは **GNU General Public License v3.0（GPLv3）** の下で公開します．詳細は [LICENSE](LICENSE) を確認してください．
+
+
+## 画像素材（Image Assets）
+
+本リポジトリに含まれる [`pointing_girl.png`](pointing_girl.png) は，OpenAIのChatGPTによる画像生成機能を使用して制作したAI生成画像です．NarrationAutomataのカスタムポインタ画像として利用するために収録しています．
+
+この画像について，リポジトリ管理者は利用・改変・再配布を認める意図で公開しています．ただし，AI生成画像には著作権が成立しない場合があり，独占的権利や第三者の権利を侵害しないことを保証するものではありません．ソフトウェア本体のGPLv3とは区別して，画像素材であることを明示しています．
+
+The [`pointing_girl.png`](pointing_girl.png) character artwork was generated using OpenAI's ChatGPT image generation functionality. It is included as an optional custom pointer image for NarrationAutomata.
+
+The repository maintainer intends to permit use, modification, and redistribution of this image. However, copyright protection, exclusive ownership, and non-infringement of third-party rights are not guaranteed for AI-generated artwork. This image is identified separately from the GPLv3-licensed software.
