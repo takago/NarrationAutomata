@@ -39,6 +39,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from nicegui import app, run, ui, background_tasks
 from PIL import Image, ImageDraw, ImageFont
 
+from pointer_settings import effective_mode
 from statistics_store import run_with_statistics, export_xlsx, read_records
 
 from slide_lecture import (
@@ -740,6 +741,7 @@ class SlideNarratorApp:
         self.mode_select = None
         self.lang_select = None
         self.default_vlm_switch = None
+        self.pointer_default_select = None
         self.view_mode = 'easy'
         self.advanced_sidebar_sections: list[Any] = []
         self.advanced_stage_buttons: list[Any] = []
@@ -2609,6 +2611,15 @@ class SlideNarratorApp:
             self.lang_select.value = self.lang_code
         if self.default_vlm_switch:
             self.default_vlm_switch.value = self.default_use_vlm
+        if self.pointer_default_select:
+            default_mode = self.proj_cfg.get('pointer_default_mode', 'static') if self.pdf else 'static'
+            if default_mode not in ('static', 'active', 'hidden'):
+                default_mode = 'static'
+            self.pointer_default_select.value = default_mode
+            if self.pdf and not self.read_only:
+                self.pointer_default_select.enable()
+            else:
+                self.pointer_default_select.disable()
         if self.pages_input:
             self.pages_input.value = self.pages_spec if self.pdf else ''
         if self.active_count_label:
@@ -3307,6 +3318,8 @@ class SlideNarratorApp:
                 client, self.cfg['llm'], self.pdf, page,
                 self.paths.page_image(page), text.strip(), dpi, self.lang_code,
                 visual_mode=mode_str,
+                active_pointer=(effective_mode(load_project_json(self.paths.root), page) == 'active' or
+                                any(a.get('pointer_mode') == 'active' for a in self.alignment_data(page)[2])),
             )
 
             if not self.cancellation_requested:
@@ -3712,6 +3725,43 @@ class SlideNarratorApp:
                     ).props('dense color=primary')
                     page_vlm_switch.tooltip('ONにすると図やグラフ・数式の内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
 
+            # プレゼンテーション標準はサイドバーから指定する．
+            # この画面ではスライド単位の上書きだけを編集する．
+            pointer_default = self.proj_cfg.get('pointer_default_mode', 'static')
+            if pointer_default not in ('static', 'active', 'hidden'):
+                pointer_default = 'static'
+            slide_modes = self.proj_cfg.get('pointer_slide_modes', {})
+            if not isinstance(slide_modes, dict):
+                slide_modes = {}
+            current_slide_mode = slide_modes.get(str(page), 'inherit')
+            if current_slide_mode not in ('inherit', 'static', 'active', 'hidden'):
+                current_slide_mode = 'inherit'
+            with ui.row().classes('w-full items-center gap-3 p-2 border border-zinc-700 rounded-lg'):
+                ui.label('ポインタ').classes('text-sm font-bold')
+                slide_pointer_select = ui.select(
+                    {'inherit':'プレゼンテーション設定を継承', 'static':'静止', 'active':'アクティブ', 'hidden':'非表示'},
+                    value=current_slide_mode, label='このスライド',
+                ).props('dense outlined').classes('w-64')
+                def save_slide_pointer_mode() -> None:
+                    if not self.write_access_allowed() or not self.paths:
+                        return
+                    data = load_project_json(self.paths.root)
+                    overrides = data.get('pointer_slide_modes', {})
+                    if not isinstance(overrides, dict):
+                        overrides = {}
+                    if slide_pointer_select.value == 'inherit':
+                        overrides.pop(str(page), None)
+                    else:
+                        overrides[str(page)] = slide_pointer_select.value
+                    data['pointer_slide_modes'] = overrides
+                    save_project_json(self.paths.root, data)
+                    self.proj_cfg = data
+                    for video_file in self.paths.root.glob('video/*.mp4'):
+                        video_file.unlink(missing_ok=True)
+                    self.paths.final_video.unlink(missing_ok=True)
+                    ui.notify('スライド設定を保存しました．反映には動画再生成が必要です．', type='positive')
+                self.register_main_action_button(ui.button('保存', on_click=save_slide_pointer_mode).props('outline dense'))
+
             with ui.row().classes('w-full items-start gap-6 flex-nowrap'):
                 with ui.column().classes('flex-[2] min-w-0 gap-3'):
                     if img.exists():
@@ -3848,6 +3898,8 @@ class SlideNarratorApp:
                         rows.append({
                             'sentence': item.get('sentence', ''),
                             'block_id': item.get('block_id'),
+                            'pointer_mode': item.get('pointer_mode', 'inherit'),
+                            'motion': item.get('motion', {'type':'fixed'}),
                             'translation': item.get('en_sentence', '') if self.lang_code == 'ja' else item.get('ja_sentence', ''),
                         })
 
@@ -3862,6 +3914,34 @@ class SlideNarratorApp:
                                 trans = ui.input('対訳字幕', value=row['translation']).props('dense outlined').classes('grow')
                                 row['_select'] = select
                                 row['_trans'] = trans
+                                pointer_select = ui.select(
+                                    {'inherit':'上位を継承', 'static':'静止', 'active':'アクティブ', 'hidden':'非表示'},
+                                    value=row['pointer_mode'] if row['pointer_mode'] in ('inherit','static','active','hidden') else 'inherit',
+                                    label='この文のポインタ',
+                                ).props('dense outlined').classes('w-44 shrink-0')
+                                motion_data = row['motion'] if isinstance(row['motion'], dict) else {'type':'fixed'}
+                                motion_type = motion_data.get('type', 'fixed')
+                                if motion_type not in ('fixed','line','ellipse','rounded_polygon','hidden'):
+                                    motion_type = 'fixed'
+                                motion_select = ui.select(
+                                    {'fixed':'固定', 'line':'直線', 'ellipse':'楕円',
+                                     'rounded_polygon':'角丸多角形', 'hidden':'非表示'},
+                                    value=motion_type, label='動作パターン',
+                                ).props('dense outlined').classes('w-40 shrink-0')
+                                def update_motion_enabled(pointer=pointer_select, motion=motion_select) -> None:
+                                    selected = pointer.value
+                                    inherited = slide_pointer_select.value
+                                    resolved = (selected if selected != 'inherit' else
+                                                inherited if inherited != 'inherit' else pointer_default)
+                                    if resolved == 'active':
+                                        motion.enable()
+                                    else:
+                                        motion.disable()
+                                pointer_select.on_value_change(lambda e, update=update_motion_enabled: update())
+                                slide_pointer_select.on_value_change(lambda e, update=update_motion_enabled: update())
+                                update_motion_enabled()
+                                row['_pointer_mode'] = pointer_select
+                                row['_motion'] = motion_select
 
                     # ポインタ先を変更した場合は保存前でも採用IDプレビューを更新する．
                     if img.exists() and blocks:
@@ -3886,6 +3966,10 @@ class SlideNarratorApp:
                                 out.append({'sentence': r['sentence'], 'block_id': bid, 'ja_sentence': r['sentence'], 'en_sentence': tr})
                             else:
                                 out.append({'sentence': r['sentence'], 'block_id': bid, 'en_sentence': r['sentence'], 'ja_sentence': tr})
+                            out[-1]['pointer_mode'] = r['_pointer_mode'].value
+                            motion = dict(r.get('motion') or {})
+                            motion['type'] = r['_motion'].value
+                            out[-1]['motion'] = motion
                         await self.save_alignment(page, out, align_data)
 
                     self.register_main_action_button(ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2'))
@@ -5101,6 +5185,15 @@ class SlideNarratorApp:
                 self.default_vlm_switch = ui.switch('VLMを活用してポインタ配置を決定する', value=self.default_use_vlm).props('dense color=primary')
                 self.default_vlm_switch.tooltip('ONにすると図形・数式・グラフの内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
                 self.default_vlm_switch.on_value_change(lambda e: self._default_vlm_changed(e.value))
+                pointer_default_mode = self.proj_cfg.get('pointer_default_mode', 'static')
+                if pointer_default_mode not in ('static', 'active', 'hidden'):
+                    pointer_default_mode = 'static'
+                self.pointer_default_select = ui.select(
+                    {'static':'静止', 'active':'アクティブ', 'hidden':'非表示'},
+                    value=pointer_default_mode, label='ポインタモード（プレゼンテーション全体）',
+                ).props('dense outlined').classes('w-full')
+                self.pointer_default_select.on_value_change(lambda e: self._pointer_default_changed(e.value))
+                ui.label('スライド・文ごとの個別設定が優先されます．').classes('text-xs text-zinc-400')
 
             self.pages_input = (
                 ui.input('ビデオ化対象', placeholder='例: 1-10,12', value=self.pages_spec)
@@ -5184,6 +5277,7 @@ class SlideNarratorApp:
                 self.mode_select.disable()
                 self.lang_select.disable()
                 self.default_vlm_switch.disable()
+                self.pointer_default_select.disable()
                 self.pages_input.disable()
 
             ui.separator()
@@ -5353,6 +5447,23 @@ class SlideNarratorApp:
             return
         self.default_use_vlm = bool(value)
         self.save_project_settings()
+
+    def _pointer_default_changed(self, value: str) -> None:
+        if value not in ('static', 'active', 'hidden') or not self.paths:
+            return
+        if self.proj_cfg.get('pointer_default_mode', 'static') == value:
+            return
+        if not self.write_access_allowed():
+            return
+        # 他のプロジェクト設定を上書きしないよう最新値を読み直す．
+        data = load_project_json(self.paths.root)
+        data['pointer_default_mode'] = value
+        save_project_json(self.paths.root, data)
+        self.proj_cfg = data
+        for video_file in self.paths.root.glob('video/*.mp4'):
+            video_file.unlink(missing_ok=True)
+        self.paths.final_video.unlink(missing_ok=True)
+        ui.notify('ポインタモードを保存しました．動画再生成で反映されます．', type='positive')
 
     def _range_changed(self) -> None:
         if not self.write_access_allowed():

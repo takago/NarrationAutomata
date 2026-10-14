@@ -34,6 +34,9 @@ import pymupdf as fitz
 import yaml
 from openai import OpenAI
 from PIL import Image, ImageDraw
+from pointer_motion import ffmpeg_position_expr, Motion
+from pointer_settings import effective_mode, normalize_motion, create_motion
+
 
 from statistics_store import record as record_statistics, set_current_page
 
@@ -1111,6 +1114,7 @@ def align_narration_with_blocks(
     blocks: list[dict],
     sentences: list[str],
     lang: str = "ja",
+    active: bool = False,
 ) -> list[dict]:
     if not blocks or not sentences:
         return [{"sentence": s, "block_id": None} for s in sentences]
@@ -1150,6 +1154,22 @@ def align_narration_with_blocks(
     ]
 
     sys_prompt = ALIGN_SYSTEM_JA if lang == "ja" else ALIGN_SYSTEM_EN
+    if active:
+        sys_prompt += ("""
+追加指示：各文に motion を指定してください．既存のblock_id選定規則は厳守してください．
+候補は fixed，line，ellipse，rounded_polygon，hidden のみです．
+特定の点やコード行はfixed，文章やコードの流れはline，図全体の囲みはellipse，
+三角形や四角形の輪郭を強調するときはrounded_polygonとしてください．
+通常はfixedを優先し，動かす必要がない文で安易に動かさないでください．
+方向が明らかなlineにはdirectionをleft_to_right/right_to_left/top_to_bottom/bottom_to_topから付与できます．
+座標・速度・時間を生成せず，block_idとmotion.typeのみを決めてください．
+JSON例：[{'sentence_index':0,'block_id':2,'motion':{'type':'ellipse'}}]
+""" if lang == "ja" else """
+Also choose a motion for each sentence: fixed, line, ellipse, rounded_polygon, or hidden.
+Use fixed by default; choose movement only if semantically useful. For line, optional direction:
+left_to_right, right_to_left, top_to_bottom, bottom_to_top. Never generate coordinates.
+Return each object's existing sentence_index and block_id plus motion:{type:...}.
+""")
 
     try:
         response = stream_chat(client, task=f"ポインタ位置選定（全{len(sentences)}文）", 
@@ -1173,13 +1193,17 @@ def align_narration_with_blocks(
                     s_idx = item.get("sentence_index")
                     b_id = item.get("block_id")
                     if s_idx is not None:
-                        mapping[s_idx] = b_id if isinstance(b_id, int) and 0 <= b_id < len(blocks) else None
+                        mapping[s_idx] = {
+                            "block_id": b_id if type(b_id) is int and b_id in {b["block_id"] for b in blocks} else None,
+                            "motion": normalize_motion(item.get("motion")),
+                        }
 
         result = []
         last_block_id = None
 
         for i, s in enumerate(sentences):
-            bid = mapping.get(i, None)
+            mapped = mapping.get(i, {})
+            bid = mapped.get("block_id")
             if bid is not None:
                 last_block_id = bid
             elif last_block_id is not None and len(s) > 10:
@@ -1188,6 +1212,7 @@ def align_narration_with_blocks(
             result.append({
                 "sentence": s,
                 "block_id": bid,
+                "motion": mapped.get("motion", {"type": "fixed"}),
             })
         return result
     except Exception:
@@ -1198,6 +1223,9 @@ def build_pointer_schedule(
     blocks: list[dict],
     alignments: list[dict],
     duration: float,
+    project_settings: dict | None = None,
+    page: int = 0,
+    image_size: tuple[int, int] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     if not alignments or duration <= 0:
         return [], []
@@ -1211,7 +1239,7 @@ def build_pointer_schedule(
     schedule = []
     subtitle_timing = []
 
-    for item in alignments:
+    for sentence_index, item in enumerate(alignments):
         s_weight = max(1, len(item.get("tts_sentence", item["sentence"])))
         b_id = item.get("block_id")
         span = (s_weight / total_weight) * duration
@@ -1231,14 +1259,21 @@ def build_pointer_schedule(
 
         subtitle_timing.append(timing_entry)
 
+        mode = effective_mode(project_settings or {}, page, item)
+        if mode == 'hidden':
+            continue
         if b_id is not None and b_id in block_map:
             target = block_map[b_id]
-            schedule.append({
-                "start": round(t_start, 2),
-                "end": round(t_end, 2),
-                "x": target["x"],
-                "y": target["y"],
-            })
+            event = {"start": t_start, "end": t_end, "x": target["x"], "y": target["y"]}
+            if mode == 'active' and image_size:
+                try:
+                    event["motion"] = create_motion(item.get('motion'), target, image_size)
+                    Motion.from_dict(event["motion"])
+                    if event["motion"]["type"] == "hidden":
+                        continue
+                except (ValueError, TypeError, KeyError) as exc:
+                    print(f"[POINTER] slide={page} sentence={sentence_index+1}: fixed fallback ({exc})")
+            schedule.append(event)
 
     return schedule, subtitle_timing
 
@@ -1281,6 +1316,23 @@ def build_course_overview(
         **reasoning_extra_kwargs(cfg.get("reasoning_effort", "none")),
     )
     return response.choices[0].message.content.strip()
+
+
+def classify_brief_slide(text: str, active_idx: int) -> str | None:
+    """明確な表紙・目次だけ短い説明の対象にする．曖昧なら通常スライド扱い．"""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    heading = re.sub(r'^[\s#\d.．、:：-]+', '', lines[0]).strip().lower()
+    toc_names = {'目次', '本日の内容', '講義内容', '本日の流れ', '発表の流れ',
+                 '発表内容', 'アジェンダ', 'agenda', 'contents', 'table of contents', 'outline'}
+    if heading in toc_names or (len(lines) <= 3 and any(heading.startswith(t + ' ') for t in toc_names)):
+        return 'agenda'
+    # 先頭ページで，文章・箇条書きが少なく，表紙らしい場合のみ．
+    if active_idx == 0 and len(lines) <= 5 and len(text.strip()) <= 150 and \
+            not any(len(line) > 85 for line in lines):
+        return 'title'
+    return None
 
 
 def make_explanation(
@@ -1344,6 +1396,21 @@ Currently presenting slide {active_idx + 1} of {total_active}.
 {instruction_line}
 Return ONLY the raw narration text.
 """
+
+    # 表紙・目次には短い導入だけを指示する．内容スライドには適用しない．
+    brief_slide = classify_brief_slide(current_text, active_idx)
+    if brief_slide:
+        if lang == 'ja':
+            if brief_slide == 'title':
+                prompt += ("\nこのスライドはタイトルページです．発表・講義の主題を簡潔に紹介してください．"
+                           "詳細説明や後続スライドの内容の先取りは避けてください．\n")
+            else:
+                prompt += ("\nこのスライドは目次・構成案内です．主な話題の流れだけ簡潔に案内し，"
+                           "各項目の詳しい説明は該当スライドに譲ってください．\n")
+        elif brief_slide == 'title':
+            prompt += ("\nThis is a title slide. Briefly introduce the topic. Do not preview all later details.\n")
+        else:
+            prompt += ("\nThis is an agenda slide. Briefly introduce the flow. Leave details for subsequent slides.\n")
 
     # 全体指示は全スライドに適用する．既存のシステムプロンプトは変更しない．
     if project_prompt and project_prompt.strip():
@@ -1452,6 +1519,7 @@ def generate_single_alignment(
     dpi: int,
     lang: str,
     visual_mode: str = "vlm",
+    active_pointer: bool = False,
 ) -> dict:
     blocks = extract_page_blocks(pdf, page_num - 1, dpi)
 
@@ -1466,7 +1534,7 @@ def generate_single_alignment(
             blocks.append(elem)
 
     sentences = split_sentences(text, lang=lang)
-    alignments = align_narration_with_blocks(client, cfg, image_path, blocks, sentences, lang=lang)
+    alignments = align_narration_with_blocks(client, cfg, image_path, blocks, sentences, lang=lang, active=active_pointer)
 
     target_lang = "en" if lang == "ja" else "ja"
     translations = translate_sentences(client, cfg, sentences, target_lang=target_lang)
@@ -1638,7 +1706,10 @@ def generate_alignments(
         emit_progress("align", k, len(active_indices), page=i, message=f"スライド {i}（{k}/{len(active_indices)}, {mode_label}）")
         print(f"[ALIGN] 字幕＆ポインタ解析: page {i}/{len(images)} (visual_mode={vmode})")
         raw_text = text_file.read_text(encoding="utf-8").strip()
-        align_data = generate_single_alignment(client, cfg, pdf, i, image, raw_text, dpi, lang, visual_mode=vmode)
+        pointer_cfg = load_project_json(out_dir.parent)
+        active_pointer = (effective_mode(pointer_cfg, i) == "active")
+        align_data = generate_single_alignment(client, cfg, pdf, i, image, raw_text, dpi, lang,
+                                              visual_mode=vmode, active_pointer=active_pointer)
         atomic_write_text(align_out, json.dumps(align_data, ensure_ascii=False, indent=2))
 
 
@@ -1880,21 +1951,39 @@ def generate_page_video(
             ]
             run(cmd)
         else:
-            expr_x_parts = [
-                f"between(t,{s['start']},{s['end']})*({s['x']}+2*sin(4*PI*t))"
-                for s in schedule
-            ]
-            expr_y_parts = [
-                f"between(t,{s['start']},{s['end']})*({s['y']}+2*cos(4*PI*t))"
-                for s in schedule
-            ]
-            expr_x = "+".join(expr_x_parts) if expr_x_parts else "-100"
-            expr_y = "+".join(expr_y_parts) if expr_y_parts else "-100"
-
-            filter_complex = (
-                f"[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2[bg];\n"
-                f"[bg][1:v]overlay=x='{expr_x}':y='{expr_y}':eval=frame[v]\n"
-            )
+            # Each sentence has its own half-open time gate. No pointer is shown in gaps.
+            with Image.open(image) as bg_image, Image.open(laser_img) as pointer_image:
+                width, height = bg_image.size
+                pointer_width, pointer_height = pointer_image.size
+            width -= width % 2
+            height -= height % 2
+            overlays = []
+            previous = '[bg]'
+            valid = [event for event in schedule if event['end'] > event['start']]
+            parts = [f'[0:v]scale={width}:{height}[bg]']
+            if len(valid) > 1:
+                parts.append(f'[1:v]format=rgba,split={len(valid)}' + ''.join(f'[ptr{i}]' for i in range(len(valid))))
+            else:
+                parts.append('[1:v]format=rgba[ptr0]')
+            for i, event in enumerate(valid):
+                motion = event.get('motion')
+                if motion:
+                    try:
+                        x, y = ffmpeg_position_expr(motion, event['start'], event['end'],
+                                                    width, height, pointer_width)
+                    except (ValueError, TypeError, KeyError) as exc:
+                        print(f'[POINTER] fallback to fixed: {exc}')
+                        motion = None
+                if not motion:
+                    # Preserve legacy location behavior while correcting hidden intervals.
+                    x = f"({event['x']}+2*sin(4*PI*t))"
+                    y = f"({event['y']}+2*cos(4*PI*t))"
+                dest = f'[p{i}]'
+                gate = f"gte(t,{event['start']:.12g})*lt(t,{event['end']:.12g})"
+                parts.append(f"{previous}[ptr{i}]overlay=x='{x}':y='{y}':eval=frame:enable='{gate}':eof_action=pass{dest}")
+                previous = dest
+            parts.append(f'{previous}format=yuv420p[v]')
+            filter_complex = ';\n'.join(parts) + '\n'
 
             filter_script.write_text(filter_complex, encoding="utf-8")
 
@@ -2157,8 +2246,11 @@ def _run_video_stage(
             for item in alignments:
                 item["tts_sentence"] = item["sentence"]
 
+            with Image.open(image) as im:
+                image_size = im.size
             schedule, page_subtitles = build_pointer_schedule(
-                blocks, alignments, duration
+                blocks, alignments, duration,
+                project_settings=load_project_json(video.parent), page=page_num, image_size=image_size,
             )
         else:
             text = text_file.read_text(encoding="utf-8").strip() if text_file.exists() else ""
