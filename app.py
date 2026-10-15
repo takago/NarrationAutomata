@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 from datetime import datetime, timedelta
 import hashlib
 import httpx
@@ -746,6 +748,14 @@ class SlideNarratorApp:
         self.pointer_anchor_x = None
         self.pointer_anchor_y = None
         self.pointer_image_upload = None
+        self.pointer_preview = None
+        self.pointer_scale_slider = None
+        self.pointer_page_select = None
+        self.pointer_preview_x = 70
+        self.pointer_preview_y = 50
+        self._pointer_dragging = False
+        self._pointer_drag_offset = (0.0, 0.0)
+        self._pointer_drag_last_render = 0.0
         self.view_mode = 'easy'
         self.advanced_sidebar_sections: list[Any] = []
         self.advanced_stage_buttons: list[Any] = []
@@ -2614,7 +2624,8 @@ class SlideNarratorApp:
             temporary.replace(target)
             data = load_project_json(self.paths.root)
             data['pointer_image'] = target.name
-            data['pointer_anchor'] = [w // 2, h // 2]
+            data['pointer_anchor'] = [round(w * .82), round(h * .31)]
+            data.setdefault('pointer_scale_percent', 15)
             save_project_json(self.paths.root, data)
             self.proj_cfg = data
             self._invalidate_pointer_videos()
@@ -2626,6 +2637,102 @@ class SlideNarratorApp:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _pointer_source(self, data: dict) -> Path:
+        custom = self.paths.root / 'custom_pointer.png'
+        return custom if custom.is_file() else Path(__file__).resolve().parent / 'pointing_lecturer.png'
+
+    def _pointer_preview_image(self) -> str:
+        """Render the actual PDF page and the scaled pointer using the video size rule."""
+        page = int(self.pointer_page_select.value)
+        slide_path = self.paths.page_image(page)
+        source = self._pointer_source(self.proj_cfg)
+        with Image.open(slide_path) as bg, Image.open(source) as pointer:
+            bg = bg.convert('RGBA')
+            pointer = pointer.convert('RGBA')
+            target_w = max(1, round(bg.width * float(self.pointer_scale_slider.value) / 100))
+            target_h = max(1, round(pointer.height * target_w / pointer.width))
+            pointer = pointer.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            source_w, source_h = Image.open(source).size
+            ax = float(self.pointer_anchor_x.value) * target_w / source_w
+            ay = float(self.pointer_anchor_y.value) * target_h / source_h
+            if page == 1 and self.proj_cfg.get('title_pointer_fixed', True):
+                # Position the entire PNG rectangle, including transparent pixels.
+                left, top = 0, bg.height - target_h
+            else:
+                tx = bg.width * self.pointer_preview_x / 100
+                ty = bg.height * self.pointer_preview_y / 100
+                left, top = round(tx - ax), round(ty - ay)
+            bg.alpha_composite(pointer, (left, top)) if (0 <= left and 0 <= top and left+target_w <= bg.width and top+target_h <= bg.height) else self._pointer_alpha_paste(bg, pointer, left, top)
+            # Downsize the UI preview only; keep the video render independent.
+            bg.thumbnail((720, 540), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            bg.save(out, 'PNG')
+            return 'data:image/png;base64,' + base64.b64encode(out.getvalue()).decode('ascii')
+
+    @staticmethod
+    def _pointer_alpha_paste(bg, pointer, x, y):
+        layer = Image.new('RGBA', bg.size)
+        layer.paste(pointer, (x, y))
+        bg.alpha_composite(layer)
+
+    def _pointer_preview_mouse(self, e) -> None:
+        """Move the preview pointer by dragging it; never change video target positions."""
+        if not self.paths or not self.pointer_page_select:
+            return
+        try:
+            with Image.open(self.paths.page_image(int(self.pointer_page_select.value))) as slide:
+                slide_w, slide_h = slide.size
+            with Image.open(self._pointer_source(self.proj_cfg)) as source:
+                src_w, src_h = source.size
+            # interactive_image coordinates refer to its natural thumbnail size.
+            factor = min(1.0, 720 / slide_w, 540 / slide_h)
+            x = float(e.image_x) / (slide_w * factor) * 100
+            y = float(e.image_y) / (slide_h * factor) * 100
+            fraction = float(self.pointer_scale_slider.value) / 100
+            px_w = slide_w * fraction
+            px_h = px_w * src_h / src_w
+            ax = float(self.pointer_anchor_x.value) / src_w * px_w
+            ay = float(self.pointer_anchor_y.value) / src_h * px_h
+            hot_x = slide_w * self.pointer_preview_x / 100
+            hot_y = slide_h * self.pointer_preview_y / 100
+            image_x = x * slide_w / 100
+            image_y = y * slide_h / 100
+            if int(self.pointer_page_select.value) == 1 and self.proj_cfg.get('title_pointer_fixed', True):
+                return  # タイトルページは動画と同様に左下固定．他ページでドラッグ可能．
+            if e.type == 'mousedown':
+                # Start a drag only within the pointer bounding rectangle.
+                if hot_x-ax <= image_x <= hot_x-ax+px_w and hot_y-ay <= image_y <= hot_y-ay+px_h:
+                    self._pointer_dragging = True
+                    self._pointer_drag_offset = (self.pointer_preview_x-x, self.pointer_preview_y-y)
+                return
+            if e.type == 'mouseup':
+                was_dragging = self._pointer_dragging
+                self._pointer_dragging = False
+                if not was_dragging:
+                    return
+            elif e.type != 'mousemove' or not self._pointer_dragging:
+                return
+            next_x = max(0.0, min(100.0, x + self._pointer_drag_offset[0]))
+            next_y = max(0.0, min(100.0, y + self._pointer_drag_offset[1]))
+            if abs(next_x - self.pointer_preview_x) < .05 and abs(next_y - self.pointer_preview_y) < .05:
+                return
+            self.pointer_preview_x, self.pointer_preview_y = next_x, next_y
+            # PNG compositing on every raw mouse event is costly; cap updates to ~10 fps.
+            now = time.monotonic()
+            if e.type == 'mouseup' or now-self._pointer_drag_last_render >= .10:
+                self._pointer_drag_last_render = now
+                self._refresh_pointer_preview()
+        except (OSError, ValueError, AttributeError, ZeroDivisionError) as exc:
+            LOGGER.warning('ポインタのドラッグ処理に失敗: %s', exc)
+            self._pointer_dragging = False
+
+    def _refresh_pointer_preview(self) -> None:
+        if self._widget_available(self.pointer_preview):
+            try:
+                self.pointer_preview.set_source(self._pointer_preview_image())
+            except (OSError, ValueError, TypeError) as exc:
+                LOGGER.warning('ポインタプレビューを更新できません: %s', exc)
+
     def refresh_pointer_image_panel(self) -> None:
         if not self._widget_available(self.pointer_image_panel):
             return
@@ -2636,39 +2743,92 @@ class SlideNarratorApp:
                 ui.label('プロジェクトを選択すると設定できます．').classes('text-xs text-zinc-400')
                 return
             data = self.proj_cfg
-            image_name = data.get('pointer_image')
-            image_path = self.paths.root / 'custom_pointer.png'
-            use_custom = image_name == image_path.name and image_path.is_file()
-            ui.label('現在: カスタムPNG' if use_custom else '現在: 標準レーザードット').classes('text-xs text-zinc-300')
-            if not use_custom:
-                ui.label('PNG画像をアップロードするとカスタムポインタに切り替わります．').classes('text-xs text-zinc-400')
+            custom_mode = bool(data.get('pointer_image'))
+            def switch_mode(e):
+                if not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
+                    self.refresh_pointer_image_panel()
+                    return
+                updated = load_project_json(self.paths.root)
+                if e.value == 'custom':
+                    updated['pointer_image'] = self._pointer_source(updated).name
+                    source = self._pointer_source(updated)
+                    with Image.open(source) as img:
+                        updated.setdefault('pointer_anchor', [round(img.width * .82), round(img.height * .31)])
+                    updated.setdefault('pointer_scale_percent', 15)
+                else:
+                    updated['pointer_image'] = ''
+                save_project_json(self.paths.root, updated)
+                self.proj_cfg = updated
+                self._invalidate_pointer_videos()
+                self.refresh_pointer_image_panel()
+            mode = ui.select({'standard': '標準レーザードット', 'custom': 'カスタム画像'}, value='custom' if custom_mode else 'standard', label='ポインタの種類', on_change=switch_mode).props('outlined dense').classes('w-full')
+            if self.read_only:
+                mode.disable()
+            if not custom_mode:
+                ui.label('カスタム画像を選択すると，付属の先生画像が初期表示されます．').classes('text-xs text-zinc-400')
+                return
+            image_path = self._pointer_source(data)
+            if not image_path.is_file():
+                ui.label('標準のポインタ画像が見つかりません．').classes('text-xs text-red-400')
+                return
+            with Image.open(image_path) as im:
+                width, height = im.size
+            anchor = data.get('pointer_anchor')
+            if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
+                anchor = [round(width * .82), round(height * .31)]
+            anchor = [max(0, min(width-1, int(anchor[0]))), max(0, min(height-1, int(anchor[1])))]
+            ui.label('画像をクリックしてチョークの先端などの指示点を選択できます．').classes('text-xs text-zinc-400')
+            with ui.row().classes('w-full gap-2'):
+                self.pointer_anchor_x = ui.number('指示点 X (px)', value=anchor[0], min=0, max=width-1, step=1).props('outlined dense').classes('w-1/2')
+                self.pointer_anchor_y = ui.number('指示点 Y (px)', value=anchor[1], min=0, max=height-1, step=1).props('outlined dense').classes('w-1/2')
+            def clicked(e):
+                if e.type == 'click':
+                    self.pointer_anchor_x.value = max(0, min(width-1, round(e.image_x)))
+                    self.pointer_anchor_y.value = max(0, min(height-1, round(e.image_y)))
+                    self._refresh_pointer_preview()
+            ui.interactive_image(file_url(image_path), on_mouse=clicked, events=['click']).classes('w-full').style('max-height: 230px; object-fit: contain')
+            ui.label('スライドを背景にしたサイズ・配置プレビュー').classes('text-sm font-semibold')
+            pages = sorted(int(f.stem) for f in self.paths.pages_dir.glob('[0-9]*.png') if f.stem.isdigit())
+            if pages:
+                self.pointer_page_select = ui.select(pages, value=pages[0], label='背景スライド', on_change=lambda _: self._refresh_pointer_preview()).props('outlined dense').classes('w-full')
+                self.pointer_scale_slider = ui.slider(min=5, max=100, step=1, value=float(data.get('pointer_scale_percent', 15))).props('label-always')
+                self.pointer_scale_slider.on_value_change(lambda _: self._refresh_pointer_preview())
+                ui.label('表示幅：スライド横幅に対する割合（％）．縦横比は維持します．').classes('text-xs text-zinc-400')
+                self._pointer_dragging = False
+                self.pointer_preview = ui.interactive_image(on_mouse=self._pointer_preview_mouse, events=['mousedown', 'mousemove', 'mouseup'], cross=False).classes('w-full rounded border border-zinc-700').style('touch-action: none; cursor: grab')
+                self.pointer_preview.set_source(self._pointer_preview_image())
+                ui.label('通常ページではドラッグしてプレビュー位置を変更できます．タイトルページは左下固定です．').classes('text-xs text-zinc-400')
             else:
-                with Image.open(image_path) as im:
-                    width, height = im.size
-                anchor = data.get('pointer_anchor')
-                if not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
-                    anchor = [width // 2, height // 2]
-                ui.label(f'画像サイズ: {width} × {height} px').classes('text-xs text-zinc-400')
-                with ui.row().classes('w-full gap-2'):
-                    self.pointer_anchor_x = ui.number('X (px)', value=anchor[0], min=0, max=width-1, step=1).props('outlined dense').classes('w-1/2')
-                    self.pointer_anchor_y = ui.number('Y (px)', value=anchor[1], min=0, max=height-1, step=1).props('outlined dense').classes('w-1/2')
-                def clicked(e):
-                    if e.type == 'click':
-                        self.pointer_anchor_x.value = max(0, min(width-1, round(e.image_x)))
-                        self.pointer_anchor_y.value = max(0, min(height-1, round(e.image_y)))
-                ui.interactive_image(file_url(image_path), on_mouse=clicked, events=['click']).classes('w-full').style('max-height: 210px; object-fit: contain')
-                ui.label('画像をクリックして指示点を選択し，保存してください．').classes('text-xs text-zinc-400')
-                with ui.row().classes('w-full gap-2'):
-                    ui.button('指示点を保存', icon='save', on_click=self.save_pointer_anchor).props('outline dense').classes('flex-1')
-                    ui.button('標準に戻す', icon='restart_alt', on_click=self.reset_pointer_image).props('outline dense').classes('flex-1')
+                self.pointer_scale_slider = ui.slider(min=5, max=100, step=1, value=float(data.get('pointer_scale_percent', 15))).props('label-always')
+                ui.label('スライド画像生成後にプレビューを表示できます．').classes('text-xs text-zinc-400')
+            def toggle_title_pointer(e):
+                if not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
+                    self.refresh_pointer_image_panel()
+                    return
+                updated = load_project_json(self.paths.root)
+                updated['title_pointer_fixed'] = bool(e.value)
+                save_project_json(self.paths.root, updated)
+                self.proj_cfg = updated
+                self._invalidate_pointer_videos()
+                self._refresh_pointer_preview()
+            title_fixed = ui.switch('タイトルページ（1枚目）は左下に固定表示', value=data.get('title_pointer_fixed', True), on_change=toggle_title_pointer)
+            title_fixed.tooltip('カスタム画像が有効な場合のみ．通常ページでは自動視線誘導します．')
+            if self.read_only:
+                title_fixed.disable()
+            with ui.row().classes('w-full gap-2'):
+                save_btn = ui.button('指示点・サイズを保存', icon='save', on_click=self.save_pointer_anchor).props('outline dense').classes('flex-1')
+                reset_btn = ui.button('標準に戻す', icon='restart_alt', on_click=self.reset_pointer_image).props('outline dense').classes('flex-1')
+            ui.label('PNGをアップロードすると，付属画像に代わって使用します．').classes('text-xs text-zinc-400')
             self.pointer_image_upload = ui.upload(on_upload=self.upload_pointer_image, auto_upload=True, max_files=1).props('accept=.png').classes('w-full')
             if self.read_only:
                 self.pointer_image_upload.disable()
+                save_btn.disable()
+                reset_btn.disable()
 
     def save_pointer_anchor(self) -> None:
         if not self.paths or not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
             return
-        path = self.paths.root / 'custom_pointer.png'
+        path = self._pointer_source(self.proj_cfg)
         if not path.is_file():
             return
         try:
@@ -2677,21 +2837,23 @@ class SlideNarratorApp:
             x, y = int(self.pointer_anchor_x.value), int(self.pointer_anchor_y.value)
             if not (0 <= x < w and 0 <= y < h):
                 raise ValueError('指示点が画像範囲外です．')
+            scale = float(self.pointer_scale_slider.value)
+            if not (5 <= scale <= 100):
+                raise ValueError('サイズの指定範囲は5〜100％です．')
             data = load_project_json(self.paths.root)
-            data.update(pointer_image=path.name, pointer_anchor=[x, y])
+            data.update(pointer_image=path.name, pointer_anchor=[x, y], pointer_scale_percent=scale)
             save_project_json(self.paths.root, data)
             self.proj_cfg = data
             self._invalidate_pointer_videos()
-            safe_notify('指示点を保存しました．動画再生成で反映されます．', type='positive')
+            safe_notify('指示点とサイズを保存しました．動画再生成で反映されます．', type='positive')
         except (ValueError, TypeError) as exc:
-            safe_notify(f'座標を確認してください: {exc}', type='negative')
+            safe_notify(f'設定を確認してください: {exc}', type='negative')
 
     def reset_pointer_image(self) -> None:
         if not self.paths or not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
             return
         data = load_project_json(self.paths.root)
         data['pointer_image'] = ''
-        data.pop('pointer_anchor', None)
         save_project_json(self.paths.root, data)
         self.proj_cfg = data
         self._invalidate_pointer_videos()

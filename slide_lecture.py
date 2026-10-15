@@ -1990,6 +1990,16 @@ def generate_page_video(
             width -= width % 2
             height -= height % 2
             anchor = cfg.get("_pointer_anchor")
+            # Custom PNG size is relative to the video slide, not the source PNG.
+            if anchor is not None and cfg.get('pointer_scale_percent') is not None:
+                percent = float(cfg['pointer_scale_percent'])
+                if not 5 <= percent <= 100:
+                    raise ValueError('pointer_scale_percent は5〜100の範囲にしてください')
+                source_width = pointer_width
+                pointer_width = max(1, round(width * percent / 100))
+                pointer_height = max(1, round(pointer_height * pointer_width / source_width))
+                anchor = (anchor[0] * pointer_width / source_width,
+                          anchor[1] * pointer_width / source_width)
             # Use a real target hot spot for both static and animated movement.
             if anchor is not None:
                 ax, ay = anchor
@@ -2000,11 +2010,19 @@ def generate_page_video(
             valid = [event for event in schedule if event['end'] > event['start']]
             parts = [f'[0:v]scale={width}:{height}[bg]']
             if len(valid) > 1:
-                parts.append(f'[1:v]format=rgba,split={len(valid)}' + ''.join(f'[ptr{i}]' for i in range(len(valid))))
+                parts.append(f'[1:v]scale={pointer_width}:{pointer_height},format=rgba,split={len(valid)}' + ''.join(f'[ptr{i}]' for i in range(len(valid))))
             else:
-                parts.append('[1:v]format=rgba[ptr0]')
+                parts.append(f'[1:v]scale={pointer_width}:{pointer_height},format=rgba[ptr0]')
             for i, event in enumerate(valid):
-                motion = event.get('motion')
+                if event.get('title_fixed'):
+                    # Align the full PNG rectangle (including transparency) to
+                    # the bottom-left. Apply the same 2 px jitter as fixed pointing,
+                    # biased outwards to avoid showing a gap at either edge.
+                    x = '(-2+2*sin(4*PI*t))'
+                    y = f'({height}-{pointer_height}+2+2*cos(4*PI*t))'
+                    motion = None
+                else:
+                    motion = event.get('motion')
                 if motion:
                     try:
                         x, y = ffmpeg_position_expr(motion, event['start'], event['end'],
@@ -2012,7 +2030,7 @@ def generate_page_video(
                     except (ValueError, TypeError, KeyError) as exc:
                         print(f'[POINTER] fallback to fixed: {exc}')
                         motion = None
-                if not motion:
+                if not motion and not event.get('title_fixed'):
                     # Preserve legacy location behavior while correcting hidden intervals.
                     if anchor is None:
                         # Legacy placement retained for existing projects.
@@ -2306,6 +2324,14 @@ def _run_video_stage(
             }]
             schedule = []
 
+        # First PDF page is a stationary character introduction by default.
+        # The title treatment applies only to custom PNG pointers; laser-dot
+        # users retain the existing schedule and title-page behavior.
+        page_settings = load_project_json(root)
+        if (page_num == 1 and page_settings.get('pointer_image')
+                and page_settings.get('title_pointer_fixed', True) and duration > 0):
+            schedule = [{'start': 0.0, 'end': duration, 'title_fixed': True}]
+
         all_page_subtitles.append((accumulated_offset, page_subtitles))
         accumulated_offset += duration
 
@@ -2505,18 +2531,20 @@ def main() -> int:
     # WebUIで保存したプロジェクト固有のポインタはグローバル設定より優先する．
     if proj_cfg.get('pointer_image'):
         local_name = proj_cfg.get('pointer_image')
-        if local_name == 'custom_pointer.png':
-            local_path = (root / local_name).resolve()
-            if local_path.parent != root.resolve():
+        if local_name in ('custom_pointer.png', 'pointing_lecturer.png'):
+            local_path = ((root / local_name) if local_name == 'custom_pointer.png' else (Path(__file__).resolve().parent / local_name)).resolve()
+            if local_name == 'custom_pointer.png' and local_path.parent != root.resolve():
                 raise ValueError('不正なポインタ画像パスです．')
             cfg['video']['pointer_image'] = str(local_path)
             cfg['video']['pointer_anchor'] = proj_cfg.get('pointer_anchor')
+            cfg['video']['pointer_scale_percent'] = float(proj_cfg.get('pointer_scale_percent', 15))
         else:
             raise ValueError('project.json の pointer_image が不正です．')
     elif proj_cfg.get('pointer_image', None) == '':
         # 「標準に戻す」を明示指定したプロジェクト．
         cfg['video'].pop('pointer_image', None)
         cfg['video'].pop('pointer_anchor', None)
+        cfg['video'].pop('pointer_scale_percent', None)
     laser_img, pointer_anchor = resolve_pointer_image(root, cfg["video"])
     cfg["video"]["_pointer_anchor"] = pointer_anchor
 
