@@ -60,6 +60,7 @@ class Motion:
     jitter_seed: int = 42
     moving_factor: float = 0.15
     jitter_transition: float = 0.25
+    jitter_rate: float = 1.0  # 1.0 retains the original laser-dot jitter speed
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> 'Motion':
@@ -117,11 +118,15 @@ class Motion:
             seed = jitter.get('seed', 42)
             moving_factor = _number(jitter.get('moving_factor', 0.15), 'jitter.moving_factor')
             transition = _number(jitter.get('transition', 0.25), 'jitter.transition')
+            rate = _number(jitter.get('rate', 1.0), 'jitter.rate')
         else:
             jitter_px = 3.0 if jitter is True else 0.0
             seed = 42
             moving_factor = 0.15
             transition = 0.25
+            rate = 1.0
+        if not 0 < rate <= 10:
+            raise ValueError('jitter rate must be in (0, 10]')
         if not 0 <= moving_factor <= 1 or not 0 <= transition <= 5:
             raise ValueError('jitter moving_factor and transition out of range')
         if jitter_px < 0 or jitter_px > 32:
@@ -129,7 +134,7 @@ class Motion:
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise ValueError('jitter seed must be an integer')
         return cls(kind, pts, center, radius, phase, bool(data.get('clockwise', True)),
-                   turns, bool(data.get('loop', False)), speed, easing, radius_y, jitter_px, seed, moving_factor, transition)
+                   turns, bool(data.get('loop', False)), speed, easing, radius_y, jitter_px, seed, moving_factor, transition, rate)
 
     @property
     def distances(self) -> tuple[float, ...]:
@@ -218,12 +223,14 @@ def _jitter_scale_expr(m: Motion, local: str, duration: float) -> str:
 def _jitter_terms(m: Motion, t: float, duration: float) -> Point:
     phase = (m.jitter_seed % 997)*0.037
     scale = _jitter_scale(m, t, duration)
+    t *= m.jitter_rate
     return (scale*m.jitter_px*(.62*math.sin(2*math.pi*2.0*t+phase)+.38*math.sin(2*math.pi*.83*t+phase*1.7)),
             scale*m.jitter_px*(.58*math.sin(2*math.pi*1.93*t+phase*2.1)+.42*math.sin(2*math.pi*1.07*t+phase*.7)))
 
 
 def _jitter_expr(m: Motion, local: str, k: int) -> str:
     phase = (m.jitter_seed % 997)*0.037
+    local = f'({_fmt(m.jitter_rate)}*({local}))' if m.jitter_rate != 1.0 else local
     if k == 0:
         return f'({_fmt(m.jitter_px)}*(0.62*sin(2*PI*2.0*({local})+{_fmt(phase)})+0.38*sin(2*PI*0.83*({local})+{_fmt(phase*1.7)})))'
     return f'({_fmt(m.jitter_px)}*(0.58*sin(2*PI*1.93*({local})+{_fmt(phase*2.1)})+0.42*sin(2*PI*1.07*({local})+{_fmt(phase*.7)})))'
@@ -296,7 +303,9 @@ def _bezier_coord_expr(pts: Sequence[Point], k: int, u: str) -> str:
 
 def ffmpeg_position_expr(motion: Motion | Mapping[str, Any], start: float, end: float,
                          width: int, height: int, pointer_size: int = 24,
-                         pointer_anchor: tuple[float, float] | None = None) -> tuple[str, str]:
+                         pointer_anchor: tuple[float, float] | None = None,
+                         quantize_jitter: bool = False,
+                         horizontal_jitter_only: bool = False) -> tuple[str, str]:
     """Return FFmpeg overlay x/y expressions, evaluated each output frame.
 
     Coordinates refer to a square pointer PNG; formulas center it on the target.
@@ -344,8 +353,17 @@ def ffmpeg_position_expr(motion: Motion | Mapping[str, Any], start: float, end: 
             coords.append(expr)
     factor = _jitter_scale_expr(m, local, end-start)
     jx = f'+({factor})*{_jitter_expr(m, local, 0)}' if m.jitter_px else ''
-    jy = f'+({factor})*{_jitter_expr(m, local, 1)}' if m.jitter_px else ''
+    jy = f'+({factor})*{_jitter_expr(m, local, 1)}' if m.jitter_px and not horizontal_jitter_only else ''
     ax, ay = pointer_anchor if pointer_anchor is not None else (pointer_size / 2, pointer_size / 2)
+    if quantize_jitter and m.jitter_px:
+        # Round motion and jitter *separately*. Otherwise a fractional anchor or
+        # negative/offscreen placement can consume an entire 1-pixel oscillation.
+        # floor(v+0.5) also handles negative image overlay coordinates.
+        x = f'floor((({coords[0]})*{width}-{ax:g})+0.5)+floor((({factor})*{_jitter_expr(m, local, 0)})+0.5)'
+        y = f'floor((({coords[1]})*{height}-{ay:g})+0.5)'
+        if not horizontal_jitter_only:
+            y += f'+floor((({factor})*{_jitter_expr(m, local, 1)})+0.5)'
+        return x, y
     return (f'({coords[0]})*{width}{jx}-{ax:g}',
             f'({coords[1]})*{height}{jy}-{ay:g}')
 

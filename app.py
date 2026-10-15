@@ -2781,12 +2781,28 @@ class SlideNarratorApp:
             with ui.row().classes('w-full gap-2'):
                 self.pointer_anchor_x = ui.number('指示点 X (px)', value=anchor[0], min=0, max=width-1, step=1).props('outlined dense').classes('w-1/2')
                 self.pointer_anchor_y = ui.number('指示点 Y (px)', value=anchor[1], min=0, max=height-1, step=1).props('outlined dense').classes('w-1/2')
+            # The marker is drawn in source-image coordinates so it stays aligned
+            # while the displayed image scales responsively.
+            def marker_svg():
+                x = max(0, min(width - 1, float(self.pointer_anchor_x.value or 0)))
+                y = max(0, min(height - 1, float(self.pointer_anchor_y.value or 0)))
+                r = max(3, min(width, height) * .012)
+                return (f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">'
+                        f'<circle cx="{x:g}" cy="{y:g}" r="{r:g}" fill="none" stroke="#ffffff" stroke-width="{max(2,r*.42):g}"/>'
+                        f'<circle cx="{x:g}" cy="{y:g}" r="{r:g}" fill="#22c55e" fill-opacity="0.45" stroke="#16a34a" stroke-width="{max(1.5,r*.25):g}"/>'
+                        f'<circle cx="{x:g}" cy="{y:g}" r="{max(1.5,r*.25):g}" fill="#14532d"/>'
+                        '</svg>')
+            def update_marker(_=None):
+                pointer_anchor_image.content = marker_svg()
+                self._refresh_pointer_preview()
             def clicked(e):
                 if e.type == 'click':
                     self.pointer_anchor_x.value = max(0, min(width-1, round(e.image_x)))
                     self.pointer_anchor_y.value = max(0, min(height-1, round(e.image_y)))
-                    self._refresh_pointer_preview()
-            ui.interactive_image(file_url(image_path), on_mouse=clicked, events=['click']).classes('w-full').style('max-height: 230px; object-fit: contain')
+                    update_marker()
+            pointer_anchor_image = ui.interactive_image(file_url(image_path), content=marker_svg(), on_mouse=clicked, events=['click'], cross=False).classes('w-full').style('max-height: 230px; object-fit: contain')
+            self.pointer_anchor_x.on_value_change(update_marker)
+            self.pointer_anchor_y.on_value_change(update_marker)
             ui.label('スライドを背景にしたサイズ・配置プレビュー').classes('text-sm font-semibold')
             pages = sorted(int(f.stem) for f in self.paths.pages_dir.glob('[0-9]*.png') if f.stem.isdigit())
             if pages:

@@ -2005,28 +2005,44 @@ def generate_page_video(
                 ax, ay = anchor
             else:
                 ax, ay = pointer_width / 2, pointer_height / 2
+            # Laser dot keeps its existing jitter; custom PNG sways horizontally by 1 px.
+            jitter_px = 1 if anchor is not None else 2
+            jitter_rate = 0.1 if anchor is not None else 1.0
             overlays = []
             previous = '[bg]'
             valid = [event for event in schedule if event['end'] > event['start']]
-            parts = [f'[0:v]scale={width}:{height}[bg]']
+            parts = [f'[0:v]scale={width}:{height},format=yuv444p[bg]']
             if len(valid) > 1:
                 parts.append(f'[1:v]scale={pointer_width}:{pointer_height},format=rgba,split={len(valid)}' + ''.join(f'[ptr{i}]' for i in range(len(valid))))
             else:
                 parts.append(f'[1:v]scale={pointer_width}:{pointer_height},format=rgba[ptr0]')
             for i, event in enumerate(valid):
                 if event.get('title_fixed'):
-                    # Align the full PNG rectangle (including transparency) to
-                    # the bottom-left. Apply the same 2 px jitter as fixed pointing,
-                    # biased outwards to avoid showing a gap at either edge.
-                    x = '(-2+2*sin(4*PI*t))'
-                    y = f'({height}-{pointer_height}+2+2*cos(4*PI*t))'
+                    # Position the entire PNG rectangle at bottom-left.
+                    # The PNG rectangle stays flush at the bottom; only X sways outward.
+                    x = f'(-{jitter_px}+floor({jitter_px}*sin(4*PI*{jitter_rate}*t)+0.5))'
+                    y = f'({height}-{pointer_height})'
                     motion = None
                 else:
                     motion = event.get('motion')
                 if motion:
                     try:
+                        if anchor is not None:
+                            # Do not mutate the project's stored motion settings.
+                            motion = dict(motion) if isinstance(motion, dict) else motion
+                            if isinstance(motion, dict):
+                                setting = motion.get('jitter')
+                                if isinstance(setting, dict):
+                                    motion['jitter'] = {**setting, 'amplitude_px': 1.0, 'rate': jitter_rate}
+                                elif setting is True:
+                                    motion['jitter'] = {'enabled': True, 'amplitude_px': 1.0, 'rate': jitter_rate}
+                            elif isinstance(motion, Motion):
+                                from dataclasses import replace
+                                motion = replace(motion, jitter_px=1.0 if motion.jitter_px else 0.0, jitter_rate=jitter_rate)
                         x, y = ffmpeg_position_expr(motion, event['start'], event['end'],
-                                                    width, height, pointer_width, (ax, ay))
+                                                    width, height, pointer_width, (ax, ay),
+                                                    quantize_jitter=anchor is not None,
+                                                    horizontal_jitter_only=anchor is not None)
                     except (ValueError, TypeError, KeyError) as exc:
                         print(f'[POINTER] fallback to fixed: {exc}')
                         motion = None
@@ -2034,14 +2050,14 @@ def generate_page_video(
                     # Preserve legacy location behavior while correcting hidden intervals.
                     if anchor is None:
                         # Legacy placement retained for existing projects.
-                        x = f"({event['x']}+2*sin(4*PI*t))"
-                        y = f"({event['y']}+2*cos(4*PI*t))"
+                        x = f"({event['x']}+{jitter_px}*sin(4*PI*{jitter_rate}*t))"
+                        y = f"({event['y']}+{jitter_px}*cos(4*PI*{jitter_rate}*t))"
                     else:
-                        x = f"({event['x']}-{ax:g}+2*sin(4*PI*t))"
-                        y = f"({event['y']}-{ay:g}+2*cos(4*PI*t))"
+                        x = f"(floor({event['x']}-{ax:g}+0.5)+floor({jitter_px}*sin(4*PI*{jitter_rate}*t)+0.5))"
+                        y = f"floor({event['y']}-{ay:g}+0.5)"
                 dest = f'[p{i}]'
                 gate = f"gte(t,{event['start']:.12g})*lt(t,{event['end']:.12g})"
-                parts.append(f"{previous}[ptr{i}]overlay=x='{x}':y='{y}':eval=frame:enable='{gate}':eof_action=pass{dest}")
+                parts.append(f"{previous}[ptr{i}]overlay=x='{x}':y='{y}':eval=frame:format=yuv444:enable='{gate}':eof_action=pass{dest}")
                 previous = dest
             parts.append(f'{previous}format=yuv420p[v]')
             filter_complex = ';\n'.join(parts) + '\n'
