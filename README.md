@@ -30,14 +30,24 @@
 </table>
 
 ---
-
 ### WebUI（画面例 2）
+
+<table>
+<tr><td>
+<img src="screenshot3.png" alt="NarrationAutomata WebUI スクリーンショット 3" />
+</td></tr>
+</table>
+
+---
+
+### WebUI（画面例 3）
 
 <table>
 <tr><td>
 <img src="screenshot2.png" alt="NarrationAutomata WebUI スクリーンショット 2" />
 </td></tr>
 </table>
+
 
 > 画面は開発中のものです．最新版と異なる場合があります．
 
