@@ -197,10 +197,10 @@ python3 slide_lecture.py --help
 
 ## 画像素材（Image Assets）
 
-本リポジトリに含まれる [`pointing_girl.png`](pointing_girl.png) は，OpenAIのChatGPTによる画像生成機能を使用して制作したAI生成画像です．NarrationAutomataのカスタムポインタ画像として利用するために収録しています．
+本リポジトリに含まれる [`pointing_lecturer.png`](pointing_lecturer.png) は，OpenAIのChatGPTによる画像生成機能を使用して制作したAI生成画像です．NarrationAutomataのカスタムポインタ画像として利用するために収録しています．
 
 この画像について，リポジトリ管理者は利用・改変・再配布を認める意図で公開しています．ただし，AI生成画像には著作権が成立しない場合があり，独占的権利や第三者の権利を侵害しないことを保証するものではありません．ソフトウェア本体のGPLv3とは区別して，画像素材であることを明示しています．
 
-The [`pointing_girl.png`](pointing_girl.png) character artwork was generated using OpenAI's ChatGPT image generation functionality. It is included as an optional custom pointer image for NarrationAutomata.
+The [`pointing_lecturer.png`](pointing_lecturer.png) character artwork was generated using OpenAI's ChatGPT image generation functionality. It is included as an optional custom pointer image for NarrationAutomata.
 
 The repository maintainer intends to permit use, modification, and redistribution of this image. However, copyright protection, exclusive ownership, and non-infringement of third-party rights are not guaranteed for AI-generated artwork. This image is identified separately from the GPLv3-licensed software.
