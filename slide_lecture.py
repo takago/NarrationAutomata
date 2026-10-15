@@ -1456,6 +1456,7 @@ def generate_single_explanation(
     active_pages: list[int] | None = None,
     mode: str = "lecture",
     lang: str = "ja",
+    persist: bool = True,
 ) -> str:
     out_dir.mkdir(parents=True, exist_ok=True)
     page_texts = extract_page_text(pdf)
@@ -1505,7 +1506,8 @@ def generate_single_explanation(
     )
 
     out_file = out_dir / f"{page:03d}.txt"
-    atomic_write_text(out_file, new_text + "\n")
+    if persist:
+        atomic_write_text(out_file, new_text + "\n")
     return new_text
 
 

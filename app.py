@@ -43,6 +43,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from pointer_settings import effective_mode
 from statistics_store import run_with_statistics, export_xlsx, read_records
+from validation.ui import ValidationView
 
 from slide_lecture import (
     generate_single_alignment,
@@ -705,6 +706,7 @@ class SlideNarratorApp:
         self._gallery_filter_label = None
         self.simple_edit_container = None
         self.edit_container = None
+        self.validation_view = ValidationView(self, GLOBAL_EXECUTION_LOCK, atomic_write_text)
         self.slide_video_gallery = None
         self._slide_play_buttons: dict[int, Any] = {}
         self._gallery_video_signatures: dict[int, tuple | None] = {}
@@ -2020,6 +2022,15 @@ class SlideNarratorApp:
                 if self._widget_available(self.statistics_notice):
                     self.statistics_notice.text = f'統計データの読み込みに失敗しました：{exc}'
                 return
+        # 品質検査のLLM統計は既存工程別グラフから分離して表示する．
+        validation_records = [r for r in records if str(r.get('task', '')).startswith('品質検査（')]
+        prompts = sum(int((r.get('llm') or {}).get('prompt_tokens') or 0) for r in validation_records)
+        completions = sum(int((r.get('llm') or {}).get('completion_tokens') or 0) for r in validation_records)
+        if self._widget_available(getattr(self, 'statistics_validation_label', None)):
+            self.statistics_validation_label.text = (
+                f'品質検査・修正のLLM実行履歴：{len(validation_records)}回 ／ '
+                f'入力 {prompts:,} tokens ／ 出力 {completions:,} tokens '
+                '（未報告のトークン数は0として表示）')
         page_count = len(self.images) if self.paths else 0
         if page_count <= 0 and self.pdf:
             try:
@@ -3940,6 +3951,23 @@ class SlideNarratorApp:
                                 on_click=lambda _, page=p, area=ta: self.save_and_realign(page, area.value),
                             ).props('dense color=primary'))
 
+    def download_all_narrations(self) -> None:
+        """プロジェクト内に保存されている全ナレーションをまとめてDLする．"""
+        if not self.paths:
+            safe_notify('プロジェクトを選択してください．', type='warning')
+            return
+        rows = []
+        for source in sorted(self.paths.explanations_dir.glob('[0-9]*.txt')):
+            if source.stem.isdigit():
+                rows.append(f'===== スライド #{int(source.stem)} =====\n'
+                            + source.read_text(encoding='utf-8').rstrip() + '\n')
+        if not rows:
+            safe_notify('保存済みナレーションがありません．', type='warning')
+            return
+        destination = self.paths.root / 'all_narrations.txt'
+        atomic_write_text(destination, '\n'.join(rows))
+        ui.download(str(destination), filename='all_narrations.txt')
+
     async def refresh_simple_editor(self) -> None:
         if not self.simple_edit_container:
             return
@@ -5632,10 +5660,12 @@ class SlideNarratorApp:
                 tab_gallery = ui.tab('🖼 スライドデッキ')
                 self._tab_gallery = tab_gallery
                 if not self.read_only:
-                    tab_simple_edit = ui.tab('📋 ナレーション修正（簡易）')
+                    tab_simple_edit = ui.tab('📋 ナレーション一覧')
                     self._tab_simple_edit = tab_simple_edit
-                    tab_edit = ui.tab('📝 ナレーション修正（詳細）')
+                    tab_edit = ui.tab('📝 ナレーション編集')
                     self._tab_edit = tab_edit
+                    tab_validation = ui.tab('🔎 品質検査')
+                    self._tab_validation = tab_validation
                 tab_statistics = ui.tab('📊 統計')
                 tab_logs = ui.tab('📜 ログ')
                 self._tab_logs = tab_logs
@@ -5650,10 +5680,14 @@ class SlideNarratorApp:
                     self.gallery = ui.column().classes('w-full').props('id=slide-deck-gallery')
                 if not self.read_only:
                     with ui.tab_panel(tab_simple_edit):
-                        ui.label('📋 ナレーション修正（簡易）').classes('text-h5')
+                        ui.label('📋 ナレーション一覧').classes('text-h5')
+                        with ui.row().classes('gap-2 items-center'):
+                            ui.button('一括ダウンロード',icon='download',on_click=self.download_all_narrations).props('dense outline')
                         self.simple_edit_container = ui.column().classes('w-full')
                     with ui.tab_panel(tab_edit):
                         self.edit_container = ui.column().classes('w-full')
+                    with ui.tab_panel(tab_validation):
+                        self.validation_view.build()
                 with ui.tab_panel(tab_statistics):
                     ui.label('📊 スライド別生成統計').classes('text-h5')
                     ui.label('工程別：ナレーション生成（画像・テキスト解析）／Bbox検出（スライド要素の位置検出）／字幕用翻訳／ポインタ位置選定／TTSヨミ変換').classes('text-caption text-slate-400')
@@ -5693,6 +5727,7 @@ class SlideNarratorApp:
                                                          lambda _: self._pointer_display_changed())
                         self.pointer_breakdown_mode.on('update:model-value',
                                                        lambda _: self._pointer_display_changed())
+                    self.statistics_validation_label = ui.label('品質検査のLLM使用量：未計測').classes('text-caption text-slate-400')
                     self.statistics_notice = ui.label('プロジェクトを選択してください．').classes('text-caption text-slate-400')
                     self.statistics_chart_container = ui.column().classes('w-full')
                     self.statistics_chart = None
@@ -5720,6 +5755,7 @@ class SlideNarratorApp:
                 if not self.read_only:
                     mapping[tab_simple_edit.name] = 'simple'
                     mapping[tab_edit.name] = 'detail'
+                    mapping[tab_validation.name] = 'validation'
                 self.refresh_output_views_on_tab_change(mapping.get(getattr(e.value, 'name', e.value), 'other'))
 
             tabs.on_value_change(handle_tab_change)
@@ -5728,6 +5764,7 @@ class SlideNarratorApp:
             if not self.read_only:
                 tab_simple_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('simple'))
                 tab_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('detail'))
+                tab_validation.on('click', lambda _: self.validation_view.refresh())
 
     def build(self) -> None:
         ui.page_title('NarrationAutomata')
