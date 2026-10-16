@@ -1430,6 +1430,21 @@ class SlideNarratorApp:
                 pass
         return cancel_pending
 
+    def refresh_live_views(self) -> None:
+        """Synchronize live UI widgets using one client-side polling timer.
+
+        Keep each update independent: a disconnected/stale widget in one
+        section must not prevent the sidebar or other refinement view from
+        refreshing.  Worker execution and persisted state remain server-side.
+        """
+        self._safe_view_update(self.refresh_refine_sidebar, 'リファインのサイドバー表示')
+        self._safe_view_update(self.refresh_job_status, '通常生成の状態更新')
+        for view, label in (
+            (self.validation_view, '内容リファインの操作欄更新'),
+            (self.time_refine_view, '時間リファインの操作欄更新'),
+        ):
+            self._safe_view_update(view._sync_controls_on_state_change, label)
+
     def refresh_job_status(self) -> None:
         """ポーリング時に画面上のボタン・進捗バー群を同期"""
         allowed_now = self.write_access_allowed(notify=False)
@@ -1460,7 +1475,6 @@ class SlideNarratorApp:
                 self._time_refine_token = time_token
                 self._safe_view_update(self.time_refine_view.restore_progress, '時間リファイン状態の復元')
                 self._safe_view_update(self.time_refine_view.refresh, '時間リファイン画面の復元')
-        self._safe_view_update(self.refresh_refine_sidebar, 'リファインのサイドバー表示')
         refine_active = bool(getattr(self, '_refine_sidebar_live', False))
         globally_busy = GLOBAL_EXECUTION_LOCK.is_locked()
         self.sync_project_select_enabled()
@@ -5694,10 +5708,8 @@ class SlideNarratorApp:
         with ui.left_drawer(value=True).props('width=380').classes('p-4'):
             if self.read_only:
                 ui.label('閲覧モード：利用可能時間外のため編集・生成はできません．').classes('text-sm text-amber-400')
-            ui.timer(1.0, self.refresh_job_status)
-            # Independent of pipeline progress refresh; survives tab reloads.
-            ui.timer(1.0, lambda: self._safe_view_update(
-                self.refresh_refine_sidebar, '独立したリファイン状態更新'))
+            # One timer per browser client; each section remains isolated.
+            ui.timer(1.0, self.refresh_live_views)
             ui.timer(2.0, lambda: self._safe_view_update(
                 self.poll_visible_outputs, '表示タブの生成ファイル差分同期'))
 

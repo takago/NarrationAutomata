@@ -39,3 +39,28 @@ def write(project: Path, kind: str, **updates) -> dict:
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
     os.replace(temp, path)
     return value
+
+
+def running_as(username: str, project: Path | None, view_type: type):
+    """Return a live refinement only if it belongs to the requested view type.
+
+    A single project registry is shared by content and time refinement.
+    Never treat another kind of refinement as the current view's worker.
+    """
+    if project is None:
+        return None
+    view = running(username, project)
+    return view if isinstance(view, view_type) else None
+
+
+def finish_content(project: Path, *, cancelled: bool) -> dict:
+    """Finalize content refinement while preserving an earlier failure/cancel.
+
+    The final message and the preexisting terminal status are intentionally
+    retained, exactly as in the two original content-worker finally blocks.
+    """
+    snapshot = read(project, 'content')
+    state = snapshot.get('state', 'running')
+    if state not in ('failed', 'cancelled'):
+        state = 'cancelled' if cancelled else 'completed'
+    return write(project, 'content', state=state, message=snapshot.get('message', ''))

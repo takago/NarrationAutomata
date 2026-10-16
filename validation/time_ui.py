@@ -272,16 +272,13 @@ class TimeRefineView:
         self.history = ui.column().classes('w-full gap-1')
         self.result_container = ui.column().classes('w-full gap-2 mt-3')
         self.refresh()
-        ui.timer(1.0, self._sync_controls_on_state_change)
 
     def _sync_controls_on_state_change(self):
         """Rebuild settings after completion, cancellation, or failure."""
         if self.controls is None or getattr(self.controls, "is_deleted", False):
             return
         project = self.owner.paths.root if self.owner.paths else None
-        live = refine_job.running(self.owner.username, project) if project else None
-        if not isinstance(live, TimeRefineView):
-            live = None
+        live = refine_job.running_as(self.owner.username, project, TimeRefineView)
         if self.running_spinner is not None:
             self.running_spinner.visible = live is not None
         if (live is not None) != self._shown_busy:
@@ -372,9 +369,7 @@ class TimeRefineView:
             return
         project = self.owner.paths.root
         snapshot = refine_job.read(project, 'time')
-        live = refine_job.running(self.owner.username, project)
-        if not isinstance(live, TimeRefineView):
-            live = None
+        live = refine_job.running_as(self.owner.username, project, TimeRefineView)
         if live is not None:
             self.busy = True
             self.stop_requested = live.stop_requested
@@ -519,9 +514,9 @@ class TimeRefineView:
                 self.start_button.disable()
 
     async def request_stop(self):
-        live = refine_job.running(self.owner.username, self.owner.paths.root) if self.owner.paths else None
-        if not isinstance(live, TimeRefineView):
-            live = None
+        live = refine_job.running_as(
+            self.owner.username, self.owner.paths.root if self.owner.paths else None, TimeRefineView
+        )
         if live is not None and live is not self:
             await live.request_stop()
             self.restore_progress()

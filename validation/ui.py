@@ -76,16 +76,13 @@ class ValidationView:
         self._edit_bar.set_visibility(False)
         self.results = ui.column().classes('w-full gap-2')
         self.refresh()
-        ui.timer(1.0, self._sync_controls_on_state_change)
 
     def _sync_controls_on_state_change(self):
         """Restore configuration controls when a server-side job finishes."""
         if self.controls is None or getattr(self.controls, "is_deleted", False):
             return
         project = self.owner.paths.root if self.owner.paths else None
-        live = refine_job.running(self.owner.username, project) if project else None
-        if not isinstance(live, ValidationView):
-            live = None
+        live = refine_job.running_as(self.owner.username, project, ValidationView)
         active = live is not None
         if self.running_spinner is not None:
             self.running_spinner.visible = active
@@ -135,9 +132,7 @@ class ValidationView:
         if project is None or self.progress is None:
             return
         snapshot = refine_job.read(project, "content")
-        live = refine_job.running(self.owner.username, project)
-        if not isinstance(live, ValidationView):
-            live = None
+        live = refine_job.running_as(self.owner.username, project, ValidationView)
         self.busy = live is not None or (self._running_project == project and self.busy)
         if self.running_spinner is not None:
             self.running_spinner.visible = self.busy
@@ -361,7 +356,7 @@ class ValidationView:
                     self._start_button.enable()
             except Exception:
                 pass
-            refine_job.write(project, 'content', state=refine_job.read(project, 'content').get('state', 'running') if refine_job.read(project, 'content').get('state') in ('failed', 'cancelled') else ('cancelled' if owner.cancellation_requested else 'completed'), message=refine_job.read(project, 'content').get('message', ''))
+            refine_job.finish_content(project, cancelled=owner.cancellation_requested)
             refine_job.unregister(owner.username, project, self)
             self._running_project = None
             owner._finalize_cancel_request()
@@ -573,7 +568,7 @@ class ValidationView:
                     self._start_button.enable()
             except Exception:
                 pass
-            refine_job.write(project, 'content', state=refine_job.read(project, 'content').get('state', 'running') if refine_job.read(project, 'content').get('state') in ('failed', 'cancelled') else ('cancelled' if owner.cancellation_requested else 'completed'), message=refine_job.read(project, 'content').get('message', ''))
+            refine_job.finish_content(project, cancelled=owner.cancellation_requested)
             refine_job.unregister(owner.username, project, self)
             self._running_project = None
             owner._finalize_cancel_request()
