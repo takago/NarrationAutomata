@@ -46,8 +46,6 @@ from statistics_store import run_with_statistics, export_xlsx, read_records
 from validation.ui import ValidationView
 from validation.time_ui import TimeRefineView
 from validation import refine_job
-from validation.runner import run_auto_refiner
-from validation.store import log as validation_log
 
 from slide_lecture import (
     generate_single_alignment,
@@ -456,7 +454,7 @@ class ProjectPaths:
             path.unlink()
 
     def cleanup_downstream(self, page: int | None = None, include_alignment: bool = False) -> None:
-        """下流のメディアファイル（動画・音声・字幕）を削除します．"""
+        """下流のメディアファイル（ビデオ・音声・字幕）を削除します．"""
         for path in (self.final_video, self.final_ja_srt, self.final_en_srt):
             self._unlink(path)
 
@@ -741,6 +739,8 @@ class SlideNarratorApp:
         self._output_project_key: str | None = None
         self._detail_signatures: dict[str, tuple | None] = {}
         self._final_video_signature: tuple | None = None
+        # 画面更新が重なって完成ビデオのボタンが重複しないようにする．
+        self._final_video_refresh_lock = asyncio.Lock()
         self.final_video_container = None
         self.settings_container = None
         self.user_manage_container = None
@@ -780,7 +780,8 @@ class SlideNarratorApp:
         self.advanced_stage_buttons: list[Any] = []
         self.advanced_stage_rows: list[Any] = []
         self.easy_generate_button = None
-        self.easy_cancel_button = None
+        self.cancel_button = None
+        self.sidebar_busy_controls: list[Any] = []
         self.easy_progress_box = None
         self.easy_progress_label = None
         self.easy_progress_bar = None
@@ -831,9 +832,12 @@ class SlideNarratorApp:
 
     def _complete_background_job(self) -> None:
         # UIが破棄されていてもロック解放を最優先する．
+        # 中断要求はジョブ単位の状態．次のリファイナー等に引き継がない．
+        # 呼び出し側で中断結果を保存した後に，ここで解放する．
         self.current_process = None
         self.processing = False
         self.current_task = None
+        self.cancellation_requested = False
         try:
             GLOBAL_EXECUTION_LOCK.release()
         finally:
@@ -860,7 +864,7 @@ class SlideNarratorApp:
             )
 
     def _invalidate_page_video_outputs(self, page: int) -> None:
-        """ページの動画・完成動画・完成字幕を無効化する．音声と解析結果は保持する．"""
+        """ページのビデオ・完成ビデオ・完成字幕を無効化する．音声と解析結果は保持する．"""
         assert self.paths is not None
         for path in (
             self.paths.video(page), self.paths.final_video,
@@ -1038,7 +1042,7 @@ class SlideNarratorApp:
     @staticmethod
     def stage_button_key(stage: str | None) -> str | None:
         stage = str(stage or '')
-        # 内容のリファインは①〜④のいずれにも属さない独立工程．
+        # リファイナーは①〜④のいずれにも属さない独立工程．
         if stage == 'validation':
             return 'validation'
         if any(word in stage for word in ('ナレーション原稿', 'ナレーション再生成', 'explain')):
@@ -1047,7 +1051,7 @@ class SlideNarratorApp:
             return 'align'
         if any(word in stage for word in ('音声合成', '音声を作成', '音声', 'tts')):
             return 'tts'
-        if any(word in stage for word in ('動画', 'ビデオ', 'video', 'concat')):
+        if any(word in stage for word in ('ビデオ', 'ビデオ', 'video', 'concat')):
             return 'video'
         return None
 
@@ -1095,7 +1099,7 @@ class SlideNarratorApp:
         self.poll_generated_outputs()
 
     def poll_generated_outputs(self) -> None:
-        """生成物だけを差分反映する．既存の入力欄・再生中の動画には触れない．"""
+        """生成物だけを差分反映する．既存の入力欄・再生中のビデオには触れない．"""
         if not self.paths or not self.pdf:
             return
         project_key = str(self.pdf.resolve())
@@ -1148,10 +1152,10 @@ class SlideNarratorApp:
         if signature != self._final_video_signature:
             self._final_video_signature = signature
             background_tasks.create(self._safe_async_view_update(
-                self.refresh_final_video, '完成動画の差分更新'))
+                self.refresh_final_video, '完成ビデオの差分更新'))
 
     def _refresh_gallery_video_buttons(self) -> None:
-        """動画プレーヤーを生成せず，単体動画の有無のみを差分反映する．"""
+        """ビデオプレーヤーを生成せず，単体ビデオの有無のみを差分反映する．"""
         if not self.paths:
             return
         for page, button in list(self._slide_play_buttons.items()):
@@ -1168,9 +1172,9 @@ class SlideNarratorApp:
                     button.classes(remove='hidden')
 
     def show_video_dialog(self, path: Path, title: str) -> None:
-        """動画は選択された1本だけ読み込む．閉じるとプレーヤーごと破棄する．"""
+        """ビデオは選択された1本だけ読み込む．閉じるとプレーヤーごと破棄する．"""
         if not path.is_file():
-            safe_notify('動画ファイルが見つかりません．', type='warning')
+            safe_notify('ビデオファイルが見つかりません．', type='warning')
             self._refresh_gallery_video_buttons()
             return
         if self._video_dialog is not None:
@@ -1194,18 +1198,16 @@ class SlideNarratorApp:
         dialog.open()
 
     def _refresh_easy_action_visibility(self) -> None:
-        """Easyでは同じ位置の「全自動生成／中断」を実行状態に応じて切り替える．"""
-        if self.view_mode != 'easy':
-            show_cancel = False
-            show_generate = False
-        else:
-            show_cancel = (GLOBAL_EXECUTION_LOCK.is_locked()
-                           and GLOBAL_EXECUTION_LOCK.current_user == self.username)
-            show_generate = not show_cancel
+        """生成ボタンはEasy専用，中断ボタンは両モードで共有する．"""
+        owner_running = (GLOBAL_EXECUTION_LOCK.is_locked()
+                         and GLOBAL_EXECUTION_LOCK.current_user == self.username)
         if self._widget_available(self.easy_generate_button):
-            self.easy_generate_button.classes(remove='hidden') if show_generate else self.easy_generate_button.classes(add='hidden')
-        if self._widget_available(self.easy_cancel_button):
-            self.easy_cancel_button.classes(remove='hidden') if show_cancel else self.easy_cancel_button.classes(add='hidden')
+            if self.view_mode == 'easy' and not owner_running:
+                self.easy_generate_button.classes(remove='hidden')
+            else:
+                self.easy_generate_button.classes(add='hidden')
+        if self._widget_available(self.cancel_button):
+            self.cancel_button.classes(remove='hidden') if owner_running else self.cancel_button.classes(add='hidden')
 
     def set_sidebar_view_mode(self, mode: str) -> None:
         """表示内容だけを変更する．生成設定と実行中のジョブには触れない．"""
@@ -1254,7 +1256,7 @@ class SlideNarratorApp:
             if display_state in ('running', 'failed', 'completed', 'cancelled'):
                 self.easy_progress_box.classes(remove='hidden') if self.view_mode == 'easy' else self.easy_progress_box.classes(add='hidden')
                 key = self.get_active_stage_key(own_display)
-                stage_names = {'explain': 'ナレーション原稿の生成', 'align': '翻訳・字幕・ポインタ配置', 'tts': '音声合成', 'video': '動画の生成', 'validation': '内容のリファイン'}
+                stage_names = {'explain': 'ナレーション原稿の生成', 'align': '翻訳・字幕・ポインタ配置', 'tts': '音声合成', 'video': 'ビデオの生成', 'validation': 'リファイナー'}
                 stage_name = stage_names.get(key, '生成処理')
                 progress = own_display.get('progress')
                 current_index = own_display.get('current_index')
@@ -1287,14 +1289,14 @@ class SlideNarratorApp:
                             pieces.append(f'経過時間 {elapsed // 60}分{elapsed % 60:02d}秒')
                     except (ValueError, TypeError):
                         pass
-                if display_state == 'failed':
+                if display_state in ('failed',):
                     pieces.append(str(own_display.get('error_detail') or own_display.get('message') or '詳細不明')[:200])
                 self.easy_progress_detail.text = ' ／ '.join(pieces)
                 # Advancedと同じLLM/TTS情報を，Easyの進捗バー下にも表示する．
                 if self._widget_available(self.easy_progress_metrics):
                     detail = ''
                     if display_state == 'running' and owner_is_self:
-                        llm_metrics = own_display.get('llm_metrics')
+                        llm_metrics = own_display.get('llm_metrics') if key != 'validation' else None
                         tts_metrics = own_display.get('tts_metrics') if key == 'tts' else None
                         if isinstance(tts_metrics, dict):
                             detail = self.format_tts_progress(tts_metrics, running=True)
@@ -1319,7 +1321,7 @@ class SlideNarratorApp:
 
         active_idx = ORDERED_STAGES.index(active_key) if (active_key in ORDERED_STAGES) else -1
 
-        # validation には①〜④のボタンがないため，独立した進捗欄に表示する．
+        # 手動リファイナーの進捗は生成工程とは独立して表示する．
         refine_box = getattr(self, 'pipeline_refine_progress_box', None)
         if self._widget_available(refine_box):
             showing_refine = (self.view_mode == 'advanced' and owner_is_self
@@ -1376,7 +1378,7 @@ class SlideNarratorApp:
                         p_detail.text = self.format_tts_progress(tts_metrics, error=True)
                         if self.view_mode == 'advanced':
                             p_detail.classes(remove='hidden')
-                    self.set_button_enabled_visual(btn, not self.read_only)
+                    self.set_button_enabled_visual(btn, not (globally_busy or self.read_only))
 
                 elif owner_is_self and status.get('state') == 'running' and key == active_key:
                     btn.props('color=primary')
@@ -1427,7 +1429,7 @@ class SlideNarratorApp:
                                 p_easy_elapsed.classes(remove='hidden')
                             except (ValueError, TypeError):
                                 pass
-                    self.set_button_enabled_visual(btn, not cancel_pending)
+                    self.set_button_enabled_visual(btn, False)
 
                 elif owner_is_self and (key in completed_stages or (active_idx >= 0 and key_idx < active_idx)):
                     box.classes(remove='hidden')
@@ -1474,7 +1476,7 @@ class SlideNarratorApp:
             metrics_text = ''
             try:
                 tts = state.get('tts_metrics') if active_stage == 'tts' else None
-                llm = state.get('llm_metrics')
+                llm = state.get('llm_metrics') if active_stage != 'validation' else None
                 running = state.get('state') == 'running'
                 if isinstance(tts, dict):
                     metrics_text = self.format_tts_progress(tts, running=running)
@@ -1485,10 +1487,32 @@ class SlideNarratorApp:
             metrics_label.text = metrics_text
             metrics_label.classes(remove='hidden') if metrics_text else metrics_label.classes(add='hidden')
 
+    def _set_sidebar_slide_preview(self, page: Any, *, project: Path | None = None) -> None:
+        """Show a generated slide PNG only when the current page changes."""
+        preview = getattr(self, 'refine_sidebar_slide_preview', None)
+        if not self._widget_available(preview):
+            return
+        try:
+            number = int(page)
+            # Refinements can run against a different project from the one
+            # currently selected in this browser.  Use the worker's project.
+            if project is not None:
+                path = Path(project) / 'pages' / f'{number:03d}.png' if number > 0 else None
+            else:
+                path = self.paths.page_image(number) if self.paths and number > 0 else None
+            source = file_url(path) if path is not None and path.is_file() else None
+        except (ValueError, TypeError, OSError):
+            source = None
+        if source != getattr(self, '_sidebar_slide_preview_source', None):
+            self._sidebar_slide_preview_source = source
+            if source is not None:
+                preview.set_source(source)
+        preview.visible = bool(source)
+
     def refresh_common_job_sidebar(self, status: dict[str, Any],
                                    own_status: dict[str, Any],
                                    owner_is_self: bool) -> None:
-        """時間・内容リファイン以外の通常生成進捗を共通カードへ描画する．"""
+        """時間・リファイナー以外の通常生成進捗を共通カードへ描画する．"""
         panel = getattr(self, 'refine_sidebar_panel', None)
         if not self._widget_available(panel) or getattr(self, '_refine_sidebar_live', False):
             return
@@ -1497,30 +1521,51 @@ class SlideNarratorApp:
         # 保存済みの完了状態は既存の完成ビデオ欄で確認できる．
         if state not in ('running', 'failed', 'cancelled') or (state == 'running' and not owner_is_self):
             panel.visible = False
+            self._set_sidebar_slide_preview(None)
             return
         panel.visible = True
         if self._widget_available(getattr(self, 'refine_sidebar_spinner', None)):
             self.refine_sidebar_spinner.classes(remove='hidden') if state == 'running' else self.refine_sidebar_spinner.classes(add='hidden')
         name = {'explain': '① ナレーション原稿生成',
-                'validation': '内容のリファイン',
+                'validation': 'リファイナー',
                 'align': '② 翻訳・字幕・ポインタ配置',
-                'tts': '③ 音声生成', 'video': '④ 動画生成'}
+                'tts': '③ 音声生成', 'video': '④ ビデオ生成'}
         stage = name.get(self.get_active_stage_key(display), '通常パイプライン')
         state_label = {'running': '実行中', 'failed': 'エラー停止', 'cancelled': '中断'}[state]
         self.refine_sidebar_title.text = f'処理状況：{stage}（{state_label}）'
-        project = self.paths.root if self.paths is not None else None
-        self.refine_sidebar_project.text = f'プロジェクト：{project.name}' if project else ''
-        detail = str(display.get('error_detail') or display.get('message') or stage)
+        # ProjectPaths.root is a generated "*_lecture" directory, not the
+        # project's display name.  Use the same label as the project selector.
+        pdf = self.pdf if self.pdf is not None and self.pdf.is_file() else None
+        if pdf is None and self.paths is not None:
+            pdf = self.paths.pdf if self.paths.pdf.is_file() else None
+        project_name = self.project_display_name(pdf) if pdf is not None else ''
+        self.refine_sidebar_project.text = f'プロジェクト：{project_name}' if project_name else ''
+
+        detail = str(display.get('error_detail') or display.get('message') or stage).strip()
         current = display.get('current_index')
         total = display.get('total_count')
         if current and total:
             page = display.get('current_page')
-            prefix = f'スライド {page} ({current}/{total})' if page is not None else f'スライド {current} / {total}枚'
-            detail = f'{prefix}\n{detail}'
+            prefix = (f'スライド {page} ({current}/{total})' if page is not None
+                      else f'スライド {current} / {total}枚')
+            # The CLI progress message can already contain the same slide and
+            # counter (e.g. "スライド 19（19/46, VLM併用）").  Show the
+            # position once, retaining useful detail such as "VLM併用".
+            if not display.get('error_detail'):
+                slide_match = re.match(
+                    r'^スライド\s+\d+\s*[（(]\s*\d+\s*/\s*\d+\s*'
+                    r'(?:[,，]\s*([^）)]*))?[）)]\s*(.*)$', detail)
+                if slide_match:
+                    mode, remainder = slide_match.groups()
+                    detail = ' ／ '.join(part for part in (mode, remainder.strip(' ：:')) if part)
+                elif detail == prefix:
+                    detail = ''
+            detail = prefix + (f'\n{detail}' if detail else '')
         progress = display.get('progress')
         if isinstance(progress, (int, float)):
             detail = f'進捗：{max(0, min(100, int(progress * 100)))}％\n{detail}'
         self.refine_sidebar_detail.text = detail
+        self._set_sidebar_slide_preview(display.get('current_page'))
         self._update_sidebar_extra_progress(display, active_stage=self.get_active_stage_key(display))
         fraction = display.get('progress')
         if isinstance(fraction, (int, float)):
@@ -1539,8 +1584,8 @@ class SlideNarratorApp:
         self._safe_view_update(self.refresh_refine_sidebar, 'リファインのサイドバー表示')
         self._safe_view_update(self.refresh_job_status, '通常生成の状態更新')
         for view, label in (
-            (self.validation_view, '内容リファインの操作欄更新'),
-            (self.time_refine_view, '時間リファインの操作欄更新'),
+            (self.validation_view, 'リファイナーの操作欄更新'),
+            (self.time_refine_view, '再生時間の調整の操作欄更新'),
         ):
             self._safe_view_update(view._sync_controls_on_state_change, label)
 
@@ -1564,16 +1609,16 @@ class SlideNarratorApp:
             content_token = (content.get('updated_at'), live_content is not None)
             if getattr(self, '_content_refine_token', None) != content_token:
                 self._content_refine_token = content_token
-                self._safe_view_update(self.validation_view.restore_progress, '内容リファイン状態の復元')
+                self._safe_view_update(self.validation_view.restore_progress, 'リファイナー状態の復元')
                 if content.get('state') != 'running':
-                    self._safe_view_update(self.validation_view.render_results, '内容リファイン履歴の復元')
+                    self._safe_view_update(self.validation_view.render_results, 'リファイナー履歴の復元')
             time_state = refine_job.read(project, 'time')
             live_time = refine_job.running(self.username, project)
             time_token = (time_state.get('updated_at'), live_time is not None)
             if getattr(self, '_time_refine_token', None) != time_token:
                 self._time_refine_token = time_token
-                self._safe_view_update(self.time_refine_view.restore_progress, '時間リファイン状態の復元')
-                self._safe_view_update(self.time_refine_view.refresh, '時間リファイン画面の復元')
+                self._safe_view_update(self.time_refine_view.restore_progress, '再生時間の調整状態の復元')
+                self._safe_view_update(self.time_refine_view.refresh, '再生時間の調整画面の復元')
         refine_active = bool(getattr(self, '_refine_sidebar_live', False))
         globally_busy = GLOBAL_EXECUTION_LOCK.is_locked()
         self.sync_project_select_enabled()
@@ -1640,11 +1685,13 @@ class SlideNarratorApp:
 
         if self._widget_available(self.easy_generate_button):
             self.set_button_enabled_visual(self.easy_generate_button, not (globally_busy or self.read_only))
-        if self._widget_available(self.easy_cancel_button):
-            self.set_button_enabled_visual(
-                self.easy_cancel_button,
-                owner_is_self and not cancel_pending,
-            )
+        if self._widget_available(self.cancel_button):
+            self.set_button_enabled_visual(self.cancel_button, owner_is_self and not cancel_pending)
+
+        # 実行中のプロジェクトやパイプライン設定を変更させない．
+        for control in self.sidebar_busy_controls:
+            if self._widget_available(control):
+                self.set_button_enabled_visual(control, not (globally_busy or self.read_only))
 
         for button in self.main_action_buttons:
             self.set_button_enabled_visual(button, not (globally_busy or self.read_only))
@@ -2214,13 +2261,13 @@ class SlideNarratorApp:
                     reduction = before - after
                     percent = (100 * reduction / before) if before else 0
                     self.statistics_time_refine_label.text = (
-                        f'時間リファインの原稿文字数：{before:,} → {after:,} 文字 '
+                        f'再生時間の調整の原稿文字数：{before:,} → {after:,} 文字 '
                         f'（短縮 {reduction:,} 文字，{percent:.1f}%）'
                         ' ／ 元のプロジェクトとの比較')
                 except (TypeError, ValueError, OSError):
-                    self.statistics_time_refine_label.text = '時間リファインの原稿文字数：集計できませんでした．'
+                    self.statistics_time_refine_label.text = '再生時間の調整の原稿文字数：集計できませんでした．'
             else:
-                self.statistics_time_refine_label.text = '時間リファインの原稿文字数：比較記録なし'
+                self.statistics_time_refine_label.text = '再生時間の調整の原稿文字数：比較記録なし'
         # 品質検査のLLM統計は既存工程別グラフから分離して表示する．
         validation_records = [r for r in records if str(r.get('task', '')).startswith('品質検査（')]
         prompts = sum(int((r.get('llm') or {}).get('prompt_tokens') or 0) for r in validation_records)
@@ -2452,7 +2499,7 @@ class SlideNarratorApp:
         if not project_id:
             return
         if self._time_refine_switch_blocked and not (time_refine_internal or refine_sidebar_internal):
-            safe_notify('時間リファイン中は別プロジェクトに切り替えられません．', type='warning')
+            safe_notify('再生時間の調整中は別プロジェクトに切り替えられません．', type='warning')
             self.refresh_project_list()
             return
         if GLOBAL_EXECUTION_LOCK.is_locked() and GLOBAL_EXECUTION_LOCK.current_user != self.username:
@@ -2468,7 +2515,7 @@ class SlideNarratorApp:
                 GLOBAL_EXECUTION_LOCK.owner_app is not None and
                 GLOBAL_EXECUTION_LOCK.owner_app.pdf is not None and
                 project_id != GLOBAL_EXECUTION_LOCK.owner_app.pdf.parent.name):
-            # 自動復元に限り，同一ユーザが実行している時間リファインの
+            # 自動復元に限り，同一ユーザが実行している再生時間の調整の
             # コピー先へ移動できる．一般のプロジェクト切替制限は維持する．
             target = self.projects_dir / str(project_id)
             live_time = refine_job.running(self.username, target)
@@ -2551,7 +2598,7 @@ class SlideNarratorApp:
                 ui.icon('delete_forever', size='md')
                 ui.label('プロジェクトを完全に削除').classes('text-base font-bold')
             ui.label(
-                f'「{project_name}」と，元PDF（{pdf_path.name}），生成済みの音声・動画・字幕・編集データを完全に削除します．この操作は取り消せません．'
+                f'「{project_name}」と，元PDF（{pdf_path.name}），生成済みの音声・ビデオ・字幕・編集データを完全に削除します．この操作は取り消せません．'
             ).classes('text-sm text-zinc-300 leading-relaxed')
             with ui.row().classes('w-full justify-end gap-2 pt-2'):
                 ui.button('キャンセル', on_click=dialog.close).props('outline color=grey')
@@ -2796,6 +2843,10 @@ class SlideNarratorApp:
                         state.get('state'), state.get('title'), state.get('detail'))
             self._refine_sidebar_diag = diagnostic
         self._refine_sidebar_live = bool(live)
+        # Content refinement writes the actual page to its persisted job status.
+        # Show its PNG in the same preview used by normal pipeline stages.
+        self._set_sidebar_slide_preview(state.get('page') if kind == 'content' else None,
+                                        project=project)
         panel.visible = True
         if self._widget_available(getattr(self, 'refine_sidebar_spinner', None)):
             self.refine_sidebar_spinner.classes(remove='hidden') if live else self.refine_sidebar_spinner.classes(add='hidden')
@@ -2817,7 +2868,7 @@ class SlideNarratorApp:
                 self.refresh_project_name_input()
                 self._refine_sidebar_project_sync_id = project.name
                 LOGGER.info('[refine-sidebar] synchronized project selector: %s', project.name)
-        title = '時間のリファイン' if kind == 'time' else '内容のリファイン'
+        title = '再生時間の調整' if kind == 'time' else 'リファイナー'
         self.refine_sidebar_title.text = (
             f'処理状況：{title}（実行中）' if live else f'処理状況：{title}（状態未確認）')
         # Display the user-facing project name as in the project selector,
@@ -3104,7 +3155,7 @@ class SlideNarratorApp:
             image_x = x * slide_w / 100
             image_y = y * slide_h / 100
             if int(self.pointer_page_select.value) == 1 and self.proj_cfg.get('title_pointer_fixed', True):
-                return  # タイトルページは動画と同様に左下固定．他ページでドラッグ可能．
+                return  # タイトルページはビデオと同様に左下固定．他ページでドラッグ可能．
             if e.type == 'mousedown':
                 # Start a drag only within the pointer bounding rectangle.
                 if hot_x-ax <= image_x <= hot_x-ax+px_w and hot_y-ay <= image_y <= hot_y-ay+px_h:
@@ -3267,7 +3318,7 @@ class SlideNarratorApp:
             save_project_json(self.paths.root, data)
             self.proj_cfg = data
             self._invalidate_pointer_videos()
-            safe_notify('指示点とサイズを保存しました．動画再生成で反映されます．', type='positive')
+            safe_notify('指示点とサイズを保存しました．ビデオ再生成で反映されます．', type='positive')
         except (ValueError, TypeError) as exc:
             safe_notify(f'設定を確認してください: {exc}', type='negative')
 
@@ -3315,8 +3366,6 @@ class SlideNarratorApp:
             self.lang_select.value = self.lang_code
         if self.default_vlm_switch:
             self.default_vlm_switch.value = self.default_use_vlm
-        if self._widget_available(getattr(self, 'auto_refine_switch', None)):
-            self.auto_refine_switch.value = bool(self.proj_cfg.get('pipeline_auto_refine', True))
         self.refresh_pointer_image_panel()
         if self.pointer_default_select:
             default_mode = self.proj_cfg.get('pointer_default_mode', 'static') if self.pdf else 'static'
@@ -3345,7 +3394,6 @@ class SlideNarratorApp:
             'skip_pages': '',
             'visual_mode': 'vlm' if self.default_use_vlm else 'pdf',
             'slide_visual_modes': self.slide_visual_modes,
-            'pipeline_auto_refine': bool(self.proj_cfg.get('pipeline_auto_refine', True)),
         })
         save_project_json(self.paths.root, self.proj_cfg)
 
@@ -3386,7 +3434,7 @@ class SlideNarratorApp:
         target_pdf = self.pdf.resolve()
         with ui.dialog() as dialog, ui.card().classes('min-w-[340px] max-w-lg p-5 gap-3'):
             ui.label('生成データを削除しますか？').classes('text-lg font-bold text-red-400')
-            ui.label('このプロジェクトのナレーション原稿，翻訳・ポインタ情報，音声，動画，字幕，統計データ，内容リファインの検査結果・履歴を削除します．')
+            ui.label('このプロジェクトのナレーション原稿，翻訳・ポインタ情報，音声，ビデオ，字幕，統計データ，リファイナーの検査結果・履歴を削除します．')
             ui.label('元PDF，プロジェクト設定・ヨミ辞書，スライド画像は残します．削除後に自動生成は開始しません．この操作は取り消せません．').classes('text-sm text-zinc-400')
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('キャンセル', on_click=dialog.close).props('flat')
@@ -3420,7 +3468,7 @@ class SlideNarratorApp:
                 if directory.exists():
                     shutil.rmtree(directory)
 
-            # 統計データと内容リファインの検査・修正履歴も生成物として初期化する．
+            # 統計データとリファイナーの検査・修正履歴も生成物として初期化する．
             # 設定・辞書を含むproject.jsonやpages/は削除しない．
             for statistics_file in paths.root.glob('statistics*'):
                 if statistics_file.is_file():
@@ -3434,7 +3482,7 @@ class SlideNarratorApp:
             # project.json やPDF，ユーザ別ジョブ履歴には触れない．
             for output in (paths.final_video, paths.final_ja_srt, paths.final_en_srt):
                 output.unlink(missing_ok=True)
-            # 完成動画と同じstemで生成される一時・派生出力も対象にする．
+            # 完成ビデオと同じstemで生成される一時・派生出力も対象にする．
             for output in paths.root.glob(f'{target_pdf.stem}*'):
                 if output.is_file():
                     output.unlink()
@@ -3450,7 +3498,7 @@ class SlideNarratorApp:
                                    completed_stages=[], progress=None, current_page=None,
                                    current_index=None, total_count=None,
                                    cancellation_requested=False)
-            self.append_job_log('[RESET] 生成データ・統計・内容リファイン履歴を削除しました（元PDF・設定・ページ画像は保持）')
+            self.append_job_log('[RESET] 生成データ・統計・リファイナー履歴を削除しました（元PDF・設定・ページ画像は保持）')
             await self.refresh_all()
             self.validation_view.refresh()
             self.time_refine_view.refresh()
@@ -3526,9 +3574,9 @@ class SlideNarratorApp:
         self._refresh_easy_action_visibility()
         if self._widget_available(self.easy_generate_button):
             self.set_button_enabled_visual(self.easy_generate_button, not value and not self.read_only)
-        if self._widget_available(self.easy_cancel_button):
+        if self._widget_available(self.cancel_button):
             self.set_button_enabled_visual(
-                self.easy_cancel_button,
+                self.cancel_button,
                 GLOBAL_EXECUTION_LOCK.is_locked()
                 and GLOBAL_EXECUTION_LOCK.current_user == self.username
                 and not self.cancellation_requested,
@@ -3621,10 +3669,18 @@ class SlideNarratorApp:
         first_idx = ORDERED_STAGES.index(from_stage)
         target_idx = ORDERED_STAGES.index(stage)
         stages_to_run = ORDERED_STAGES[first_idx:target_idx + 1]
-        # 起動ボタンに関係なく，①を実際に実行する場合はその直後にリファインする．
-        # ①が既に完了していて再実行しない場合はリファインも省略する．
-        pipeline_refine = ('explain' in stages_to_run
-                           and self._pipeline_auto_refine_enabled())
+        # 完了済み①は生成し直さない．再生成は「生成データを削除」から行う．
+        if 'explain' in stages_to_run and all(
+            self.paths.explanation(page).exists()
+            and self.paths.explanation(page).read_text(encoding='utf-8').strip()
+            for page in self.active_pages
+        ):
+            stages_to_run = [item for item in stages_to_run if item != 'explain']
+        if not stages_to_run:
+            safe_notify('指定された工程は完了済みです．', type='info')
+            self.current_task = None
+            return
+        from_stage = stages_to_run[0]
 
         lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"パイプライン ({stage})", self)
         if not lock_acquired:
@@ -3744,7 +3800,7 @@ class SlideNarratorApp:
                             self.update_job_status(
                                 'running', stage=run_stage,
                                 completed_stages=list(completed_stages),
-                                message=msg or ('完成動画を結合・生成中…' if phase == 'concat' else stage_message),
+                                message=msg or ('完成ビデオを結合・生成中…' if phase == 'concat' else stage_message),
                                 progress=max(0.0, min(1.0, float(frac))),
                                 current_page=p_num,
                                 llm_metrics=None, tts_metrics=None,
@@ -3803,12 +3859,6 @@ class SlideNarratorApp:
                     total_count=total_active_slides,
                 )
                 self.debounce_refresh_views((run_stage,))
-
-                if run_stage == 'explain' and pipeline_refine:
-                    current_phase = 'validation'
-                    await self._run_pipeline_auto_refine(completed_stages)
-                    if self.cancellation_requested:
-                        raise asyncio.CancelledError()
 
             if succeeded and not cancelled:
                 self.update_job_status(
@@ -3872,7 +3922,7 @@ class SlideNarratorApp:
         """時間調整終了後，独立した通常パイプラインのジョブを開始する．"""
         self._start_background_job(
             lambda: self._run_time_refine_pipeline(),
-            busy_message='時間調整後の動画生成はすでに実行中です．',
+            busy_message='時間調整後のビデオ生成はすでに実行中です．',
         )
 
     async def _run_time_refine_pipeline(self) -> None:
@@ -3888,7 +3938,7 @@ class SlideNarratorApp:
                 raise RuntimeError(f'時間調整後の原稿がありません（スライド {missing}）．')
             if self._determine_starting_stage('video') == 'explain':
                 raise RuntimeError('①の再実行が必要です．時間調整済み原稿を保護するため停止します．')
-            await self._pipeline_worker('video', '時間調整後の動画生成')
+            await self._pipeline_worker('video', '時間調整後のビデオ生成')
             status = read_user_job_status(self.username)
             if status.get('state') == 'cancelled':
                 raise asyncio.CancelledError()
@@ -3898,7 +3948,7 @@ class SlideNarratorApp:
             from validation.time_ui import duration
             result = await run.io_bound(duration, self.paths.final_video)
             if result is None:
-                raise RuntimeError('完成動画の時間を取得できませんでした．')
+                raise RuntimeError('完成ビデオの時間を取得できませんでした．')
             config = load_project_json(project_root)
             meta = config.get('time_refine', {})
             if isinstance(meta, dict):
@@ -4058,7 +4108,7 @@ class SlideNarratorApp:
                     pass
                 self.update_job_status('completed', message=f'スライド {page} のナレーション再生成完了', progress=1.0, finished_at=datetime.now().isoformat(timespec='seconds'))
                 self.append_job_log(f'[REGEN] 完了: 新しいナレーションを保存しました')
-                safe_notify('ナレーションを再生成しました（古い字幕・音声・動画を初期化しました）．', type='positive')
+                safe_notify('ナレーションを再生成しました（古い字幕・音声・ビデオを初期化しました）．', type='positive')
                 self._safe_view_update(self.poll_generated_outputs, '個別生成結果の差分更新')
         except asyncio.CancelledError:
             self.update_job_status('cancelled', message='ナレーション再生成を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
@@ -4081,9 +4131,8 @@ class SlideNarratorApp:
     async def _save_and_realign_worker(self, page: int, text: str, page_use_vlm: bool | None = None) -> None:
         if not self.write_access_allowed() or not self.pdf or not self.paths:
             return
-
         ep = self.paths.explanation(page)
-        atomic_write_text(ep, text.rstrip() + '\n')
+        old_text = ep.read_text(encoding='utf-8') if ep.exists() else None
 
         mode_str = ('vlm' if page_use_vlm else 'pdf') if page_use_vlm is not None else self.slide_visual_modes.get(str(page), 'vlm' if self.default_use_vlm else 'pdf')
         self.slide_visual_modes[str(page)] = mode_str
@@ -4098,6 +4147,7 @@ class SlideNarratorApp:
             safe_notify(f'他のユーザーが処理を実行中です．完了するまでお待ちください．', type='negative', duration=5)
             return
 
+        atomic_write_text(ep, text.rstrip() + '\n')
         mode_label = "VLM併用" if mode_str == 'vlm' else "PDF基準"
         self.update_job_status('running', stage='align', message=f'スライド {page} 解析中（{mode_label}）', progress=0.3, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'), finished_at=None, llm_metrics=None, tts_metrics=None, error_detail=None)
         self.append_job_log(f'[ALIGN] スライド {page} の要素抽出 ({mode_label}) と視線誘導を再計算中...')
@@ -4347,8 +4397,8 @@ class SlideNarratorApp:
                             play_button = ui.button(
                                 icon='play_circle',
                                 on_click=lambda _, page=n: self.show_video_dialog(
-                                    self.paths.video(page), f'スライド {page} の動画'),
-                            ).props('flat round dense color=positive').tooltip('このスライドの動画を再生')
+                                    self.paths.video(page), f'スライド {page} のビデオ'),
+                            ).props('flat round dense color=positive').tooltip('このスライドのビデオを再生')
                             play_button.on('click.stop', lambda _: None)
                             if not video_exists:
                                 play_button.classes(add='hidden')
@@ -4572,7 +4622,7 @@ class SlideNarratorApp:
                     for video_file in self.paths.root.glob('video/*.mp4'):
                         video_file.unlink(missing_ok=True)
                     self.paths.final_video.unlink(missing_ok=True)
-                    ui.notify('スライド設定を保存しました．反映には動画再生成が必要です．', type='positive')
+                    ui.notify('スライド設定を保存しました．反映にはビデオ再生成が必要です．', type='positive')
                 self.register_main_action_button(ui.button('保存', on_click=save_slide_pointer_mode).props('outline dense'))
 
             with ui.row().classes('w-full items-start gap-6 flex-nowrap'):
@@ -4687,7 +4737,7 @@ class SlideNarratorApp:
                     value=slide_prompt if isinstance(slide_prompt, str) else '',
                     placeholder='このスライドで特に説明したい内容や説明順序などを入力',
                 ).props('outlined autogrow').classes('w-full')
-                ui.label('保存した指示は一括生成と個別再生成の両方に適用されます．保存だけでは既存の原稿・音声・動画を変更しません．').classes('text-xs text-zinc-400')
+                ui.label('保存した指示は一括生成と個別再生成の両方に適用されます．保存だけでは既存の原稿・音声・ビデオを変更しません．').classes('text-xs text-zinc-400')
                 self.register_main_action_button(ui.button(
                     '💾 追加プロンプトを保存',
                     on_click=lambda: self.save_slide_prompt(page, prompt_area.value or ''),
@@ -4804,69 +4854,50 @@ class SlideNarratorApp:
             self.append_job_log(f'[STATISTICS ERROR] {type(exc).__name__}: {exc}')
             safe_notify(f'統計XLSXの作成に失敗しました: {exc}', type='negative')
 
-    def start_sidebar_time_refine(self, minutes: float | None) -> None:
-        """Use the existing time-refiner; no parallel sidebar worker."""
-        view = self.time_refine_view
-        seconds, reason = view._source()
-        if reason or seconds is None:
-            ui.notify(reason or '完成動画を確認できません．', type='warning')
-            return
-        try:
-            target = float(minutes)
-        except (TypeError, ValueError):
-            ui.notify('目標時間を入力してください．', type='warning')
-            return
-        if not 0 < target * 60 < seconds:
-            ui.notify('目標時間は現在の動画時間より短く設定してください．', type='warning')
-            return
-        if view.controls is None:
-            ui.notify('時間リファイン画面が初期化されていません．', type='negative')
-            return
-        view.target_minutes = target
-        view.start()
-
     async def refresh_final_video(self) -> None:
-        if not self._widget_available(self.final_video_container):
-            return
-        self.final_video_container.clear()
-        if not self.paths:
+        # 再生成時の差分検知と処理終了時の再描画が同時に走ることがある．
+        # これらを直列化し，毎回既存のリンクを消してから1組だけ描画する．
+        async with self._final_video_refresh_lock:
+            if not self._widget_available(self.final_video_container):
+                return
+            paths = self.paths
+            final = paths.final_video if paths else None
+            seconds = None
+            if final is not None and final.is_file():
+                from validation.time_ui import duration
+                seconds = await run.io_bound(duration, final)
+            if not self._widget_available(self.final_video_container):
+                return
+            # ffprobeの待機中にプロジェクトが変更された場合は古い結果を描画しない．
+            if paths is not self.paths:
+                return
+            self.final_video_container.clear()
+            duration_label = getattr(self, 'final_video_duration_label', None)
+            if self._widget_available(duration_label):
+                duration_label.text = ''
+            if final is None:
+                with self.final_video_container:
+                    ui.label('PDFを選択してください．').classes('text-xs text-zinc-500')
+                return
             with self.final_video_container:
-                ui.label('PDFを選択してください．').classes('text-xs text-zinc-500')
-            return
-
-        final = self.paths.final_video
-        with self.final_video_container:
-            if final.is_file():
-                ui.button('▶ 完成ビデオを再生',
-                          on_click=lambda: self.show_video_dialog(final, '完成ビデオ')) \
-                    .props('color=primary').classes('w-full')
-                # Download under the user-facing project name, e.g. Lecture_RF100m.mp4.
-                from urllib.parse import quote
-                display_name = self.project_display_name(self.pdf)
-                download_name = re.sub(r'[\\/\x00-\x1f\x7f]', '_', display_name).strip().rstrip('.') + '.mp4'
-                video_download_url = download_url(final) + '?filename=' + quote(download_name)
-                ui.button('MP4ダウンロード', icon='download',
-                          on_click=lambda url=video_download_url, name=download_name: ui.download(url, filename=name)) \
-                    .props('dense outline').classes('w-full')
-                # A concise entry point to the same time-refine workflow as the detail tab.
-                # Re-created with the completed-video panel on project changes.
-                if not self.read_only:
-                    secs, reason = self.time_refine_view._source()
-                    if secs is not None and not reason:
-                        ui.separator().classes('my-1')
-                        ui.label('解説時間の調整').classes('text-sm font-bold text-zinc-200')
-                        ui.label(f'現在の動画：約{secs / 60:.1f}分').classes('text-xs text-zinc-400')
-                        target_input = ui.number('目標時間（分）', min=1, max=1440, precision=1,
-                                                 value=None).props('outlined dense').classes('w-full')
-                        ui.label('新しいプロジェクトを作成して時間を調整します．元のプロジェクトと動画は変更されません．') \
-                            .classes('text-xs text-zinc-400')
-                        ui.label('現在の動画より短い時間を入力してください．詳細な短縮方針は「時間のリファイン」タブで設定できます．') \
-                            .classes('text-xs text-zinc-400')
-                        ui.button('解説時間の調整', icon='schedule',
-                                  on_click=lambda field=target_input: self.start_sidebar_time_refine(field.value)) \
-                            .props('outline color=primary').classes('w-full')
-            else:
-                ui.label('動画未生成').classes('text-xs text-zinc-500')
+                if final.is_file():
+                    from validation.time_ui import fmt
+                    if self._widget_available(duration_label):
+                        duration_label.text = (
+                            f'再生時間：{fmt(seconds)}' if seconds is not None else '再生時間：取得できません'
+                        )
+                    ui.button('▶ 完成ビデオを再生',
+                              on_click=lambda path=final: self.show_video_dialog(path, '完成ビデオ')) \
+                        .props('color=primary').classes('w-full')
+                    from urllib.parse import quote
+                    display_name = self.project_display_name(self.pdf)
+                    download_name = re.sub(r'[\\/\x00-\x1f\x7f]', '_', display_name).strip().rstrip('.') + '.mp4'
+                    video_download_url = download_url(final) + '?filename=' + quote(download_name)
+                    ui.button('MP4ダウンロード', icon='download',
+                              on_click=lambda url=video_download_url, name=download_name: ui.download(url, filename=name)) \
+                        .props('dense outline').classes('w-full')
+                else:
+                    ui.label('ビデオ未生成').classes('text-xs text-zinc-500')
 
     async def refresh_all(self) -> None:
         self._output_project_key = str(self.pdf.resolve()) if self.pdf else None
@@ -5663,18 +5694,18 @@ class SlideNarratorApp:
             (ja_base, ja_key, ja_model, ja_voice, ja_limit), (en_base, en_key, en_model, en_voice, en_limit) = self._build_tts_settings()
 
             with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-lg'):
-                ui.label('PDF・動画設定（システム共通）').classes('text-lg font-bold')
+                ui.label('PDF・ビデオ設定（システム共通）').classes('text-lg font-bold')
                 pdf_cfg = self.cfg.get('pdf', {})
                 video_cfg = self.cfg.get('video', {})
                 with ui.row().classes('w-full gap-3'):
                     pdf_dpi = ui.number('PDF DPI', value=pdf_cfg.get('dpi', 81), min=36, max=600, step=1).props('outlined').classes('w-40')
-                    video_fps = ui.number('動画 FPS', value=video_cfg.get('fps', 10), min=1, max=60, step=1).props('outlined').classes('w-40')
+                    video_fps = ui.number('ビデオ FPS', value=video_cfg.get('fps', 10), min=1, max=60, step=1).props('outlined').classes('w-40')
                     video_crf = ui.number('CRF（小さいほど高画質）', value=video_cfg.get('crf', 26), min=0, max=51, step=1).props('outlined').classes('w-52')
                 with ui.row().classes('w-full gap-3'):
                     video_preset = ui.select(['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], value=video_cfg.get('preset', 'veryfast'), label='エンコード preset').props('outlined').classes('w-52')
                     video_codec = ui.select(['aac', 'libmp3lame', 'ac3'], value=video_cfg.get('audio_codec', 'aac'), label='音声コーデック').props('outlined').classes('w-44')
                     video_bitrate = ui.select(['64k', '96k', '128k', '160k', '192k', '256k', '320k'], value=video_cfg.get('audio_bitrate', '96k'), label='音声ビットレート').props('outlined').classes('w-44')
-                ui.label('設定は次回の画像・動画生成から適用されます．既存の生成ファイルは自動再生成されません．').classes('text-xs text-zinc-400')
+                ui.label('設定は次回の画像・ビデオ生成から適用されます．既存の生成ファイルは自動再生成されません．').classes('text-xs text-zinc-400')
 
             def save_main_config() -> None:
                 """基本設定を保存し，結果を通知する．"""
@@ -5980,8 +6011,10 @@ class SlideNarratorApp:
                 ui.label('プロジェクト').classes('text-h6')
                 with ui.row().classes('items-center gap-1'):
                     add_project_button = ui.button(icon='add', on_click=lambda: self.uploader.run_method('pickFiles')).props('flat dense round size=sm')
+                    self.sidebar_busy_controls.append(add_project_button)
                     add_project_button.tooltip('PDFを追加して新しいプロジェクトを作成')
-                    with ui.button(icon='more_vert').props('flat dense round size=sm'):
+                    with ui.button(icon='more_vert').props('flat dense round size=sm') as project_menu_button:
+                        self.sidebar_busy_controls.append(project_menu_button)
                         with ui.menu():
                             ui.menu_item('名前を変更', on_click=self.request_rename_project).props('dense')
                             ui.menu_item('完全削除', on_click=self.request_delete_project).props('dense')
@@ -6024,6 +6057,7 @@ class SlideNarratorApp:
                 .props('outlined dense')
                 .on_value_change(lambda e: self._range_changed())
             )
+            self.sidebar_busy_controls.extend([self.mode_select, self.lang_select, self.pages_input])
             self.active_count_label = ui.label('対象スライド: 0 / 0 スライド')
             ui.separator().classes('w-full my-3')
             # モード名は独立したラベル1個で表示し，スイッチのlabel属性は使用しない．
@@ -6072,6 +6106,7 @@ class SlideNarratorApp:
                 ).props('outline dense').classes('w-full')
                 self.project_dict_audio_button.disable()
                 self.project_dict_audio_container = ui.column().classes('w-full')
+            self.sidebar_busy_controls.extend([self.project_prompt_save_button, self.project_dict_save_button, self.project_dict_audio_button])
             self.refresh_project_widgets()
 
             with ui.expansion('ポインタ画像・指示点', icon='ads_click').classes('w-full mt-2') as pointer_expansion:
@@ -6094,15 +6129,7 @@ class SlideNarratorApp:
                 self.pointer_default_select.on_value_change(lambda e: self._pointer_default_changed(e.value))
                 ui.label('スライド・文ごとの個別設定が優先されます．').classes('text-xs text-zinc-400')
 
-            with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2') as refine_settings_card:
-                self.advanced_sidebar_sections.append(refine_settings_card)
-                self.auto_refine_switch = ui.switch(
-                    '①原稿生成後に内容をリファインする',
-                    value=bool(self.proj_cfg.get('pipeline_auto_refine', True)),
-                ).props('dense color=primary')
-                self.auto_refine_switch.tooltip('①原稿生成後，3種類の検査を1回ずつ実行します．設定はEasy/Advanced共通で，切り替えても維持されます．')
-                self.auto_refine_switch.on_value_change(lambda e: self._auto_refine_changed(e.value))
-
+            self.sidebar_busy_controls.extend([self.default_vlm_switch, self.pointer_default_select])
             # Easyでは見出しと付随する区切り線を隠し，余白を残さない．
             self.pipeline_heading_separator = ui.separator()
             self.pipeline_heading_label = ui.label('パイプライン実行').classes('text-h6')
@@ -6118,12 +6145,7 @@ class SlideNarratorApp:
                 '全自動生成', icon='play_arrow',
                 on_click=lambda: self.handle_pipeline_button('video', '④ ナレーションビデオを作成中…', full_auto=True),
             ).props('color=primary').classes('w-full')
-            self.easy_generate_button.tooltip('必要な前工程から動画完成まで一括して実行します．')
-            self.easy_cancel_button = ui.button(
-                '中断', icon='stop', on_click=self.confirm_cancel,
-            ).props('outline color=negative').classes('w-full hidden')
-            self.easy_cancel_button.tooltip('実行中の生成処理に中断を要求します．')
-            self.easy_cancel_button.disable()
+            self.easy_generate_button.tooltip('必要な前工程からビデオ完成まで一括して実行します．')
             with ui.column().classes('w-full gap-2 rounded-lg p-2 bg-zinc-900 border border-zinc-800 hidden') as self.easy_progress_box:
                 self.easy_progress_label = ui.label('生成処理中…').classes('font-bold text-sm')
                 with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
@@ -6138,11 +6160,11 @@ class SlideNarratorApp:
 
             for key, label, initial_msg in STAGE_DEFINITIONS:
                 if key == 'align':
-                    # ①と②の間で実行する内容のリファインは，④の進捗欄を流用しない．
+                    # 手動検査の進捗を表示する独立した領域．
                     with ui.column().classes('w-full gap-1 px-2 py-2 rounded-lg bg-zinc-900 border border-zinc-800 hidden') as self.pipeline_refine_progress_box:
                         with ui.row().classes('w-full items-center gap-2'):
                             self.pipeline_refine_spinner = ui.spinner(size='xs', color='primary')
-                            ui.label('内容のリファイン').classes('text-sm font-bold')
+                            ui.label('リファイナー').classes('text-sm font-bold')
                         self.pipeline_refine_progress_label = ui.label('準備中…').classes('text-xs text-zinc-300 whitespace-pre-wrap')
                         self.pipeline_refine_progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=6px color=positive').classes('w-full')
                 with ui.column().classes('w-full gap-1 mb-2') as stage_row:
@@ -6180,6 +6202,9 @@ class SlideNarratorApp:
                 self.refine_sidebar_title = ui.label('処理状況').classes('font-bold text-sm text-blue-300')
                 self.refine_sidebar_project = ui.label('').classes('text-xs text-zinc-400')
                 self.refine_sidebar_detail = ui.label('').classes('text-xs whitespace-pre-wrap break-words')
+                self.refine_sidebar_slide_preview = ui.image('').classes('w-full rounded-md border border-zinc-700 object-contain')
+                self.refine_sidebar_slide_preview.visible = False
+                self._sidebar_slide_preview_source = None
                 self.refine_sidebar_elapsed = ui.label('').classes('hidden text-xs text-zinc-400')
                 self.refine_sidebar_metrics = ui.label('').classes('hidden text-xs text-zinc-300 whitespace-pre-wrap break-words')
                 with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
@@ -6187,11 +6212,18 @@ class SlideNarratorApp:
                     self.refine_sidebar_bar = ui.linear_progress(value=0, show_value=False).props('rounded size=8px color=primary').classes('flex-1 min-w-0')
             self.refine_sidebar_panel.visible = False
 
+            # 中断は共通進捗カードの直下に置く（Easy／Advanced共通）．
+            self.cancel_button = ui.button(
+                '中断', icon='stop', on_click=self.confirm_cancel,
+            ).props('outline color=negative').classes('w-full hidden')
+            self.cancel_button.tooltip('実行中のパイプライン処理に中断を要求します．')
+            self.cancel_button.disable()
+
             self.reset_generated_button = self.register_main_action_button(
                 ui.button('生成データを削除', icon='delete_outline', on_click=self.confirm_reset_generated_data)
                 .props('outline color=negative').classes('w-full mt-2')
             )
-            self.reset_generated_button.tooltip('元PDF，プロジェクト設定，ページ画像を残し，生成済みの原稿・字幕・音声・動画を削除します．')
+            self.reset_generated_button.tooltip('元PDF，プロジェクト設定，ページ画像を残し，生成済みの原稿・字幕・音声・ビデオを削除します．')
 
             self.set_sidebar_view_mode(self.view_mode)
 
@@ -6206,7 +6238,9 @@ class SlideNarratorApp:
                 self.pages_input.disable()
 
             ui.separator()
-            ui.label('🎬 完成ビデオ').classes('text-subtitle1 font-bold text-zinc-200')
+            with ui.row().classes('w-full items-center justify-between gap-2'):
+                ui.label('🎬 完成ビデオ').classes('text-subtitle1 font-bold text-zinc-200')
+                self.final_video_duration_label = ui.label('').classes('text-xs text-zinc-400')
             self.final_video_container = ui.column().classes('w-full gap-2')
             ui.separator()
             ui.label('TAKAGO LAB., KIT, Japan.').classes('text-caption')
@@ -6226,6 +6260,8 @@ class SlideNarratorApp:
                     self._tab_edit = tab_edit
                     tab_validation = ui.tab('✨ リファイナー').props('id=na-refine-main-tab')
                     self._tab_validation = tab_validation
+                    tab_time_refine = ui.tab('⏱ 再生時間の調整').props('id=na-video-length-tab')
+                    self._tab_time_refine = tab_time_refine
                 tab_statistics = ui.tab('📊 統計')
                 tab_logs = ui.tab('📜 ログ')
                 self._tab_logs = tab_logs
@@ -6248,27 +6284,16 @@ class SlideNarratorApp:
                     with ui.tab_panel(tab_edit):
                         self.edit_container = ui.column().classes('w-full')
                     with ui.tab_panel(tab_validation):
-                        # リファイナーの詳細操作は任意．通常の生成・時間調整はサイドバーから実行できる．
                         with ui.column().classes('w-full rounded-lg bg-slate-800/40 border border-slate-700 p-4 gap-1'):
-                            ui.label('ナレーション原稿の内容と解説時間を調整します．').classes('text-sm font-semibold')
-                            ui.label('通常はこのタブを操作する必要はありません．').classes('text-sm text-slate-300')
-                            ui.label('・内容のリファイン：サイドバーの設定がONの場合，①原稿生成の直後に自動実行されます．設定の変更はAdvancedモードで行えます．').classes('text-sm text-slate-300')
-                            ui.label('・時間のリファイン：完成動画はサイドバーの「解説時間の調整」から調整できます．調整後は新しいプロジェクトとして作成され，元の動画は保持されます．').classes('text-sm text-slate-300')
-                            ui.label('調整前後の解説時間やナレーションの変更内容は，「統計」タブではなく，「時間のリファイン」タブで確認できます．').classes('text-sm text-slate-300')
-                            ui.label('このタブでは，検査結果の確認や調整条件の指定など，詳しい操作を行えます．').classes('text-sm text-slate-300')
-                        with ui.tabs().classes('w-full') as refine_tabs:
-                            self._refine_tabs = refine_tabs
-                            refine_content = ui.tab('内容のリファイン（解説と展開の改善）').props('id=na-refine-content-tab')
-                            refine_time = ui.tab('時間のリファイン（再生時間の最適化）').props('id=na-refine-time-tab')
-                            self._refine_content_tab = refine_content
-                            self._refine_time_tab = refine_time
-                        with ui.tab_panels(refine_tabs, value=refine_content).classes('w-full') as refine_tab_panels:
-                            self._refine_tab_panels = refine_tab_panels
-                            with ui.tab_panel(refine_content):
-                                self.validation_view.build()
-                            with ui.tab_panel(refine_time):
-                                self.time_refine_view.build()
-                        refine_time.on('click', lambda _: self.time_refine_view.refresh())
+                            ui.label('ナレーション原稿の品質を検査・修正します．').classes('text-sm font-semibold')
+                            ui.label('①の生成後など，必要なときに「検査を開始」を押してください．生成工程とは独立した手動操作です．').classes('text-sm text-slate-300')
+                            ui.label('ルール検査の指摘は自動再生成せず，ほかの自動校正を終えた後に手動修正を求めます．').classes('text-sm text-slate-300')
+                            ui.label('結果は「統計」ではなく，この「リファイナー」タブで確認できます．').classes('text-sm text-slate-300')
+                        self.validation_view.build()
+                    with ui.tab_panel(tab_time_refine):
+                        self.time_refine_view.build()
+                    tab_time_refine.on('click', lambda _: self.time_refine_view.refresh())
+                    tab_validation.on('click', lambda _: self.validation_view.render_results())
                 with ui.tab_panel(tab_statistics):
                     ui.label('📊 スライド別生成統計').classes('text-h5')
                     ui.label('工程別：ナレーション生成（画像・テキスト解析）／Bbox検出（スライド要素の位置検出）／字幕用翻訳／ポインタ位置選定／TTSヨミ変換').classes('text-caption text-slate-400')
@@ -6338,6 +6363,7 @@ class SlideNarratorApp:
                     mapping[tab_simple_edit.name] = 'simple'
                     mapping[tab_edit.name] = 'detail'
                     mapping[tab_validation.name] = 'validation'
+                    mapping[tab_time_refine.name] = 'time_refine'
                 self.refresh_output_views_on_tab_change(mapping.get(getattr(e.value, 'name', e.value), 'other'))
 
             tabs.on_value_change(handle_tab_change)
@@ -6346,7 +6372,8 @@ class SlideNarratorApp:
             if not self.read_only:
                 tab_simple_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('simple'))
                 tab_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('detail'))
-                tab_validation.on('click', lambda _: (self.validation_view.refresh(), self.time_refine_view.refresh()))
+                tab_validation.on('click', lambda _: self.validation_view.refresh())
+                tab_time_refine.on('click', lambda _: self.time_refine_view.refresh())
 
     def build(self) -> None:
         ui.page_title('NarrationAutomata')
@@ -6401,53 +6428,6 @@ class SlideNarratorApp:
         background_tasks.create(self.refresh_simple_editor())
         background_tasks.create(self.refresh_editor())
 
-    def _auto_refine_changed(self, enabled: bool) -> None:
-        """プロジェクト共通のリファイン設定．表示モードには依存しない．"""
-        if not self.write_access_allowed() or not self.paths:
-            return
-        if bool(self.proj_cfg.get('pipeline_auto_refine', True)) == bool(enabled):
-            return
-        self.proj_cfg['pipeline_auto_refine'] = bool(enabled)
-        self.save_project_settings()
-
-    def _pipeline_auto_refine_enabled(self) -> bool:
-        return bool(self.proj_cfg.get('pipeline_auto_refine', True))
-
-    async def _run_pipeline_auto_refine(self, completed_stages: list[str]) -> None:
-        """①の直後に1周実行．共通runnerはジョブとロックを所有しない．"""
-        self.append_job_log('=== 内容のリファイン 開始（3検査，各1回） ===')
-        self.update_job_status('running', stage='validation', completed_stages=list(completed_stages),
-                               message='内容のリファインを開始します', progress=0.0)
-
-        def report(message: str, *, page=None, index=None, total=None, progress=None, stage='validation') -> None:
-            self.append_job_log(message)
-            self.update_job_status('running', stage='validation',
-                                   completed_stages=list(completed_stages), message=message,
-                                   current_page=page, current_index=index,
-                                   total_count=total, progress=progress)
-
-        def refresh() -> None:
-            # 履歴を保存した後に結果タブが開いていれば更新する．
-            self._safe_view_update(self.validation_view.render_results, 'リファイン履歴更新')
-
-        state = await run_auto_refiner(
-            self, ('rules', 'individual', 'overall'), 1,
-            atomic_write_text, report=report, notify_change=refresh,
-        )
-        if self.cancellation_requested or not state.get('completed'):
-            raise asyncio.CancelledError()
-        errors = [f for f in state.get('findings', []) if f.get('kind') == 'check_error']
-        errors.extend(row for row in state.get('auto_refiner', {}).get('history', [])
-                      if str(row.get('status', '')).startswith('失敗：'))
-        if errors:
-            raise RuntimeError(f'内容のリファインで検査・修正エラーが{len(errors)}件発生しました')
-        remaining = len({int(f['page']) for f in state.get('findings', []) if 'page' in f})
-        message = f'内容のリファイン完了（1周，残り指摘：{remaining}スライド）'
-        self.append_job_log(message)
-        validation_log(self.paths.root, message)
-        self.update_job_status('running', stage='validation',
-                               completed_stages=list(completed_stages), message=message, progress=1.0)
-
     def _default_vlm_changed(self, value: bool) -> None:
         if not self.write_access_allowed():
             return
@@ -6469,7 +6449,7 @@ class SlideNarratorApp:
         for video_file in self.paths.root.glob('video/*.mp4'):
             video_file.unlink(missing_ok=True)
         self.paths.final_video.unlink(missing_ok=True)
-        ui.notify('ポインタモードを保存しました．動画再生成で反映されます．', type='positive')
+        ui.notify('ポインタモードを保存しました．ビデオ再生成で反映されます．', type='positive')
 
     def _range_changed(self) -> None:
         if not self.write_access_allowed():

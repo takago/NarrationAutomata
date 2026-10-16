@@ -123,7 +123,7 @@ def shorten(client, cfg: dict, page: int, narration: str, fraction: float,
     if image is None or not image.is_file():
         raise FileNotFoundError(f'スライド #{page} の画像が見つかりません：{image}')
     image_content = {'type': 'image_url', 'image_url': {'url': image_data_url(image)}}
-    response = stream_chat(client, task='時間リファイン（短縮）', model=cfg['model'],
+    response = stream_chat(client, task='再生時間の調整（短縮）', model=cfg['model'],
                            temperature=0.2, messages=[
                                {'role':'system', 'content':instruction},
                                {'role':'user', 'content':[
@@ -137,7 +137,7 @@ def shorten(client, cfg: dict, page: int, narration: str, fraction: float,
     if phase_callback is not None:
         phase_callback('内容保持確認中')
     # Reject shortened narrations that omit essential claims or change their meaning.
-    review = stream_chat(client, task='時間リファイン（内容保持確認）', model=cfg['model'],
+    review = stream_chat(client, task='再生時間の調整（内容保持確認）', model=cfg['model'],
                          temperature=0.0, messages=[
                              {'role':'system', 'content':
                               '講義原稿の短縮前後と添付スライド画像を比較してください．画像中の重要な図表，コード，数式も考慮し，重要な技術的条件，結論，理解に必須の説明が'
@@ -199,8 +199,8 @@ def export_refine_excel(path: Path, metadata: dict, rows: list[dict]) -> None:
     wb = Workbook()
     summary = wb.active
     summary.title = '概要'
-    summary.append(['時間リファイン結果', '値'])
-    for label, key in [('元の動画時間（分）', 'original_seconds'),
+    summary.append(['再生時間の調整結果', '値'])
+    for label, key in [('元のビデオ時間（分）', 'original_seconds'),
                        ('目標時間（分）', 'target_seconds'),
                        ('完成時間（分）', 'result_seconds')]:
         value = metadata.get(key)
@@ -251,8 +251,8 @@ class TimeRefineView:
         self._shown_busy = None
 
     def build(self):
-        ui.label('時間のリファイン').classes('text-h5')
-        ui.label('完成動画の再生時間を基準に，短縮版を新規プロジェクトとして全自動生成します．元のプロジェクトは変更しません．').classes('text-caption text-slate-400')
+        ui.label('再生時間の調整').classes('text-h5')
+        ui.label('完成ビデオの再生時間を基準に，短縮版を新規プロジェクトとして全自動生成します．元のプロジェクトは変更しません．').classes('text-caption text-slate-400')
         self.controls = ui.column().classes('w-full gap-3')
         self.target_input = None
         self.start_button = None
@@ -302,12 +302,12 @@ class TimeRefineView:
         if paths is None or self.owner.pdf is None:
             return None, '先にプロジェクトを選択してください．'
         if not paths.final_video.is_file():
-            return None, '動画が完成している必要があります．先に動画生成を完了してください．'
+            return None, 'ビデオが完成している必要があります．先にビデオ生成を完了してください．'
         if any(not paths.explanation(p).is_file() for p in self.owner.active_pages):
             return None, '全対象スライドのナレーションが必要です．先に原稿を生成してください．'
         secs = duration(paths.final_video)
         if secs is None:
-            return None, '完成動画の再生時間を取得できません．ffprobeと動画ファイルを確認してください．'
+            return None, '完成ビデオの再生時間を取得できません．ffprobeとビデオファイルを確認してください．'
         return secs, ''
 
     def refresh(self):
@@ -325,14 +325,14 @@ class TimeRefineView:
         self.update_result()
         with self.controls:
             if self.busy:
-                ui.label('時間リファイン実行中').classes('text-blue-300 font-bold text-sm')
+                ui.label('再生時間の調整実行中').classes('text-blue-300 font-bold text-sm')
                 snapshot = refine_job.read(self.owner.paths.root, 'time') if self.owner.paths else {}
                 target_seconds = snapshot.get('target_seconds')
                 if target_seconds is None and self.target_minutes is not None:
                     target_seconds = self.target_minutes * 60
                 if target_seconds is not None:
                     ui.label(f'目標時間：{float(target_seconds) / 60:.1f}分').classes('text-sm text-slate-300')
-                stop_button = ui.button('時間リファインを中断', icon='stop', on_click=self.request_stop).props('outline color=negative')
+                stop_button = ui.button('再生時間の調整を中断', icon='stop', on_click=self.request_stop).props('outline color=negative')
                 if self.stop_requested:
                     stop_button.disable()
                     ui.label('中断要求を受け付けました．現在の処理の終了後に停止します．').classes('text-orange-300 text-sm')
@@ -340,7 +340,7 @@ class TimeRefineView:
                 if reason:
                     ui.label(reason).classes('text-orange-300')
                 elif secs is not None:
-                    ui.label(f'現在の動画時間：約{secs / 60:.1f}分').classes('font-bold')
+                    ui.label(f'現在のビデオ時間：約{secs / 60:.1f}分').classes('font-bold')
                 with ui.row().classes('items-center gap-3 flex-wrap'):
                     self.target_input = ui.number('目標時間（分）', value=self.target_minutes, min=1, max=1440, precision=1,
                                                   on_change=self._set_target).props('outlined dense').classes('w-44')
@@ -357,11 +357,11 @@ class TimeRefineView:
                                  0 < self.target_minutes * 60 < secs and
                                  not self.busy and not self.owner.processing and
                                  not self.lock.is_locked() and not self.owner.read_only)
-                self.start_button = ui.button('新しいプロジェクトとして時間リファインを開始', icon='content_copy', on_click=self.start).props('outline')
+                self.start_button = ui.button('新しいプロジェクトとして再生時間の調整を開始', icon='content_copy', on_click=self.start).props('outline')
                 if not can_start:
                     self.start_button.disable()
-                ui.label('実行条件：完成動画・原稿が存在し，ほかの生成処理が実行されていないこと．').classes('text-xs text-slate-400')
-                ui.label('目標時間は必須です．現在の動画より短い時間を指定してください．').classes('text-xs text-slate-400')
+                ui.label('実行条件：完成ビデオ・原稿が存在し，ほかの生成処理が実行されていないこと．').classes('text-xs text-slate-400')
+                ui.label('目標時間は必須です．現在のビデオより短い時間を指定してください．').classes('text-xs text-slate-400')
                 ui.label('目標時間は上限の目安です．情報を保持できない場合，目標未達でも停止します．').classes('text-xs text-slate-400')
 
     def restore_progress(self):
@@ -383,7 +383,7 @@ class TimeRefineView:
             if self.progress_panel is not None:
                 self.progress_panel.visible = True
             try:
-                self.progress_title.text = snapshot.get('title', '時間リファイン')
+                self.progress_title.text = snapshot.get('title', '再生時間の調整')
                 self.progress_detail.text = snapshot.get('detail', '')
                 self.status.text = snapshot.get('message', '')
                 self.step_log_lines = list(snapshot.get('log', []))[-300:]
@@ -423,14 +423,14 @@ class TimeRefineView:
         after = sum(r['after'] or 0 for r in rows)
         with self.result_container:
             ui.separator()
-            ui.label('時間リファイン結果').classes('text-h6')
+            ui.label('再生時間の調整結果').classes('text-h6')
             state = meta.get('state', '不明')
             ui.label(f'状態：{state} ／ 短縮前 {before:,}字 → 現在 {after:,}字'
                      f'（削減率 {(1 - after/before)*100:.1f}%）' if before else f'状態：{state}').classes('text-sm')
             first = meta.get('original_seconds')
             target = meta.get('target_seconds')
             last = meta.get('result_seconds')
-            ui.label('動画時間：元 {:.1f}分 ／ 目標 {:.1f}分 ／ 完成 {}'.format(
+            ui.label('ビデオ時間：元 {:.1f}分 ／ 目標 {:.1f}分 ／ 完成 {}'.format(
                 first/60 if first else 0, target/60 if target else 0,
                 f'{last/60:.1f}分' if last is not None else '未完成')).classes('text-sm')
             max_chars = max([r['before'] for r in rows] + [r['after'] or 0 for r in rows] + [1])
@@ -471,7 +471,7 @@ class TimeRefineView:
             }
             ui.echart(ratio_options).classes('w-full h-64')
             ui.label('各スライドの短縮結果はExcelのスライド別明細で確認できます．').classes('text-xs text-slate-400')
-            ui.button('リファイン結果をExcelダウンロード', icon='download',
+            ui.button('調整結果をExcelダウンロード', icon='download',
                       on_click=self.download_result).props('outline dense')
 
     def download_result(self):
@@ -481,7 +481,7 @@ class TimeRefineView:
             return
         meta = load_project_json(paths.root).get('time_refine')
         if not isinstance(meta, dict):
-            ui.notify('時間リファインの結果がありません．', type='warning')
+            ui.notify('再生時間の調整の結果がありません．', type='warning')
             return
         result = paths.root / 'time_refine_result.xlsx'
         try:
@@ -548,7 +548,7 @@ class TimeRefineView:
         if not self.owner.write_access_allowed():
             return
         if self.target_minutes is None or not 0 < self.target_minutes * 60 < seconds:
-            ui.notify('目標時間は現在の動画時間より短く設定してください．', type='warning')
+            ui.notify('目標時間は現在のビデオ時間より短く設定してください．', type='warning')
             return
         self.busy = True
         self._source_project = self.owner.paths.root
@@ -605,7 +605,7 @@ class TimeRefineView:
         # Preserve originating slot only while the client exists; subsequent
         # UI mutations must be best-effort and project state remains authoritative.
         if self.controls is None:
-            raise RuntimeError('時間リファイン画面が初期化されていません．')
+            raise RuntimeError('再生時間の調整画面が初期化されていません．')
         with self.controls:
             await self._worker_with_ui_slot(baseline, target, policies)
 
@@ -669,7 +669,7 @@ class TimeRefineView:
                 self._progress('ナレーション短縮', f'0 / {len(pages)} 枚完了', fraction=0)
                 # Exclusive access only for the revision phase. The existing video
                 # pipeline acquires the same lock on its own below.
-                acquired = await self.lock.acquire(owner.username, '時間リファイン（原稿短縮）', owner)
+                acquired = await self.lock.acquire(owner.username, '再生時間の調整（原稿短縮）', owner)
                 if not acquired:
                     raise RuntimeError('別のジョブが実行中です')
                 modified = []
@@ -758,12 +758,12 @@ class TimeRefineView:
                 new_cfg = load_project_json(owner.paths.root)
                 new_cfg['time_refine']['state'] = 'pipeline_pending'
                 save_project_json(owner.paths.root, new_cfg)
-                self._message('原稿の時間調整が完了しました．②〜④を通常パイプラインへ引き継ぎます．')
-                self._progress('原稿の時間調整完了', '通常パイプラインへ引き継ぎます…', fraction=1)
-                self._persist(state='completed', title='原稿の時間調整完了',
+                self._message('再生時間の調整が完了しました．②〜④を通常パイプラインへ引き継ぎます．')
+                self._progress('再生時間の調整完了', '通常パイプラインへ引き継ぎます…', fraction=1)
+                self._persist(state='completed', title='再生時間の調整完了',
                               detail='通常パイプラインへ引き継ぎ', fraction=1, indeterminate=False)
                 handoff_to_pipeline = True
-            self._safe_ui(lambda: ui.notify('原稿の時間調整が完了しました．通常生成を開始します．', type='info'))
+            self._safe_ui(lambda: ui.notify('再生時間の調整が完了しました．通常生成を開始します．', type='info'))
         except asyncio.CancelledError:
             if new_dir is not None and new_dir.is_dir():
                 try:
@@ -774,9 +774,9 @@ class TimeRefineView:
                         save_project_json(cancelled_root, cancelled_cfg)
                 except Exception:
                     pass
-            self._message('時間リファインを中断しました．コピー元は変更されていません．新規プロジェクトは途中状態で残ります．')
+            self._message('再生時間の調整を中断しました．コピー元は変更されていません．新規プロジェクトは途中状態で残ります．')
             self._persist(state='cancelled')
-            self._progress('時間リファイン中断', '元のプロジェクトは変更されていません．', fraction=0)
+            self._progress('再生時間の調整中断', '元のプロジェクトは変更されていません．', fraction=0)
         except Exception as exc:
             if new_dir is not None and new_dir.is_dir():
                 try:
@@ -788,9 +788,9 @@ class TimeRefineView:
                         save_project_json(current_root, failure_cfg)
                 except Exception:
                     pass
-            self._message(f'時間リファインに失敗しました：{type(exc).__name__}: {exc}')
+            self._message(f'再生時間の調整に失敗しました：{type(exc).__name__}: {exc}')
             self._persist(state='failed')
-            self._progress('時間リファイン失敗', f'{type(exc).__name__}: {exc}', fraction=0)
+            self._progress('再生時間の調整失敗', f'{type(exc).__name__}: {exc}', fraction=0)
             self._safe_ui(lambda: ui.notify(str(exc), type='negative'))
         finally:
             self.update_result()
@@ -804,6 +804,6 @@ class TimeRefineView:
             self.stop_requested = False
             self._safe_ui(self.refresh)
             if handoff_to_pipeline:
-                # リファインの登録・表示状態を閉じてから別ジョブを起動する．
+                # 再生時間調整の登録・表示状態を閉じてから別ジョブを起動する．
                 # 通常の②〜④が自身のロックとキャンセル管理を取得する．
                 owner.start_time_refine_pipeline()

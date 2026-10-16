@@ -8,6 +8,11 @@ from typing import Any
 
 ACTIVE: dict[tuple[str, str], Any] = {}
 
+
+class PipelineContentRefine:
+    """Marker for an automatic content refinement owned by the pipeline."""
+
+
 def key(username: str, project: Path) -> tuple[str, str]:
     return (username, str(Path(project).resolve()))
 

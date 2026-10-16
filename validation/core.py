@@ -50,7 +50,14 @@ def _ask(client, cfg: dict, *, task: str, messages: list[dict]) -> str:
     result = stream_chat(client, task=task, model=cfg['model'],
                          temperature=0.15, messages=messages,
                          **reasoning_extra_kwargs(cfg.get('reasoning_effort', 'none')))
-    return result.choices[0].message.content.strip()
+    # Some OpenAI-compatible backends return content=None while emitting only reasoning.
+    # Report a meaningful response error instead of an AttributeError on .strip().
+    choices = getattr(result, 'choices', None)
+    message = getattr(choices[0], 'message', None) if choices else None
+    content = getattr(message, 'content', None)
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError(f'{task}：LLMの回答本文が空です（content=Noneまたは空文字列）')
+    return content.strip()
 
 
 def individual_check(client, cfg: dict, page: int, text: str, image: Path | None,
