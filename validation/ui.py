@@ -9,11 +9,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from nicegui import ui, run
+from nicegui import ui, run, background_tasks
 from statistics_store import run_with_statistics
 from slide_lecture import make_client, generate_single_explanation
 from .core import rule_check, individual_check, overall_check, synthesis_check, correct, regeneration_valid
 from .store import STAGES, digest, load, log, save
+from . import refine_job
 
 STAGE_DESCRIPTIONS = {
     'rules': '思考タグ・特殊トークン・空文などの形式異常を全スライドから検出',
@@ -36,12 +37,15 @@ class ValidationView:
         self.busy = False
         self.controls = None
         self.progress = None
+        self.running_spinner = None
         self.bar = None
         self.results = None
         self.selection = {s: True for s in STAGES}
         self.auto_refiner = True
         self.max_rounds = 3
         self._project_key = None
+        self._running_project = None
+        self._last_status = None
         self._drafts: dict[int, str] = {}
         self._originals: dict[int, str] = {}
         self._open_page = None
@@ -51,6 +55,7 @@ class ValidationView:
         self._edit_bar = None
         self._diff_panels: dict[int, tuple[Any, Any]] = {}
         self._diff_tasks: dict[int, asyncio.Task] = {}
+        self._shown_busy = None
 
     def build(self):
         ui.label('内容のリファイン').classes('text-h5')
@@ -61,13 +66,31 @@ class ValidationView:
             .validation-narration-diff > div { height: 300px; max-height: 300px; overflow-y: auto; line-height: 1.55; }
         ''')
         self.controls = ui.column().classes('w-full gap-3')
-        self.progress = ui.label('検査待機中').classes('text-sm text-slate-400')
+        with ui.row().classes('items-center gap-2'):
+            self.running_spinner = ui.spinner(size='sm')
+            self.running_spinner.visible = False
+            self.progress = ui.label('検査待機中').classes('text-sm text-slate-400')
         self.bar = ui.linear_progress(value=0, show_value=False).classes('w-full')
         self._edit_status = ui.label('').classes('text-sm text-slate-400')
         self._edit_bar = ui.linear_progress(value=0, show_value=False).classes('w-full')
         self._edit_bar.set_visibility(False)
         self.results = ui.column().classes('w-full gap-2')
         self.refresh()
+        ui.timer(1.0, self._sync_controls_on_state_change)
+
+    def _sync_controls_on_state_change(self):
+        """Restore configuration controls when a server-side job finishes."""
+        if self.controls is None or getattr(self.controls, "is_deleted", False):
+            return
+        project = self.owner.paths.root if self.owner.paths else None
+        live = refine_job.running(self.owner.username, project) if project else None
+        if not isinstance(live, ValidationView):
+            live = None
+        active = live is not None
+        if self.running_spinner is not None:
+            self.running_spinner.visible = active
+        if active != self._shown_busy:
+            self.refresh()
 
     def refresh(self):
         project = self.owner.paths.root if self.owner.paths else None
@@ -80,34 +103,85 @@ class ValidationView:
             self._open_page = None
         if self.controls is None:
             return
+        # Determine the live state *before* rebuilding the controls.
+        self.restore_progress()
+        self._shown_busy = self.busy
         self.controls.clear()
+        self._start_button = None
         with self.controls:
             if project is None:
                 ui.label('プロジェクトを選択してください．')
                 self.results.clear()
                 return
-            with ui.row().classes('items-center gap-4'):
-                ui.switch('オートリファイナー', value=self.auto_refiner, on_change=lambda e: setattr(self, 'auto_refiner', bool(e.value)))
-                ui.number('最大周回数', value=self.max_rounds, min=1, max=10, step=1, precision=0, on_change=lambda e: setattr(self, 'max_rounds', max(1, min(10, int(e.value or 1))))).props('dense outlined').classes('w-32')
-            for stage in STAGES:
-                with ui.row().classes('w-full items-center gap-3'):
-                    ui.checkbox(STAGE_NAMES[stage], value=self.selection[stage],
-                                on_change=lambda e, s=stage: self.selection.__setitem__(s, bool(e.value)))
-                    ui.label(STAGE_DESCRIPTIONS[stage]).classes('text-xs text-slate-400')
-            self._start_button = ui.button('検査を開始', icon='play_arrow', on_click=self.start).props('outline').bind_enabled_from(self, 'busy', backward=lambda value: not value)
-            ui.label('実行時に前回の検査結果をすべて破棄します．検査中は閲覧のみ可能です．').classes('text-caption text-slate-400')
+            if self.busy:
+                ui.label('内容リファイン実行中').classes('text-blue-300 font-bold text-sm')
+                ui.button('内容リファインを中断', icon='stop', on_click=self.owner.request_cancel).props('outline color=negative')
+            else:
+                with ui.row().classes('items-center gap-4'):
+                    ui.switch('オートリファイナー', value=self.auto_refiner, on_change=lambda e: setattr(self, 'auto_refiner', bool(e.value)))
+                    ui.number('最大周回数', value=self.max_rounds, min=1, max=10, step=1, precision=0, on_change=lambda e: setattr(self, 'max_rounds', max(1, min(10, int(e.value or 1))))).props('dense outlined').classes('w-32')
+                for stage in STAGES:
+                    with ui.row().classes('w-full items-center gap-3'):
+                        ui.checkbox(STAGE_NAMES[stage], value=self.selection[stage],
+                                    on_change=lambda e, s=stage: self.selection.__setitem__(s, bool(e.value)))
+                        ui.label(STAGE_DESCRIPTIONS[stage]).classes('text-xs text-slate-400')
+                self._start_button = ui.button('検査を開始', icon='play_arrow', on_click=self.start).props('outline').bind_enabled_from(self, 'busy', backward=lambda value: not value)
+                ui.label('実行時に前回の検査結果をすべて破棄します．検査中は閲覧のみ可能です．').classes('text-caption text-slate-400')
+        self.restore_progress()
         self.render_results()
+
+    def restore_progress(self):
+        project = self.owner.paths.root if self.owner.paths else None
+        if project is None or self.progress is None:
+            return
+        snapshot = refine_job.read(project, "content")
+        live = refine_job.running(self.owner.username, project)
+        if not isinstance(live, ValidationView):
+            live = None
+        self.busy = live is not None or (self._running_project == project and self.busy)
+        if self.running_spinner is not None:
+            self.running_spinner.visible = self.busy
+        if snapshot:
+            self.progress.text = snapshot.get("message", "検査待機中")
+            self._progress_value = snapshot.get("progress") or 0.0
+            self.bar.value = self._progress_value
+        if self._start_button is not None:
+            self._start_button.set_enabled(not self.busy and not self.owner.processing and not self.execution_lock.is_locked())
+
+    def _safe_render_results(self):
+        try:
+            if self.results is not None and not getattr(self.results, "is_deleted", False):
+                self.render_results()
+        except Exception:
+            pass  # A detached client must never interrupt a server worker.
 
     def _pages(self):
         if not self.owner.paths:
             return []
-        return sorted(int(p.stem) for p in self.owner.paths.explanations_dir.glob('[0-9]*.txt') if p.stem.isdigit())
+        # 検査するのは，ビデオ化対象として選択されたスライドのみ．
+        # 原稿がまだ存在しないページは従来どおり対象外とする．
+        active = set(self.owner.active_pages)
+        return sorted(
+            int(p.stem)
+            for p in self.owner.paths.explanations_dir.glob('[0-9]*.txt')
+            if p.stem.isdigit() and int(p.stem) in active
+        )
 
     def _status(self, text, *, page=None, index=None, total=None, progress=None, stage='validation'):
-        self.progress.text = text
+        try:
+            if self.progress is not None and not getattr(self.progress, "is_deleted", False):
+                self.progress.text = text
+        except Exception:
+            pass
         if progress is not None:
             self._progress_value = min(1.0, max(0.0, progress))
-            self.bar.value = self._progress_value
+            try:
+                if self.bar is not None and not getattr(self.bar, "is_deleted", False):
+                    self.bar.value = self._progress_value
+            except Exception:
+                pass
+        if self._running_project is not None:
+            refine_job.write(self._running_project, "content", state="running", message=text, progress=self._progress_value, stage=stage, page=page)
         # index/total are inspection work units, not slide numbers.
         # Keep them for the inspection progress bar, but report actual slide
         # counts to the shared sidebar status display.
@@ -134,17 +208,28 @@ class ValidationView:
             ui.notify('未保存の編集があります．先に保存するか「元に戻す」を押してください．', type='warning')
             return
         self.busy = True  # タスクの起動を待たずにボタンを無効化する
+        self._running_project = self.owner.paths.root
+        refine_job.register(self.owner.username, self._running_project, self)
+        refine_job.write(self._running_project, "content", state="running", message="検査を開始しています", progress=0.0)
         if self._start_button is not None:
             self._start_button.disable()
-        asyncio.create_task(self._auto_worker(stages, self.max_rounds) if self.auto_refiner else self._worker(stages))
+        self.owner.current_task = background_tasks.create(
+            self._auto_worker(stages, self.max_rounds) if self.auto_refiner else self._worker(stages),
+            name="content-refine")
+        self.refresh()
 
     async def _worker(self, stages):
         owner = self.owner
         if not await self.execution_lock.acquire(owner.username, 'ナレーション品質検査', owner):
             self.busy = False
-            if self._start_button is not None:
-                self._start_button.enable()
-            ui.notify('ほかのユーザの処理が実行中です．', type='warning')
+            try:
+                if self._start_button is not None and not getattr(self._start_button, "is_deleted", False):
+                    self._start_button.enable()
+            except Exception:
+                pass
+            refine_job.write(self._running_project, 'content', state='failed', message='ほかのユーザの処理が実行中です．')
+            refine_job.unregister(owner.username, self._running_project, self)
+            self._running_project = None
             return
         self.busy = True
         owner.set_processing(True)
@@ -157,7 +242,7 @@ class ValidationView:
         self._open_page = None
         state = {'findings': [], 'stages': {}, 'completed': False}
         save(project, state)
-        self.render_results()
+        self._safe_render_results()
         total_units = sum(len(pages) if s != 'overall' else (len(pages)+7)//8+1 for s in stages)
         done = 0
         seen = set()
@@ -184,7 +269,7 @@ class ValidationView:
                 changed = True
             if changed:
                 save(project, state)
-                self.render_results()
+                self._safe_render_results()
 
         try:
             for stage in stages:
@@ -252,26 +337,36 @@ class ValidationView:
             state['completed'] = not owner.cancellation_requested
             save(project, state)
             message = '検査を中断しました（途中結果）．' if owner.cancellation_requested else f'検査終了：{len(set(f["page"] for f in state["findings"]))}スライドに指摘があります．'
-            self.progress.text = message
+            self._status(message, progress=1.0 if not owner.cancellation_requested else None)
             owner.update_job_status('cancelled' if owner.cancellation_requested else 'completed',
                                     stage='validation',message=message,
                                     progress=None if owner.cancellation_requested else 1.0)
             log(project, message)
         except asyncio.CancelledError:
-            self.progress.text = '検査を中断しました（途中結果）．'
+            self._status('検査を中断しました（途中結果）．')
             owner.update_job_status('cancelled', stage='validation', message=self.progress.text)
         except Exception as exc:
-            self.progress.text = f'品質検査エラー：{exc}'
+            self._status(f'品質検査エラー：{exc}')
+            refine_job.write(project, 'content', state='failed')
             owner.update_job_status('failed', stage='validation', message=self.progress.text)
             log(project, f'ERROR {type(exc).__name__}: {exc}')
-            ui.notify(self.progress.text, type='negative')
+            try:
+                ui.notify(self.progress.text, type='negative')
+            except Exception:
+                pass
         finally:
             self.busy = False
-            if self._start_button is not None:
-                self._start_button.enable()
+            try:
+                if self._start_button is not None and not getattr(self._start_button, "is_deleted", False):
+                    self._start_button.enable()
+            except Exception:
+                pass
+            refine_job.write(project, 'content', state=refine_job.read(project, 'content').get('state', 'running') if refine_job.read(project, 'content').get('state') in ('failed', 'cancelled') else ('cancelled' if owner.cancellation_requested else 'completed'), message=refine_job.read(project, 'content').get('message', ''))
+            refine_job.unregister(owner.username, project, self)
+            self._running_project = None
             owner._finalize_cancel_request()
             owner._complete_background_job()
-            self.render_results()
+            self._safe_render_results()
 
     async def _auto_worker(self, stages, max_rounds):
         """Run each selected check against the most recently saved narration.
@@ -281,9 +376,14 @@ class ValidationView:
         owner = self.owner
         if not await self.execution_lock.acquire(owner.username, 'オートリファイナー', owner):
             self.busy = False
-            if self._start_button is not None:
-                self._start_button.enable()
-            ui.notify('ほかのユーザの処理が実行中です．', type='warning')
+            try:
+                if self._start_button is not None and not getattr(self._start_button, "is_deleted", False):
+                    self._start_button.enable()
+            except Exception:
+                pass
+            refine_job.write(self._running_project, 'content', state='failed', message='ほかのユーザの処理が実行中です．')
+            refine_job.unregister(owner.username, self._running_project, self)
+            self._running_project = None
             return
         owner.set_processing(True)
         owner.current_task = asyncio.current_task()
@@ -297,7 +397,7 @@ class ValidationView:
         state = {'findings': [], 'stages': {}, 'completed': False,
                  'auto_refiner': {'max_rounds': max_rounds, 'rounds': 0, 'history': history}}
         save(project, state)
-        self.render_results()
+        self._safe_render_results()
         client = None
         try:
             total = max_rounds * sum(len(pages) if stage != 'overall' else (len(pages)+7)//8+1 for stage in stages)
@@ -439,7 +539,7 @@ class ValidationView:
                     round_findings = detected + round_errors
                 state['findings'] = self._auto_attach_hash(round_findings, owner)
                 save(project, state)
-                self.render_results()
+                self._safe_render_results()
                 if not modified:
                     break
             state['completed'] = not owner.cancellation_requested
@@ -449,26 +549,36 @@ class ValidationView:
             left = len(set(int(f['page']) for f in state['findings']))
             label = '中断' if owner.cancellation_requested else '完了'
             message = f'オートリファイナー{label}：{state["auto_refiner"]["rounds"]}周，残り{left}スライド'
-            self.progress.text = message
+            self._status(message, progress=1.0 if not owner.cancellation_requested else None)
             owner.update_job_status('cancelled' if owner.cancellation_requested else 'completed',
                                     stage='validation', message=message,
                                     progress=None if owner.cancellation_requested else 1.0)
             log(project, message)
         except asyncio.CancelledError:
-            self.progress.text = 'オートリファイナーを中断しました．'
+            self._status('オートリファイナーを中断しました．')
             owner.update_job_status('cancelled', stage='validation', message=self.progress.text)
         except Exception as exc:
-            self.progress.text = f'オートリファイナーエラー：{exc}'
+            self._status(f'オートリファイナーエラー：{exc}')
+            refine_job.write(project, 'content', state='failed')
             owner.update_job_status('failed', stage='validation', message=self.progress.text)
             log(project, f'オートリファイナー ERROR {exc}')
-            ui.notify(self.progress.text, type='negative')
+            try:
+                ui.notify(self.progress.text, type='negative')
+            except Exception:
+                pass
         finally:
             self.busy = False
-            if self._start_button is not None:
-                self._start_button.enable()
+            try:
+                if self._start_button is not None and not getattr(self._start_button, "is_deleted", False):
+                    self._start_button.enable()
+            except Exception:
+                pass
+            refine_job.write(project, 'content', state=refine_job.read(project, 'content').get('state', 'running') if refine_job.read(project, 'content').get('state') in ('failed', 'cancelled') else ('cancelled' if owner.cancellation_requested else 'completed'), message=refine_job.read(project, 'content').get('message', ''))
+            refine_job.unregister(owner.username, project, self)
+            self._running_project = None
             owner._finalize_cancel_request()
             owner._complete_background_job()
-            self.render_results()
+            self._safe_render_results()
 
     @staticmethod
     def _auto_attach_hash(findings, owner):

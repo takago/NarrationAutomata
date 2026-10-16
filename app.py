@@ -45,6 +45,7 @@ from pointer_settings import effective_mode
 from statistics_store import run_with_statistics, export_xlsx, read_records
 from validation.ui import ValidationView
 from validation.time_ui import TimeRefineView
+from validation import refine_job
 
 from slide_lecture import (
     generate_single_alignment,
@@ -1440,6 +1441,27 @@ class SlideNarratorApp:
                 pass
             return
 
+        # Reconnect a newly created client to refinement jobs without
+        # transferring ownership of the running worker to this UI session.
+        if self.paths is not None:
+            project = self.paths.root
+            content = refine_job.read(project, 'content')
+            live_content = refine_job.running(self.username, project)
+            content_token = (content.get('updated_at'), live_content is not None)
+            if getattr(self, '_content_refine_token', None) != content_token:
+                self._content_refine_token = content_token
+                self._safe_view_update(self.validation_view.restore_progress, '内容リファイン状態の復元')
+                if content.get('state') != 'running':
+                    self._safe_view_update(self.validation_view.render_results, '内容リファイン履歴の復元')
+            time_state = refine_job.read(project, 'time')
+            live_time = refine_job.running(self.username, project)
+            time_token = (time_state.get('updated_at'), live_time is not None)
+            if getattr(self, '_time_refine_token', None) != time_token:
+                self._time_refine_token = time_token
+                self._safe_view_update(self.time_refine_view.restore_progress, '時間リファイン状態の復元')
+                self._safe_view_update(self.time_refine_view.refresh, '時間リファイン画面の復元')
+        self._safe_view_update(self.refresh_refine_sidebar, 'リファインのサイドバー表示')
+        refine_active = bool(getattr(self, '_refine_sidebar_live', False))
         globally_busy = GLOBAL_EXECUTION_LOCK.is_locked()
         self.sync_project_select_enabled()
         owner_name = GLOBAL_EXECUTION_LOCK.current_user or '' if globally_busy else ''
@@ -1464,7 +1486,13 @@ class SlideNarratorApp:
         active_key = self.get_active_stage_key(status)
         owner_is_self = globally_busy and owner_name == self.username
         self._refresh_easy_action_visibility()
-        self._refresh_easy_progress(status, own_status, owner_is_self)
+        if refine_active:
+            # A time refinement can invoke _pipeline_worker('video').  Its
+            # ordinary stage label must not masquerade as the active job.
+            if self._widget_available(self.easy_progress_box):
+                self.easy_progress_box.classes(add='hidden')
+        else:
+            self._refresh_easy_progress(status, own_status, owner_is_self)
 
         if self.pipeline_busy_row is not None and self.pipeline_busy_notice is not None:
             try:
@@ -1481,7 +1509,11 @@ class SlideNarratorApp:
         elif not globally_busy:
             self.processing = False
 
-        cancel_pending = self._refresh_advanced_stages(status, active_key, globally_busy, owner_is_self)
+        # Retain pipeline lock/cancellation semantics, but hide pipeline stage
+        # progress while a refinement owns the operation.
+        stage_status = {'state': 'idle', 'completed_stages': []} if refine_active else status
+        cancel_pending = self._refresh_advanced_stages(
+            stage_status, None if refine_active else active_key, globally_busy, owner_is_self)
 
         if self._widget_available(self.easy_generate_button):
             self.set_button_enabled_visual(self.easy_generate_button, not (globally_busy or self.read_only))
@@ -2293,10 +2325,10 @@ class SlideNarratorApp:
         self.refresh_project_name_input()
         ui.notify('プロジェクト名を保存しました．', type='positive')
 
-    async def select_existing_project(self, project_id: str | None, *, time_refine_internal: bool = False) -> None:
+    async def select_existing_project(self, project_id: str | None, *, time_refine_internal: bool = False, refine_sidebar_internal: bool = False) -> None:
         if not project_id:
             return
-        if self._time_refine_switch_blocked and not time_refine_internal:
+        if self._time_refine_switch_blocked and not (time_refine_internal or refine_sidebar_internal):
             safe_notify('時間リファイン中は別プロジェクトに切り替えられません．', type='warning')
             self.refresh_project_list()
             return
@@ -2313,9 +2345,24 @@ class SlideNarratorApp:
                 GLOBAL_EXECUTION_LOCK.owner_app is not None and
                 GLOBAL_EXECUTION_LOCK.owner_app.pdf is not None and
                 project_id != GLOBAL_EXECUTION_LOCK.owner_app.pdf.parent.name):
-            safe_notify('生成中は別プロジェクトに切り替えられません．', type='warning')
-            self.refresh_project_list()
-            return
+            # 自動復元に限り，同一ユーザが実行している時間リファインの
+            # コピー先へ移動できる．一般のプロジェクト切替制限は維持する．
+            target = self.projects_dir / str(project_id)
+            live_time = refine_job.running(self.username, target)
+            state = refine_job.read(target, 'time') if live_time is not None else {}
+            restoring_time_target = (self._restore_started and live_time is not None and
+                                     state.get('state') == 'running' and
+                                     state.get('target_project_id') == project_id)
+            # Explicit sidebar navigation is allowed only to the user's live
+            # refinement project, without relaxing general selection rules.
+            sidebar_live = (refine_sidebar_internal and
+                            refine_job.running(self.username, target) is not None and
+                            any(refine_job.read(target, k).get('state') == 'running'
+                                for k in ('content', 'time')))
+            if not (restoring_time_target or sidebar_live):
+                safe_notify('生成中は別プロジェクトに切り替えられません．', type='warning')
+                self.refresh_project_list()
+                return
         project_dir = (self.projects_dir / project_id).resolve()
         if project_dir.parent != self.projects_dir.resolve() or not project_dir.is_dir():
             ui.notify('選択したプロジェクトが見つかりません．', type='negative')
@@ -2343,6 +2390,20 @@ class SlideNarratorApp:
             self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
             marker = user_last_project_file(self.username)
             atomic_write_text(marker, json.dumps({'project_id': project_id}, ensure_ascii=False))
+            if time_refine_internal:
+                # Do not touch browser widgets from the independent worker.
+                # Preserve the same page-range rules as apply_pages_spec().
+                spec = str(self.proj_cfg.get('pages', '')).strip()
+                available = set(range(1, self.total_slides + 1))
+                if spec == 'none':
+                    self._selected_pages = set()
+                elif spec:
+                    self._selected_pages = parse_page_ranges(spec) & available
+                else:
+                    self._selected_pages = available
+                if self.edit_page not in self._selected_pages:
+                    self.edit_page = self.active_pages[0] if self.active_pages else None
+                return
             self.apply_pages_spec(self.proj_cfg.get('pages', ''), save_and_refresh=False)
             self.refresh_project_widgets()
             self.refresh_project_list()
@@ -2531,6 +2592,20 @@ class SlideNarratorApp:
             self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
             self._set_upload_status('スライド画像を準備中…', filename)
             self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
+            if time_refine_internal:
+                # Do not touch browser widgets from the independent worker.
+                # Preserve the same page-range rules as apply_pages_spec().
+                spec = str(self.proj_cfg.get('pages', '')).strip()
+                available = set(range(1, self.total_slides + 1))
+                if spec == 'none':
+                    self._selected_pages = set()
+                elif spec:
+                    self._selected_pages = parse_page_ranges(spec) & available
+                else:
+                    self._selected_pages = available
+                if self.edit_page not in self._selected_pages:
+                    self.edit_page = self.active_pages[0] if self.active_pages else None
+                return
             self.apply_pages_spec(self.proj_cfg.get('pages', ''), save_and_refresh=False)
             self.refresh_project_widgets()
             self.refresh_project_list()
@@ -2545,8 +2620,128 @@ class SlideNarratorApp:
             self._upload_complete()
 
     async def _initial_restore(self) -> None:
-        """最後に開いていたプロジェクトを復元する．"""
-        await self.restore_last_project()
+        """Restore only the last selected project; never force a refine tab."""
+        try:
+            await self.restore_last_project()
+            self.refresh_refine_sidebar()
+        except Exception:
+            logging.exception('[refine-sidebar] initial project restore failed')
+
+    def refresh_refine_sidebar(self) -> None:
+        """リファイン実行中は通常パイプラインよりも専用進捗を優先表示する．"""
+        panel = getattr(self, 'refine_sidebar_panel', None)
+        if panel is None or getattr(panel, 'is_deleted', False):
+            self._refine_sidebar_live = False
+            return
+        candidates = []
+        # Scan project-local status directly. A copied time-refinement project
+        # may temporarily be absent from the PDF based project selector.
+        project_roots = []
+        if self.projects_dir.exists():
+            project_roots.extend(p for p in self.projects_dir.iterdir() if p.is_dir())
+        if self.paths is not None and self.paths.root not in project_roots:
+            project_roots.append(self.paths.root)
+        for project in project_roots:
+            worker = refine_job.running(self.username, project)
+            for kind in ('time', 'content'):
+                state = refine_job.read(project, kind)
+                is_time_worker = worker is not None and hasattr(worker, '_target_project')
+                is_live = worker is not None and (is_time_worker == (kind == 'time'))
+                if not is_live and state.get('state') != 'running':
+                    continue
+                is_target = bool(kind == 'time' and
+                                 getattr(worker, '_target_project', None) == project)
+                candidates.append((int(is_live), int(is_target),
+                                   str(state.get('updated_at', '')),
+                                   project.name, kind, project, state))
+        if not candidates:
+            if getattr(self, '_refine_sidebar_diag', None) != 'none':
+                LOGGER.info('[refine-sidebar] no running refinements: user=%s, projects=%s',
+                            self.username, len(project_roots))
+                self._refine_sidebar_diag = 'none'
+            panel.visible = False
+            self._refine_sidebar_live = False
+            return
+        candidates.sort(reverse=True)
+        live, _, _, _, kind, project, state = candidates[0]
+        diagnostic = (project.name, kind, bool(live), state.get('state'),
+                      state.get('title'), state.get('detail'))
+        if getattr(self, '_refine_sidebar_diag', None) != diagnostic:
+            LOGGER.info('[refine-sidebar] selected user=%s project=%s kind=%s '
+                        'live=%s state=%s phase=%s detail=%s',
+                        self.username, project.name, kind, bool(live),
+                        state.get('state'), state.get('title'), state.get('detail'))
+            self._refine_sidebar_diag = diagnostic
+        self._refine_sidebar_live = bool(live)
+        panel.visible = True
+        # Time refinement switches to a copied project in a detached worker.
+        # That code intentionally avoids touching NiceGUI widgets.  Synchronize
+        # the selector here, from the browser's own periodic UI update instead.
+        if kind == 'time' and live and self.paths is not None:
+            if self.paths.root != project:
+                # A detached worker may belong to an older browser instance.
+                # Adopt its target in this client's UI, not in the worker.
+                pending = getattr(self, '_refine_sidebar_project_sync_task', None)
+                if pending is None or pending.done():
+                    self._refine_sidebar_project_sync_task = background_tasks.create(
+                        self._sync_live_time_refine_project(project.name),
+                        name='time-refine-project-ui-sync',
+                    )
+            elif getattr(self, '_refine_sidebar_project_sync_id', None) != project.name:
+                self.refresh_project_list()
+                self.refresh_project_name_input()
+                self._refine_sidebar_project_sync_id = project.name
+                LOGGER.info('[refine-sidebar] synchronized project selector: %s', project.name)
+        title = '時間のリファイン' if kind == 'time' else '内容のリファイン'
+        self.refine_sidebar_title.text = (
+            f'{title}：実行中' if live else f'{title}：実行状態を確認できません')
+        # Display the user-facing project name as in the project selector,
+        # while keeping its stable ID available for identification.
+        project_pdfs = list(project.glob('*.pdf'))
+        display_name = (self.project_display_name(project_pdfs[0])
+                        if len(project_pdfs) == 1 else project.name)
+        self.refine_sidebar_project.text = f'プロジェクト：{display_name}（{project.name}）'
+        phase = str(state.get('title') or state.get('stage') or '').strip()
+        detail = str(state.get('detail') or state.get('message') or '').strip()
+        if phase and detail and phase not in detail:
+            detail = f'{phase}：{detail}'
+        else:
+            detail = detail or phase or '処理中…'
+        if not live:
+            detail += '\n保存済みの進捗です．サーバ側の実行は確認できません．'
+        self.refine_sidebar_detail.text = detail
+        fraction = state.get('fraction') if kind == 'time' else state.get('progress')
+        try:
+            value = max(0.0, min(1.0, float(fraction))) if fraction is not None else None
+        except (ValueError, TypeError):
+            value = None
+        if value is None or state.get('indeterminate'):
+            self.refine_sidebar_bar.props('indeterminate')
+        else:
+            self.refine_sidebar_bar.props(remove='indeterminate')
+            self.refine_sidebar_bar.value = value
+
+    async def _sync_live_time_refine_project(self, project_id: str) -> None:
+        """Synchronize the browser's selected project with a detached time worker."""
+        try:
+            target = self.projects_dir / project_id
+            worker = refine_job.running(self.username, target)
+            if worker is None or getattr(worker, '_target_project', None) != target:
+                return
+            if self.paths is not None and self.paths.root.name == project_id:
+                self.refresh_project_list()
+                return
+            LOGGER.info('[refine-sidebar] adopting time-refine target: %s', project_id)
+            await self.select_existing_project(project_id, refine_sidebar_internal=True)
+            if self.paths is not None and self.paths.root.name == project_id:
+                self.refresh_project_list()
+                self.refresh_project_name_input()
+                self._refine_sidebar_project_sync_id = project_id
+                LOGGER.info('[refine-sidebar] adopted time-refine target: %s', project_id)
+            else:
+                LOGGER.warning('[refine-sidebar] target adoption rejected: %s', project_id)
+        except Exception:
+            LOGGER.exception('[refine-sidebar] project UI sync failed: %s', project_id)
 
     async def restore_last_project(self) -> None:
         if self._restore_started:
@@ -5500,6 +5695,9 @@ class SlideNarratorApp:
             if self.read_only:
                 ui.label('閲覧モード：利用可能時間外のため編集・生成はできません．').classes('text-sm text-amber-400')
             ui.timer(1.0, self.refresh_job_status)
+            # Independent of pipeline progress refresh; survives tab reloads.
+            ui.timer(1.0, lambda: self._safe_view_update(
+                self.refresh_refine_sidebar, '独立したリファイン状態更新'))
             ui.timer(2.0, lambda: self._safe_view_update(
                 self.poll_visible_outputs, '表示タブの生成ファイル差分同期'))
 
@@ -5547,6 +5745,13 @@ class SlideNarratorApp:
             current_id = self.pdf.parent.name if self.pdf and self.pdf.exists() else None
             self.project_id_label = ui.label(f'プロジェクトID：{current_id or "未選択"}') \
                 .classes('w-full text-xs text-zinc-400 font-mono mt-2 select-text')
+
+            with ui.column().classes('w-full gap-2 p-3 mt-2 rounded-lg border border-blue-500/40 bg-slate-900') as self.refine_sidebar_panel:
+                self.refine_sidebar_title = ui.label('').classes('font-bold text-sm text-blue-300')
+                self.refine_sidebar_project = ui.label('').classes('text-xs text-zinc-400')
+                self.refine_sidebar_detail = ui.label('').classes('text-xs whitespace-pre-wrap break-words')
+                self.refine_sidebar_bar = ui.linear_progress(value=0, show_value=False).props('rounded size=8px color=primary').classes('w-full')
+            self.refine_sidebar_panel.visible = False
 
             # 設定行のラベル列とラジオ選択肢の列幅を揃える．
             with ui.column().classes('w-full gap-1 mt-2'):
@@ -5743,7 +5948,7 @@ class SlideNarratorApp:
                     self._tab_simple_edit = tab_simple_edit
                     tab_edit = ui.tab('📝 ナレーション編集')
                     self._tab_edit = tab_edit
-                    tab_validation = ui.tab('✨ リファイン')
+                    tab_validation = ui.tab('✨ リファイン').props('id=na-refine-main-tab')
                     self._tab_validation = tab_validation
                 tab_statistics = ui.tab('📊 統計')
                 tab_logs = ui.tab('📜 ログ')
@@ -5753,7 +5958,8 @@ class SlideNarratorApp:
                 if is_admin:
                     tab_user_manage = ui.tab('👥 ユーザー管理')
 
-            with ui.tab_panels(tabs, value=tab_gallery).classes('w-full'):
+            with ui.tab_panels(tabs, value=tab_gallery).classes('w-full') as main_tab_panels:
+                self._main_tab_panels = main_tab_panels
                 with ui.tab_panel(tab_gallery):
                     ui.label('🖼️ スライドデッキ').classes('text-h5')
                     self.gallery = ui.column().classes('w-full').props('id=slide-deck-gallery')
@@ -5767,9 +5973,13 @@ class SlideNarratorApp:
                         self.edit_container = ui.column().classes('w-full')
                     with ui.tab_panel(tab_validation):
                         with ui.tabs().classes('w-full') as refine_tabs:
-                            refine_content = ui.tab('内容のリファイン（解説と展開の改善）')
-                            refine_time = ui.tab('時間のリファイン（再生時間の最適化）')
-                        with ui.tab_panels(refine_tabs, value=refine_content).classes('w-full'):
+                            self._refine_tabs = refine_tabs
+                            refine_content = ui.tab('内容のリファイン（解説と展開の改善）').props('id=na-refine-content-tab')
+                            refine_time = ui.tab('時間のリファイン（再生時間の最適化）').props('id=na-refine-time-tab')
+                            self._refine_content_tab = refine_content
+                            self._refine_time_tab = refine_time
+                        with ui.tab_panels(refine_tabs, value=refine_content).classes('w-full') as refine_tab_panels:
+                            self._refine_tab_panels = refine_tab_panels
                             with ui.tab_panel(refine_content):
                                 self.validation_view.build()
                             with ui.tab_panel(refine_time):
@@ -5886,7 +6096,10 @@ class SlideNarratorApp:
         if is_admin:
             self.refresh_user_management()
 
-        background_tasks.create(self._initial_restore())
+        # ui.timer はブラウザとの websocket 接続が確立してから呼ばれる．
+        # build() 直後にバックグラウンド起動すると，タブ選択をクライアントへ
+        # 反映できないことがあるため，接続後の一度きりの復元にする．
+        ui.timer(0.1, self._initial_restore, once=True)
 
     # --- ユーザー入力イベント ---
 

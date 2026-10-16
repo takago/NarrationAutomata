@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from nicegui import ui, run, background_tasks
+from . import refine_job
 from slide_lecture import make_client, stream_chat, reasoning_extra_kwargs, load_project_json, save_project_json, image_data_url
 from .core import regeneration_valid
 from statistics_store import run_with_statistics
@@ -235,6 +236,7 @@ class TimeRefineView:
         self.history = None
         self.progress_panel = None
         self.progress_title = None
+        self.running_spinner = None
         self.progress_detail = None
         self.progress_bar = None
         self.step_log = None
@@ -242,13 +244,23 @@ class TimeRefineView:
         self.busy = False
         self.stop_requested = False
         self.result_container = None
+        self._source_project = None
+        self._target_project = None
+        self._progress_fraction = 0.0
+        self._progress_indeterminate = False
+        self._shown_busy = None
 
     def build(self):
         ui.label('時間のリファイン').classes('text-h5')
         ui.label('完成動画の再生時間を基準に，短縮版を新規プロジェクトとして全自動生成します．元のプロジェクトは変更しません．').classes('text-caption text-slate-400')
         self.controls = ui.column().classes('w-full gap-3')
+        self.target_input = None
+        self.start_button = None
         with ui.column().classes('w-full gap-1') as self.progress_panel:
-            self.progress_title = ui.label('準備中').classes('font-bold text-sm')
+            with ui.row().classes('items-center gap-2'):
+                self.running_spinner = ui.spinner(size='sm')
+                self.running_spinner.visible = False
+                self.progress_title = ui.label('準備中').classes('font-bold text-sm')
             self.progress_bar = ui.linear_progress(value=0, show_value=False).props('rounded size=10px').classes('w-full')
             self.progress_detail = ui.label('').classes('text-xs text-slate-400')
             self.status = ui.label('').classes('text-sm text-slate-300 whitespace-pre-wrap break-words')
@@ -260,6 +272,20 @@ class TimeRefineView:
         self.history = ui.column().classes('w-full gap-1')
         self.result_container = ui.column().classes('w-full gap-2 mt-3')
         self.refresh()
+        ui.timer(1.0, self._sync_controls_on_state_change)
+
+    def _sync_controls_on_state_change(self):
+        """Rebuild settings after completion, cancellation, or failure."""
+        if self.controls is None or getattr(self.controls, "is_deleted", False):
+            return
+        project = self.owner.paths.root if self.owner.paths else None
+        live = refine_job.running(self.owner.username, project) if project else None
+        if not isinstance(live, TimeRefineView):
+            live = None
+        if self.running_spinner is not None:
+            self.running_spinner.visible = live is not None
+        if (live is not None) != self._shown_busy:
+            self.refresh()
 
     def update_result(self):
         """Refresh the result panel on a real processing event (no polling).
@@ -271,7 +297,7 @@ class TimeRefineView:
             return
         try:
             self.refresh_result()
-        except (OSError, ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
             self.owner.append_job_log(f'[TIME_REFINE] 結果画面の更新失敗: {exc}')
 
     def _source(self):
@@ -290,37 +316,101 @@ class TimeRefineView:
     def refresh(self):
         if self.controls is None:
             return
+        self.restore_progress()
+        self._shown_busy = self.busy
         self.controls.clear()
-        secs, reason = self._source()
+        self.target_input = None
+        self.start_button = None
+        # Do not require the source video while a live refinement is running.
+        secs, reason = (None, '') if self.busy else self._source()
+        # The chart is reconstructed from project.json and narration files.
+        # It must also be restored while a refinement is still running.
         self.update_result()
         with self.controls:
-            if reason:
-                ui.label(reason).classes('text-orange-300')
-            else:
-                ui.label(f'現在の動画時間：約{secs / 60:.1f}分').classes('font-bold')
-            with ui.row().classes('items-center gap-3 flex-wrap'):
-                ui.number('目標時間（分）', value=self.target_minutes, min=1, max=1440, precision=1,
-                          on_change=self._set_target).props('outlined dense').classes('w-44')
-            ui.label('短縮方針').classes('font-bold mt-2')
-            ui.label('ONの項目をLLMの短縮指示に追加します．OFFでも通常の短縮は行います．').classes('text-xs text-slate-400')
-            for key, label, _ in REFINE_POLICIES:
-                ui.checkbox(label, value=self.policies[key],
-                            on_change=lambda e, k=key: self.policies.__setitem__(k, bool(e.value)))
-            can_start = bool(secs and self.target_minutes is not None and
-                             0 < self.target_minutes * 60 < secs and
-                             not self.busy and not self.owner.processing and
-                             not self.lock.is_locked() and not self.owner.read_only)
-            button = ui.button('新しいプロジェクトとして時間リファインを開始', icon='content_copy', on_click=self.start).props('outline')
-            if not can_start:
-                button.disable()
             if self.busy:
+                ui.label('時間リファイン実行中').classes('text-blue-300 font-bold text-sm')
+                snapshot = refine_job.read(self.owner.paths.root, 'time') if self.owner.paths else {}
+                target_seconds = snapshot.get('target_seconds')
+                if target_seconds is None and self.target_minutes is not None:
+                    target_seconds = self.target_minutes * 60
+                if target_seconds is not None:
+                    ui.label(f'目標時間：{float(target_seconds) / 60:.1f}分').classes('text-sm text-slate-300')
                 stop_button = ui.button('時間リファインを中断', icon='stop', on_click=self.request_stop).props('outline color=negative')
                 if self.stop_requested:
                     stop_button.disable()
                     ui.label('中断要求を受け付けました．現在の処理の終了後に停止します．').classes('text-orange-300 text-sm')
-            ui.label('実行条件：完成動画・原稿が存在し，ほかの生成処理が実行されていないこと．').classes('text-xs text-slate-400')
-            ui.label('目標時間は必須です．現在の動画より短い時間を指定してください．').classes('text-xs text-slate-400')
-            ui.label('目標時間は上限の目安です．情報を保持できない場合，目標未達でも停止します．').classes('text-xs text-slate-400')
+            else:
+                if reason:
+                    ui.label(reason).classes('text-orange-300')
+                elif secs is not None:
+                    ui.label(f'現在の動画時間：約{secs / 60:.1f}分').classes('font-bold')
+                with ui.row().classes('items-center gap-3 flex-wrap'):
+                    self.target_input = ui.number('目標時間（分）', value=self.target_minutes, min=1, max=1440, precision=1,
+                                                  on_change=self._set_target).props('outlined dense').classes('w-44')
+                    if self.busy or self.owner.read_only:
+                        self.target_input.disable()
+                ui.label('短縮方針').classes('font-bold mt-2')
+                ui.label('ONの項目をLLMの短縮指示に追加します．OFFでも通常の短縮は行います．').classes('text-xs text-slate-400')
+                for key, label, _ in REFINE_POLICIES:
+                    policy_checkbox = ui.checkbox(label, value=self.policies[key],
+                                                  on_change=lambda e, k=key: self.policies.__setitem__(k, bool(e.value)) if not self.busy else None)
+                    if self.busy or self.owner.read_only:
+                        policy_checkbox.disable()
+                can_start = bool(secs and self.target_minutes is not None and
+                                 0 < self.target_minutes * 60 < secs and
+                                 not self.busy and not self.owner.processing and
+                                 not self.lock.is_locked() and not self.owner.read_only)
+                self.start_button = ui.button('新しいプロジェクトとして時間リファインを開始', icon='content_copy', on_click=self.start).props('outline')
+                if not can_start:
+                    self.start_button.disable()
+                ui.label('実行条件：完成動画・原稿が存在し，ほかの生成処理が実行されていないこと．').classes('text-xs text-slate-400')
+                ui.label('目標時間は必須です．現在の動画より短い時間を指定してください．').classes('text-xs text-slate-400')
+                ui.label('目標時間は上限の目安です．情報を保持できない場合，目標未達でも停止します．').classes('text-xs text-slate-400')
+
+    def restore_progress(self):
+        if self.owner.paths is None:
+            return
+        project = self.owner.paths.root
+        snapshot = refine_job.read(project, 'time')
+        live = refine_job.running(self.owner.username, project)
+        if not isinstance(live, TimeRefineView):
+            live = None
+        if live is not None:
+            self.busy = True
+            self.stop_requested = live.stop_requested
+        else:
+            # Registry is authoritative for the current project. A finished
+            # worker may retain _source_project/_target_project references.
+            self.busy = False
+        if self.running_spinner is not None:
+            self.running_spinner.visible = self.busy
+        if snapshot:
+            if self.progress_panel is not None:
+                self.progress_panel.visible = True
+            try:
+                self.progress_title.text = snapshot.get('title', '時間リファイン')
+                self.progress_detail.text = snapshot.get('detail', '')
+                self.status.text = snapshot.get('message', '')
+                self.step_log_lines = list(snapshot.get('log', []))[-300:]
+                self.step_log.text = '\n'.join(self.step_log_lines)
+                if snapshot.get('indeterminate'):
+                    self.progress_bar.props('indeterminate')
+                else:
+                    self.progress_bar.props(remove='indeterminate')
+                    self.progress_bar.value = snapshot.get('fraction') or 0
+            except (RuntimeError, AttributeError, ValueError):
+                pass
+
+    def _persist(self, **updates):
+        for project in {self._source_project, self._target_project} - {None}:
+            refine_job.write(project, 'time', **updates)
+
+    @staticmethod
+    def _safe_ui(callback):
+        try:
+            callback()
+        except (RuntimeError, AttributeError, ValueError, KeyError):
+            pass  # UI can disappear while the server task continues.
 
     def refresh_result(self):
         if self.result_container is None:
@@ -339,8 +429,6 @@ class TimeRefineView:
         with self.result_container:
             ui.separator()
             ui.label('時間リファイン結果').classes('text-h6')
-            if meta.get('state') == 'running' and not self.busy:
-                ui.label('処理中の記録です．画面を再読み込みすると進捗表示は引き継がれません．').classes('text-xs text-orange-300')
             state = meta.get('state', '不明')
             ui.label(f'状態：{state} ／ 短縮前 {before:,}字 → 現在 {after:,}字'
                      f'（削減率 {(1 - after/before)*100:.1f}%）' if before else f'状態：{state}').classes('text-sm')
@@ -368,14 +456,15 @@ class TimeRefineView:
             relative = [round(r['after'] / r['before'], 4)
                         if r['before'] and r['after'] is not None else None for r in rows]
             finite = [v for v in relative if v is not None]
-            ratio_max = max(1.0, max(finite, default=1.0) * 1.05)
+            # A shortening ratio is bounded by 1.0; avoid ECharts automatic padding.
+            relative = [min(1.0, max(0.0, value)) if value is not None else None for value in relative]
             ui.label('短縮比率（短縮前＝1.00）').classes('text-sm font-bold')
             ui.label('0.90は10%短縮，1.00は変更なしを表します．').classes('text-xs text-slate-400')
             ratio_options = {
                 'tooltip': {'trigger': 'axis'},
                 'grid': {'left': 58, 'right': 25, 'bottom': 42, 'top': 15},
                 'xAxis': {'type': 'category', 'data': slide_labels, 'name': 'スライド'},
-                'yAxis': {'type': 'value', 'min': 0, 'max': round(ratio_max, 2), 'name': '短縮比率'},
+                'yAxis': {'type': 'value', 'min': 0, 'max': 1.0, 'interval': 0.2, 'name': '短縮比率'},
                 'dataZoom': [{'type': 'inside', 'xAxisIndex': 0},
                              {'type': 'slider', 'bottom': 5, 'height': 15}],
                 'series': [
@@ -409,19 +498,39 @@ class TimeRefineView:
             ui.notify(f'Excel出力に失敗しました：{exc}', type='negative')
 
     def _set_target(self, event):
+        if self.busy:
+            return
         value = event.value
         try:
             minutes = float(value) if value is not None and str(value).strip() else None
             self.target_minutes = minutes if minutes is not None and minutes > 0 else None
         except (ValueError, TypeError):
             self.target_minutes = None
-        # Refresh to update the start button availability. Preserve the input value.
-        self.refresh()
+        # Do not rebuild the controls on each keystroke: that destroys focus.
+        if self.start_button is not None:
+            secs, reason = (None, '実行中') if self.busy else self._source()
+            can_start = (not reason and secs is not None and self.target_minutes is not None
+                         and 0 < self.target_minutes * 60 < secs and not self.busy
+                         and not self.owner.processing and not self.lock.is_locked()
+                         and not self.owner.read_only)
+            if can_start:
+                self.start_button.enable()
+            else:
+                self.start_button.disable()
 
     async def request_stop(self):
+        live = refine_job.running(self.owner.username, self.owner.paths.root) if self.owner.paths else None
+        if not isinstance(live, TimeRefineView):
+            live = None
+        if live is not None and live is not self:
+            await live.request_stop()
+            self.restore_progress()
+            self._safe_ui(self.refresh)
+            return
         if not self.busy or self.stop_requested:
             return
         self.stop_requested = True
+        self._persist(stop_requested=True)
         # The video pipeline has its own cancellation lifecycle and subprocess.
         # Delegate to its existing cancellation handler when it is running.
         if self.owner.processing and self.lock.is_locked():
@@ -430,7 +539,7 @@ class TimeRefineView:
             self.owner.cancellation_requested = True
         self._message('中断要求を受け付けました．現在の処理が終了したら停止します．')
         self._progress('中断処理中', '現在の処理が終了するまで待機しています…', indeterminate=True)
-        self.refresh()
+        self._safe_ui(self.refresh)
 
     def _check_stop(self):
         if self.stop_requested or self.owner.cancellation_requested:
@@ -447,6 +556,10 @@ class TimeRefineView:
             ui.notify('目標時間は現在の動画時間より短く設定してください．', type='warning')
             return
         self.busy = True
+        self._source_project = self.owner.paths.root
+        self._target_project = None
+        refine_job.register(self.owner.username, self._source_project, self)
+        self._persist(state="running", title="準備中", detail="新規プロジェクトを作成しています…", log=[], message="", fraction=0, indeterminate=True, stop_requested=False)
         self.owner.set_time_refine_project_lock(True)
         self.stop_requested = False
         self.step_log_lines.clear()
@@ -463,25 +576,30 @@ class TimeRefineView:
     def _progress(self, title: str, detail: str = '', *, fraction: float | None = None,
                   indeterminate: bool = False):
         """Update the existing progress widgets; never create UI from the worker."""
+        value = max(0.0, min(1.0, fraction if fraction is not None else 0.0))
+        self._persist(title=title, detail=detail, fraction=value, indeterminate=indeterminate)
         if self.progress_panel is None:
             return
-        self.progress_panel.visible = True
-        self.progress_title.text = title
-        self.progress_detail.text = detail
-        if indeterminate:
-            self.progress_bar.props('indeterminate')
-        else:
-            self.progress_bar.props(remove='indeterminate')
-            self.progress_bar.value = max(0.0, min(1.0, fraction if fraction is not None else 0.0))
+        def update():
+            self.progress_panel.visible = True
+            self.progress_title.text = title
+            self.progress_detail.text = detail
+            if indeterminate:
+                self.progress_bar.props('indeterminate')
+            else:
+                self.progress_bar.props(remove='indeterminate')
+                self.progress_bar.value = value
+        self._safe_ui(update)
 
     def _message(self, message: str):
+        self.step_log_lines.append(message)
+        if len(self.step_log_lines) > 300:
+            del self.step_log_lines[:-300]
+        self._persist(message=message, log=list(self.step_log_lines))
         if self.status is not None:
-            self.status.text = message
+            self._safe_ui(lambda: setattr(self.status, 'text', message))
         if self.step_log is not None:
-            self.step_log_lines.append(message)
-            if len(self.step_log_lines) > 300:
-                del self.step_log_lines[:-300]
-            self.step_log.text = '\n'.join(self.step_log_lines)
+            self._safe_ui(lambda: setattr(self.step_log, 'text', '\n'.join(self.step_log_lines)))
         self.owner.append_job_log('[TIME_REFINE] ' + message)
 
     async def _worker(self, baseline: float, target: float, policies: dict[str, bool]):
@@ -489,6 +607,8 @@ class TimeRefineView:
         # selection and subsequent pipeline callbacks may create UI elements
         # (including notifications), so establish the originating client's
         # slot explicitly for the entire asynchronous workflow.
+        # Preserve originating slot only while the client exists; subsequent
+        # UI mutations must be best-effort and project state remains authoritative.
         if self.controls is None:
             raise RuntimeError('時間リファイン画面が初期化されていません．')
         with self.controls:
@@ -530,6 +650,9 @@ class TimeRefineView:
                                       'original_narration_chars': baseline_chars,
                                       'rounds': [], 'state': 'running', 'policies': policies}
             save_project_json(new_paths.root, new_cfg)
+            self._target_project = new_paths.root
+            refine_job.register(owner.username, self._target_project, self)
+            self._persist(state='running', target_project_id=project_id)
             await owner.select_existing_project(project_id, time_refine_internal=True)
             if owner.pdf != new_pdf.resolve():
                 raise RuntimeError('新規プロジェクトに切り替えられませんでした')
@@ -538,7 +661,7 @@ class TimeRefineView:
             self._check_stop()
             self._message('新規プロジェクトを作成しました．ナレーションを短縮します…')
             self._progress('ナレーション短縮', '短縮処理を準備しています…', fraction=0)
-            ui.notify('コピー完了．新しいプロジェクトでナレーションを短縮します．', type='info')
+            self._safe_ui(lambda: ui.notify('コピー完了．新しいプロジェクトでナレーションを短縮します．', type='info'))
             for cycle in range(1, 2):
                 self._check_stop()
                 current = baseline
@@ -658,7 +781,8 @@ class TimeRefineView:
                 summary += f'／短縮失敗 {len(failure_pages)} 枚（スライド {", ".join(failure_pages)}）．理由は実行ログとプロジェクト設定に保存しました．'
             self._message(summary)
             self._progress('時間リファイン完了', f'{fmt(baseline)} → {fmt(result)}（目標 {fmt(target)}）' if result else '動画時間を取得できませんでした．', fraction=1)
-            ui.notify('時間リファインが終了しました．', type='positive' if result and result <= target else 'warning')
+            self._persist(state='completed' if result is not None else 'failed')
+            self._safe_ui(lambda: ui.notify('時間リファインが終了しました．', type='positive' if result and result <= target else 'warning'))
         except asyncio.CancelledError:
             if new_dir is not None and new_dir.is_dir():
                 try:
@@ -670,6 +794,7 @@ class TimeRefineView:
                 except Exception:
                     pass
             self._message('時間リファインを中断しました．コピー元は変更されていません．新規プロジェクトは途中状態で残ります．')
+            self._persist(state='cancelled')
             self._progress('時間リファイン中断', '元のプロジェクトは変更されていません．', fraction=0)
         except Exception as exc:
             if new_dir is not None and new_dir.is_dir():
@@ -683,12 +808,17 @@ class TimeRefineView:
                 except Exception:
                     pass
             self._message(f'時間リファインに失敗しました：{type(exc).__name__}: {exc}')
+            self._persist(state='failed')
             self._progress('時間リファイン失敗', f'{type(exc).__name__}: {exc}', fraction=0)
-            ui.notify(str(exc), type='negative')
+            self._safe_ui(lambda: ui.notify(str(exc), type='negative'))
         finally:
             self.update_result()
+            if self._source_project is not None:
+                refine_job.unregister(owner.username, self._source_project, self)
+            if self._target_project is not None:
+                refine_job.unregister(owner.username, self._target_project, self)
             owner.set_time_refine_project_lock(False)
-            owner.refresh_project_list()
+            self._safe_ui(owner.refresh_project_list)
             self.busy = False
             self.stop_requested = False
-            self.refresh()
+            self._safe_ui(self.refresh)
