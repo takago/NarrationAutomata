@@ -44,6 +44,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pointer_settings import effective_mode
 from statistics_store import run_with_statistics, export_xlsx, read_records
 from validation.ui import ValidationView
+from validation.time_ui import TimeRefineView
 
 from slide_lecture import (
     generate_single_alignment,
@@ -562,6 +563,13 @@ def file_url(path: Path) -> str:
     return f'/files/{rel}?t={ts}'
 
 
+def download_url(path: Path) -> str:
+    """Use our registered download endpoint, independent of media player initialization."""
+    from urllib.parse import quote
+    rel = path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    return '/download/' + quote(rel, safe='/')
+
+
 def _resolve_file(path: str) -> Path | None:
     root = Path.cwd().resolve()
     target = (root / path).resolve()
@@ -583,13 +591,17 @@ async def serve_file(path: str):
 
 
 @app.get('/download/{path:path}')
-async def download_file(path: str):
+async def download_file(path: str, filename: str | None = None):
     target = _resolve_file(path)
     if target is None:
         return PlainTextResponse('Forbidden', status_code=403)
     if not target.is_file():
         return PlainTextResponse('Not found', status_code=404)
-    return FileResponse(target, filename=target.name)
+    # The project display name may differ from the on-disk MP4 name.
+    safe_filename = (re.sub(r'[\\/\x00-\x1f\x7f]', '_', filename).strip()
+                     if filename else target.name)
+    safe_filename = safe_filename if safe_filename.endswith('.mp4') else target.name
+    return FileResponse(target, filename=safe_filename)
 
 
 # ----------------------------------------------------------------------
@@ -707,6 +719,7 @@ class SlideNarratorApp:
         self.simple_edit_container = None
         self.edit_container = None
         self.validation_view = ValidationView(self, GLOBAL_EXECUTION_LOCK, atomic_write_text)
+        self.time_refine_view = TimeRefineView(self, GLOBAL_EXECUTION_LOCK)
         self.slide_video_gallery = None
         self._slide_play_buttons: dict[int, Any] = {}
         self._gallery_video_signatures: dict[int, tuple | None] = {}
@@ -735,6 +748,7 @@ class SlideNarratorApp:
         self.upload_status_bar = None
         self._upload_active = False
         self.project_select = None
+        self._time_refine_switch_blocked = False
         self.project_id_label = None
         self.project_dict_area = None
         self.project_dict_save_button = None
@@ -1427,6 +1441,7 @@ class SlideNarratorApp:
             return
 
         globally_busy = GLOBAL_EXECUTION_LOCK.is_locked()
+        self.sync_project_select_enabled()
         owner_name = GLOBAL_EXECUTION_LOCK.current_user or '' if globally_busy else ''
 
         if globally_busy:
@@ -2008,8 +2023,16 @@ class SlideNarratorApp:
         if self._active_tab != 'statistics' and not force:
             return
         source = self.paths.root / 'statistics.jsonl' if self.paths else None
+        project_config_path = self.paths.root / 'project.json' if self.paths else None
+        # Include narration file changes so a completed time refinement updates
+        # the summary even if statistics.jsonl was not regenerated.
+        refine_meta = load_project_json(self.paths.root).get('time_refine', {}) if self.paths else {}
+        original_char_map = (refine_meta.get('original_narration_chars', {})
+                             if isinstance(refine_meta, dict) else {})
         signature = ((str(source), self._file_signature(source),
-                      tuple(self._file_signature(self.paths.alignment(p)) for p in range(1, len(self.images) + 1)))
+                      tuple(self._file_signature(self.paths.alignment(p)) for p in range(1, len(self.images) + 1)),
+                      tuple((p, self._file_signature(self.paths.explanation(int(p))))
+                            for p in sorted(original_char_map, key=lambda s: int(s))))
                      if source and self.paths else None)
         if not force and signature == self._statistics_signature and self._widget_available(self.statistics_chart):
             return
@@ -2022,6 +2045,27 @@ class SlideNarratorApp:
                 if self._widget_available(self.statistics_notice):
                     self.statistics_notice.text = f'統計データの読み込みに失敗しました：{exc}'
                 return
+        # Show actual narration length changes separately from LLM output statistics.
+        # Original generation bars and token counts intentionally stay unchanged.
+        if self._widget_available(getattr(self, 'statistics_time_refine_label', None)):
+            metadata = refine_meta if isinstance(refine_meta, dict) else {}
+            baseline_map = metadata.get('original_narration_chars') or {}
+            if isinstance(baseline_map, dict) and baseline_map:
+                try:
+                    before = sum(int(value) for value in baseline_map.values())
+                    after = sum(len(self.paths.explanation(int(page)).read_text(encoding='utf-8').strip())
+                                if self.paths.explanation(int(page)).is_file() else 0
+                                for page in baseline_map)
+                    reduction = before - after
+                    percent = (100 * reduction / before) if before else 0
+                    self.statistics_time_refine_label.text = (
+                        f'時間リファインの原稿文字数：{before:,} → {after:,} 文字 '
+                        f'（短縮 {reduction:,} 文字，{percent:.1f}%）'
+                        ' ／ 元のプロジェクトとの比較')
+                except (TypeError, ValueError, OSError):
+                    self.statistics_time_refine_label.text = '時間リファインの原稿文字数：集計できませんでした．'
+            else:
+                self.statistics_time_refine_label.text = '時間リファインの原稿文字数：比較記録なし'
         # 品質検査のLLM統計は既存工程別グラフから分離して表示する．
         validation_records = [r for r in records if str(r.get('task', '')).startswith('品質検査（')]
         prompts = sum(int((r.get('llm') or {}).get('prompt_tokens') or 0) for r in validation_records)
@@ -2150,6 +2194,30 @@ class SlideNarratorApp:
         name = str(cfg.get('project_name') or '').strip()
         return name or pdf_path.stem
 
+    def set_time_refine_project_lock(self, active: bool) -> None:
+        """Freeze manual project selection across all time-refine phases."""
+        self._time_refine_switch_blocked = bool(active)
+        self.sync_project_select_enabled()
+
+    def sync_project_select_enabled(self) -> None:
+        if self.project_select is None:
+            return
+        try:
+            if self._time_refine_switch_blocked or GLOBAL_EXECUTION_LOCK.is_locked():
+                self.project_select.disable()
+            else:
+                self.project_select.enable()
+        except Exception:
+            pass
+
+    async def on_project_selection(self, project_id: str | None) -> None:
+        """Reject stale UI selection events and immediately restore the true value."""
+        if self._time_refine_switch_blocked or GLOBAL_EXECUTION_LOCK.is_locked():
+            self.refresh_project_list()
+            safe_notify('処理中はプロジェクトを切り替えられません．', type='warning')
+            return
+        await self.select_existing_project(project_id)
+
     def refresh_project_list(self) -> None:
         if self.project_select is None:
             return
@@ -2160,6 +2228,7 @@ class SlideNarratorApp:
             self.project_select.options = options
             self.project_select.value = current_value if current_value in options else None
             self.project_select.update()
+            self.sync_project_select_enabled()
         except Exception:
             pass
         if self._widget_available(self.project_id_label):
@@ -2224,8 +2293,12 @@ class SlideNarratorApp:
         self.refresh_project_name_input()
         ui.notify('プロジェクト名を保存しました．', type='positive')
 
-    async def select_existing_project(self, project_id: str | None) -> None:
+    async def select_existing_project(self, project_id: str | None, *, time_refine_internal: bool = False) -> None:
         if not project_id:
+            return
+        if self._time_refine_switch_blocked and not time_refine_internal:
+            safe_notify('時間リファイン中は別プロジェクトに切り替えられません．', type='warning')
+            self.refresh_project_list()
             return
         if GLOBAL_EXECUTION_LOCK.is_locked() and GLOBAL_EXECUTION_LOCK.current_user != self.username:
             ui.notify('処理中はプロジェクトを切り替えられません．', type='warning')
@@ -2241,6 +2314,7 @@ class SlideNarratorApp:
                 GLOBAL_EXECUTION_LOCK.owner_app.pdf is not None and
                 project_id != GLOBAL_EXECUTION_LOCK.owner_app.pdf.parent.name):
             safe_notify('生成中は別プロジェクトに切り替えられません．', type='warning')
+            self.refresh_project_list()
             return
         project_dir = (self.projects_dir / project_id).resolve()
         if project_dir.parent != self.projects_dir.resolve() or not project_dir.is_dir():
@@ -4333,8 +4407,13 @@ class SlideNarratorApp:
                 ui.button('▶ 完成ビデオを再生',
                           on_click=lambda: self.show_video_dialog(final, '完成ビデオ')) \
                     .props('color=primary').classes('w-full')
+                # Download under the user-facing project name, e.g. Lecture_RF100m.mp4.
+                from urllib.parse import quote
+                display_name = self.project_display_name(self.pdf)
+                download_name = re.sub(r'[\\/\x00-\x1f\x7f]', '_', display_name).strip().rstrip('.') + '.mp4'
+                video_download_url = download_url(final) + '?filename=' + quote(download_name)
                 ui.button('MP4ダウンロード', icon='download',
-                          on_click=lambda: ui.download(str(final), filename=final.name)) \
+                          on_click=lambda url=video_download_url, name=download_name: ui.download(url, filename=name)) \
                     .props('dense outline').classes('w-full')
             else:
                 ui.label('動画未生成').classes('text-xs text-zinc-500')
@@ -5457,7 +5536,7 @@ class SlideNarratorApp:
                             ui.menu_item('完全削除', on_click=self.request_delete_project).props('dense')
             self.project_select = ui.select(
                 options={}, value=None, label='プロジェクトを選択',
-                on_change=lambda e: background_tasks.create(self.select_existing_project(e.value)),
+                on_change=lambda e: background_tasks.create(self.on_project_selection(e.value)),
             ).props('outlined dense options-dense').classes('w-full')
             if self.read_only:
                 add_project_button.disable()
@@ -5664,7 +5743,7 @@ class SlideNarratorApp:
                     self._tab_simple_edit = tab_simple_edit
                     tab_edit = ui.tab('📝 ナレーション編集')
                     self._tab_edit = tab_edit
-                    tab_validation = ui.tab('🔎 品質検査')
+                    tab_validation = ui.tab('✨ リファイン')
                     self._tab_validation = tab_validation
                 tab_statistics = ui.tab('📊 統計')
                 tab_logs = ui.tab('📜 ログ')
@@ -5687,7 +5766,15 @@ class SlideNarratorApp:
                     with ui.tab_panel(tab_edit):
                         self.edit_container = ui.column().classes('w-full')
                     with ui.tab_panel(tab_validation):
-                        self.validation_view.build()
+                        with ui.tabs().classes('w-full') as refine_tabs:
+                            refine_content = ui.tab('内容のリファイン（解説と展開の改善）')
+                            refine_time = ui.tab('時間のリファイン（再生時間の最適化）')
+                        with ui.tab_panels(refine_tabs, value=refine_content).classes('w-full'):
+                            with ui.tab_panel(refine_content):
+                                self.validation_view.build()
+                            with ui.tab_panel(refine_time):
+                                self.time_refine_view.build()
+                        refine_time.on('click', lambda _: self.time_refine_view.refresh())
                 with ui.tab_panel(tab_statistics):
                     ui.label('📊 スライド別生成統計').classes('text-h5')
                     ui.label('工程別：ナレーション生成（画像・テキスト解析）／Bbox検出（スライド要素の位置検出）／字幕用翻訳／ポインタ位置選定／TTSヨミ変換').classes('text-caption text-slate-400')
@@ -5727,6 +5814,7 @@ class SlideNarratorApp:
                                                          lambda _: self._pointer_display_changed())
                         self.pointer_breakdown_mode.on('update:model-value',
                                                        lambda _: self._pointer_display_changed())
+                    self.statistics_time_refine_label = None  # リファイン結果はリファインタブへ集約
                     self.statistics_validation_label = ui.label('品質検査のLLM使用量：未計測').classes('text-caption text-slate-400')
                     self.statistics_notice = ui.label('プロジェクトを選択してください．').classes('text-caption text-slate-400')
                     self.statistics_chart_container = ui.column().classes('w-full')
@@ -5764,7 +5852,7 @@ class SlideNarratorApp:
             if not self.read_only:
                 tab_simple_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('simple'))
                 tab_edit.on('click', lambda _: self.refresh_output_views_on_tab_change('detail'))
-                tab_validation.on('click', lambda _: self.validation_view.refresh())
+                tab_validation.on('click', lambda _: (self.validation_view.refresh(), self.time_refine_view.refresh()))
 
     def build(self) -> None:
         ui.page_title('NarrationAutomata')

@@ -53,7 +53,7 @@ class ValidationView:
         self._diff_tasks: dict[int, asyncio.Task] = {}
 
     def build(self):
-        ui.label('🔎 ナレーション品質検査').classes('text-h5')
+        ui.label('内容のリファイン').classes('text-h5')
         ui.label('オートリファイナーONでは検査・修正・保存を自動実行します．OFFでは従来どおり手動で確認できます．').classes('text-caption text-slate-400')
         ui.add_css('''
             .validation-narration-editor .q-field__control { min-height: 300px; height: 300px; }
@@ -555,6 +555,8 @@ class ValidationView:
                                     with ui.expansion('修正前後の差分', icon='difference').classes('w-full'):
                                         ui.html(self._diff_markup(row['before'], row['after']))
             ui.label(f'検出された問題：残り {len(grouped)} スライド').classes('text-subtitle1 font-medium')
+            if grouped:
+                ui.label('以下のスライドには未解決の指摘があります．内容を確認し，必要な処置を行ってください．').classes('text-sm text-amber-700 dark:text-amber-300')
             if not grouped:
                 ui.label('検査結果はありません．').classes('text-slate-400')
             for page, issues in grouped.items():
