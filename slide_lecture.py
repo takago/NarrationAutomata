@@ -2555,7 +2555,7 @@ def main() -> int:
                 raise ValueError('不正なポインタ画像パスです．')
             cfg['video']['pointer_image'] = str(local_path)
             cfg['video']['pointer_anchor'] = proj_cfg.get('pointer_anchor')
-            cfg['video']['pointer_scale_percent'] = float(proj_cfg.get('pointer_scale_percent', 15))
+            cfg['video']['pointer_scale_percent'] = float(proj_cfg.get('pointer_scale_percent', 50))
         else:
             raise ValueError('project.json の pointer_image が不正です．')
     elif proj_cfg.get('pointer_image', None) == '':

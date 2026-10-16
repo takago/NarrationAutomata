@@ -614,6 +614,7 @@ class TimeRefineView:
         source_pdf = owner.pdf
         source_paths = owner.paths
         new_dir = None
+        handoff_to_pipeline = False
         try:
             self._message('独立したプロジェクトを作成しています…')
             while True:
@@ -753,31 +754,16 @@ class TimeRefineView:
                     self._message(f'短縮段階が終了しました：採用 {len(modified)} 枚，失敗 {len(failures)} 枚，空原稿 {len(skipped)} 枚．'
                                   + (f' 失敗スライド：{", ".join(str(item["page"]) for item in failures)}．' if failures else ''))
                 self._check_stop()
-                self._message('字幕・ポインタ・音声・動画を全スライドで再生成中…')
-                self._progress('音声・字幕・動画の再生成', '再生成中（所要時間はスライド数などに依存します）', indeterminate=True)
-                await owner._pipeline_worker('video', '時間リファイン')
-                if self.stop_requested:
-                    raise asyncio.CancelledError()
-                fresh = duration(owner.paths.final_video)
-                if fresh is None:
-                    raise RuntimeError('動画再生成が完了しませんでした．新規プロジェクトから再実行できます．')
-                if fresh >= current - 1:
-                    self._message('動画時間の短縮は確認できませんでした．説明品質を優先して終了します．')
-            result = duration(owner.paths.final_video)
-            new_cfg = load_project_json(owner.paths.root)
-            new_cfg['time_refine']['state'] = 'completed' if result is not None else 'failed'
-            new_cfg['time_refine']['result_seconds'] = result
-            save_project_json(owner.paths.root, new_cfg)
-            self.update_result()
-            failure_pages = [str(item['page']) for item in new_cfg['time_refine']['rounds'][-1].get('failures', [])] if new_cfg['time_refine']['rounds'] else []
-            summary = (f'時間リファイン完了：{fmt(baseline)} → {fmt(result)}（目標 {fmt(target)}）'
-                       if result is not None else '動画時間を取得できませんでした．')
-            if failure_pages:
-                summary += f'／短縮失敗 {len(failure_pages)} 枚（スライド {", ".join(failure_pages)}）．理由は実行ログとプロジェクト設定に保存しました．'
-            self._message(summary)
-            self._progress('時間リファイン完了', f'{fmt(baseline)} → {fmt(result)}（目標 {fmt(target)}）' if result else '動画時間を取得できませんでした．', fraction=1)
-            self._persist(state='completed' if result is not None else 'failed')
-            self._safe_ui(lambda: ui.notify('時間リファインが終了しました．', type='positive' if result and result <= target else 'warning'))
+                # 原稿の編集はここで完了．後続工程は別の通常生成ジョブに引き渡す．
+                new_cfg = load_project_json(owner.paths.root)
+                new_cfg['time_refine']['state'] = 'pipeline_pending'
+                save_project_json(owner.paths.root, new_cfg)
+                self._message('原稿の時間調整が完了しました．②〜④を通常パイプラインへ引き継ぎます．')
+                self._progress('原稿の時間調整完了', '通常パイプラインへ引き継ぎます…', fraction=1)
+                self._persist(state='completed', title='原稿の時間調整完了',
+                              detail='通常パイプラインへ引き継ぎ', fraction=1, indeterminate=False)
+                handoff_to_pipeline = True
+            self._safe_ui(lambda: ui.notify('原稿の時間調整が完了しました．通常生成を開始します．', type='info'))
         except asyncio.CancelledError:
             if new_dir is not None and new_dir.is_dir():
                 try:
@@ -817,3 +803,7 @@ class TimeRefineView:
             self.busy = False
             self.stop_requested = False
             self._safe_ui(self.refresh)
+            if handoff_to_pipeline:
+                # リファインの登録・表示状態を閉じてから別ジョブを起動する．
+                # 通常の②〜④が自身のロックとキャンセル管理を取得する．
+                owner.start_time_refine_pipeline()

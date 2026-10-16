@@ -46,6 +46,8 @@ from statistics_store import run_with_statistics, export_xlsx, read_records
 from validation.ui import ValidationView
 from validation.time_ui import TimeRefineView
 from validation import refine_job
+from validation.runner import run_auto_refiner
+from validation.store import log as validation_log
 
 from slide_lecture import (
     generate_single_alignment,
@@ -1036,6 +1038,9 @@ class SlideNarratorApp:
     @staticmethod
     def stage_button_key(stage: str | None) -> str | None:
         stage = str(stage or '')
+        # 内容のリファインは①〜④のいずれにも属さない独立工程．
+        if stage == 'validation':
+            return 'validation'
         if any(word in stage for word in ('ナレーション原稿', 'ナレーション再生成', 'explain')):
             return 'explain'
         if any(word in stage for word in ('字幕', 'ポインタ', '翻訳', 'align')):
@@ -1249,7 +1254,7 @@ class SlideNarratorApp:
             if display_state in ('running', 'failed', 'completed', 'cancelled'):
                 self.easy_progress_box.classes(remove='hidden') if self.view_mode == 'easy' else self.easy_progress_box.classes(add='hidden')
                 key = self.get_active_stage_key(own_display)
-                stage_names = {'explain': 'ナレーション原稿の生成', 'align': '翻訳・字幕・ポインタ配置', 'tts': '音声合成', 'video': '動画の生成'}
+                stage_names = {'explain': 'ナレーション原稿の生成', 'align': '翻訳・字幕・ポインタ配置', 'tts': '音声合成', 'video': '動画の生成', 'validation': '内容のリファイン'}
                 stage_name = stage_names.get(key, '生成処理')
                 progress = own_display.get('progress')
                 current_index = own_display.get('current_index')
@@ -1264,7 +1269,9 @@ class SlideNarratorApp:
                     self.easy_progress_label.text = '処理を中断しました'
                 stage_index = ORDERED_STAGES.index(key) if key in ORDERED_STAGES else 0
                 fraction = max(0.0, min(1.0, float(progress))) if isinstance(progress, (int, float)) else 0.0
-                self.easy_progress_bar.value = 1.0 if display_state == 'completed' else (stage_index + fraction) / len(ORDERED_STAGES)
+                self.easy_progress_bar.value = (1.0 if display_state == 'completed' else
+                    (1 + fraction) / len(ORDERED_STAGES) if key == 'validation' else
+                    (stage_index + fraction) / len(ORDERED_STAGES))
                 pieces = []
                 if current_index and total_count:
                     pieces.append(f'スライド {current_index} / {total_count}枚')
@@ -1311,6 +1318,20 @@ class SlideNarratorApp:
         completed_stages = status.get('completed_stages', [])
 
         active_idx = ORDERED_STAGES.index(active_key) if (active_key in ORDERED_STAGES) else -1
+
+        # validation には①〜④のボタンがないため，独立した進捗欄に表示する．
+        refine_box = getattr(self, 'pipeline_refine_progress_box', None)
+        if self._widget_available(refine_box):
+            showing_refine = (self.view_mode == 'advanced' and owner_is_self
+                              and active_key == 'validation'
+                              and status.get('state') in ('running', 'failed', 'cancelled'))
+            refine_box.classes(remove='hidden') if showing_refine else refine_box.classes(add='hidden')
+            if showing_refine:
+                progress = status.get('progress')
+                fraction = max(0.0, min(1.0, float(progress))) if isinstance(progress, (int, float)) else 0.0
+                self.pipeline_refine_progress_bar.value = fraction
+                self.pipeline_refine_progress_label.text = str(status.get('message') or '処理中…')
+                self.pipeline_refine_spinner.classes(remove='hidden') if status.get('state') == 'running' else self.pipeline_refine_spinner.classes(add='hidden')
 
         for key, w in self.stage_widgets.items():
             if self.view_mode == 'easy':
@@ -1430,6 +1451,84 @@ class SlideNarratorApp:
                 pass
         return cancel_pending
 
+    def _update_sidebar_extra_progress(self, state: dict[str, Any], *, active_stage: str) -> None:
+        """共通カードに従来の経過時間・スライド・LLM/TTS進捗を復元する．"""
+        elapsed_label = getattr(self, 'refine_sidebar_elapsed', None)
+        metrics_label = getattr(self, 'refine_sidebar_metrics', None)
+        if self._widget_available(elapsed_label):
+            started = state.get('started_at')
+            finished = state.get('finished_at')
+            elapsed_text = ''
+            if started:
+                try:
+                    start_at = datetime.fromisoformat(str(started))
+                    end_at = (datetime.fromisoformat(str(finished)) if finished and
+                              state.get('state') != 'running' else datetime.now(tz=start_at.tzinfo))
+                    seconds = max(0, int((end_at - start_at).total_seconds()))
+                    elapsed_text = f'経過時間：{seconds // 60}分{seconds % 60:02d}秒'
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            elapsed_label.text = elapsed_text
+            elapsed_label.classes(remove='hidden') if elapsed_text else elapsed_label.classes(add='hidden')
+        if self._widget_available(metrics_label):
+            metrics_text = ''
+            try:
+                tts = state.get('tts_metrics') if active_stage == 'tts' else None
+                llm = state.get('llm_metrics')
+                running = state.get('state') == 'running'
+                if isinstance(tts, dict):
+                    metrics_text = self.format_tts_progress(tts, running=running)
+                elif isinstance(llm, dict):
+                    metrics_text = self.format_llm_progress(llm, running=running)
+            except (ValueError, TypeError, KeyError):
+                LOGGER.exception('[sidebar] progress metrics formatting failed')
+            metrics_label.text = metrics_text
+            metrics_label.classes(remove='hidden') if metrics_text else metrics_label.classes(add='hidden')
+
+    def refresh_common_job_sidebar(self, status: dict[str, Any],
+                                   own_status: dict[str, Any],
+                                   owner_is_self: bool) -> None:
+        """時間・内容リファイン以外の通常生成進捗を共通カードへ描画する．"""
+        panel = getattr(self, 'refine_sidebar_panel', None)
+        if not self._widget_available(panel) or getattr(self, '_refine_sidebar_live', False):
+            return
+        display = status if owner_is_self else own_status
+        state = str(display.get('state') or '')
+        # 保存済みの完了状態は既存の完成ビデオ欄で確認できる．
+        if state not in ('running', 'failed', 'cancelled') or (state == 'running' and not owner_is_self):
+            panel.visible = False
+            return
+        panel.visible = True
+        if self._widget_available(getattr(self, 'refine_sidebar_spinner', None)):
+            self.refine_sidebar_spinner.classes(remove='hidden') if state == 'running' else self.refine_sidebar_spinner.classes(add='hidden')
+        name = {'explain': '① ナレーション原稿生成',
+                'validation': '内容のリファイン',
+                'align': '② 翻訳・字幕・ポインタ配置',
+                'tts': '③ 音声生成', 'video': '④ 動画生成'}
+        stage = name.get(self.get_active_stage_key(display), '通常パイプライン')
+        state_label = {'running': '実行中', 'failed': 'エラー停止', 'cancelled': '中断'}[state]
+        self.refine_sidebar_title.text = f'処理状況：{stage}（{state_label}）'
+        project = self.paths.root if self.paths is not None else None
+        self.refine_sidebar_project.text = f'プロジェクト：{project.name}' if project else ''
+        detail = str(display.get('error_detail') or display.get('message') or stage)
+        current = display.get('current_index')
+        total = display.get('total_count')
+        if current and total:
+            page = display.get('current_page')
+            prefix = f'スライド {page} ({current}/{total})' if page is not None else f'スライド {current} / {total}枚'
+            detail = f'{prefix}\n{detail}'
+        progress = display.get('progress')
+        if isinstance(progress, (int, float)):
+            detail = f'進捗：{max(0, min(100, int(progress * 100)))}％\n{detail}'
+        self.refine_sidebar_detail.text = detail
+        self._update_sidebar_extra_progress(display, active_stage=self.get_active_stage_key(display))
+        fraction = display.get('progress')
+        if isinstance(fraction, (int, float)):
+            self.refine_sidebar_bar.props(remove='indeterminate')
+            self.refine_sidebar_bar.value = max(0.0, min(1.0, float(fraction)))
+        else:
+            self.refine_sidebar_bar.props('indeterminate')
+
     def refresh_live_views(self) -> None:
         """Synchronize live UI widgets using one client-side polling timer.
 
@@ -1528,6 +1627,16 @@ class SlideNarratorApp:
         stage_status = {'state': 'idle', 'completed_stages': []} if refine_active else status
         cancel_pending = self._refresh_advanced_stages(
             stage_status, None if refine_active else active_key, globally_busy, owner_is_self)
+        self.refresh_common_job_sidebar(status, own_status, owner_is_self)
+        # 共通カードが進捗の唯一の表示場所．工程別ボタンと中断操作は残す．
+        if self._widget_available(self.refine_sidebar_panel) and self.refine_sidebar_panel.visible:
+            if self._widget_available(self.easy_progress_box):
+                self.easy_progress_box.classes(add='hidden')
+            if self._widget_available(getattr(self, 'pipeline_refine_progress_box', None)):
+                self.pipeline_refine_progress_box.classes(add='hidden')
+            for widgets in self.stage_widgets.values():
+                if self._widget_available(widgets.get('box')):
+                    widgets['box'].classes(add='hidden')
 
         if self._widget_available(self.easy_generate_button):
             self.set_button_enabled_visual(self.easy_generate_button, not (globally_busy or self.read_only))
@@ -2642,7 +2751,7 @@ class SlideNarratorApp:
             logging.exception('[refine-sidebar] initial project restore failed')
 
     def refresh_refine_sidebar(self) -> None:
-        """リファイン実行中は通常パイプラインよりも専用進捗を優先表示する．"""
+        """リファイン実行中は共通の処理状況カードを更新する．"""
         panel = getattr(self, 'refine_sidebar_panel', None)
         if panel is None or getattr(panel, 'is_deleted', False):
             self._refine_sidebar_live = False
@@ -2688,6 +2797,8 @@ class SlideNarratorApp:
             self._refine_sidebar_diag = diagnostic
         self._refine_sidebar_live = bool(live)
         panel.visible = True
+        if self._widget_available(getattr(self, 'refine_sidebar_spinner', None)):
+            self.refine_sidebar_spinner.classes(remove='hidden') if live else self.refine_sidebar_spinner.classes(add='hidden')
         # Time refinement switches to a copied project in a detached worker.
         # That code intentionally avoids touching NiceGUI widgets.  Synchronize
         # the selector here, from the browser's own periodic UI update instead.
@@ -2708,7 +2819,7 @@ class SlideNarratorApp:
                 LOGGER.info('[refine-sidebar] synchronized project selector: %s', project.name)
         title = '時間のリファイン' if kind == 'time' else '内容のリファイン'
         self.refine_sidebar_title.text = (
-            f'{title}：実行中' if live else f'{title}：実行状態を確認できません')
+            f'処理状況：{title}（実行中）' if live else f'処理状況：{title}（状態未確認）')
         # Display the user-facing project name as in the project selector,
         # while keeping its stable ID available for identification.
         project_pdfs = list(project.glob('*.pdf'))
@@ -2724,6 +2835,7 @@ class SlideNarratorApp:
         if not live:
             detail += '\n保存済みの進捗です．サーバ側の実行は確認できません．'
         self.refine_sidebar_detail.text = detail
+        self._update_sidebar_extra_progress(state, active_stage=kind)
         fraction = state.get('fraction') if kind == 'time' else state.get('progress')
         try:
             value = max(0.0, min(1.0, float(fraction))) if fraction is not None else None
@@ -2919,7 +3031,7 @@ class SlideNarratorApp:
             data = load_project_json(self.paths.root)
             data['pointer_image'] = target.name
             data['pointer_anchor'] = [round(w * .82), round(h * .31)]
-            data.setdefault('pointer_scale_percent', 15)
+            data.setdefault('pointer_scale_percent', 50)
             save_project_json(self.paths.root, data)
             self.proj_cfg = data
             self._invalidate_pointer_videos()
@@ -3048,7 +3160,7 @@ class SlideNarratorApp:
                     source = self._pointer_source(updated)
                     with Image.open(source) as img:
                         updated.setdefault('pointer_anchor', [round(img.width * .82), round(img.height * .31)])
-                    updated.setdefault('pointer_scale_percent', 15)
+                    updated.setdefault('pointer_scale_percent', 50)
                 else:
                     updated['pointer_image'] = ''
                 save_project_json(self.paths.root, updated)
@@ -3101,7 +3213,7 @@ class SlideNarratorApp:
             pages = sorted(int(f.stem) for f in self.paths.pages_dir.glob('[0-9]*.png') if f.stem.isdigit())
             if pages:
                 self.pointer_page_select = ui.select(pages, value=pages[0], label='背景スライド', on_change=lambda _: self._refresh_pointer_preview()).props('outlined dense').classes('w-full')
-                self.pointer_scale_slider = ui.slider(min=5, max=100, step=1, value=float(data.get('pointer_scale_percent', 15))).props('label-always')
+                self.pointer_scale_slider = ui.slider(min=5, max=100, step=1, value=float(data.get('pointer_scale_percent', 50))).props('label-always')
                 self.pointer_scale_slider.on_value_change(lambda _: self._refresh_pointer_preview())
                 ui.label('表示幅：スライド横幅に対する割合（％）．縦横比は維持します．').classes('text-xs text-zinc-400')
                 self._pointer_dragging = False
@@ -3109,7 +3221,7 @@ class SlideNarratorApp:
                 self.pointer_preview.set_source(self._pointer_preview_image())
                 ui.label('通常ページではドラッグしてプレビュー位置を変更できます．タイトルページは左下固定です．').classes('text-xs text-zinc-400')
             else:
-                self.pointer_scale_slider = ui.slider(min=5, max=100, step=1, value=float(data.get('pointer_scale_percent', 15))).props('label-always')
+                self.pointer_scale_slider = ui.slider(min=5, max=100, step=1, value=float(data.get('pointer_scale_percent', 50))).props('label-always')
                 ui.label('スライド画像生成後にプレビューを表示できます．').classes('text-xs text-zinc-400')
             def toggle_title_pointer(e):
                 if not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
@@ -3203,6 +3315,8 @@ class SlideNarratorApp:
             self.lang_select.value = self.lang_code
         if self.default_vlm_switch:
             self.default_vlm_switch.value = self.default_use_vlm
+        if self._widget_available(getattr(self, 'auto_refine_switch', None)):
+            self.auto_refine_switch.value = bool(self.proj_cfg.get('pipeline_auto_refine', True))
         self.refresh_pointer_image_panel()
         if self.pointer_default_select:
             default_mode = self.proj_cfg.get('pointer_default_mode', 'static') if self.pdf else 'static'
@@ -3231,6 +3345,7 @@ class SlideNarratorApp:
             'skip_pages': '',
             'visual_mode': 'vlm' if self.default_use_vlm else 'pdf',
             'slide_visual_modes': self.slide_visual_modes,
+            'pipeline_auto_refine': bool(self.proj_cfg.get('pipeline_auto_refine', True)),
         })
         save_project_json(self.paths.root, self.proj_cfg)
 
@@ -3271,8 +3386,8 @@ class SlideNarratorApp:
         target_pdf = self.pdf.resolve()
         with ui.dialog() as dialog, ui.card().classes('min-w-[340px] max-w-lg p-5 gap-3'):
             ui.label('生成データを削除しますか？').classes('text-lg font-bold text-red-400')
-            ui.label('このプロジェクトのナレーション原稿，翻訳・ポインタ情報，音声，単体動画，完成動画と字幕を削除します．')
-            ui.label('元PDF，プロジェクト名・設定，スライド画像は残します．削除後に自動生成は開始しません．この操作は取り消せません．').classes('text-sm text-zinc-400')
+            ui.label('このプロジェクトのナレーション原稿，翻訳・ポインタ情報，音声，動画，字幕，統計データ，内容リファインの検査結果・履歴を削除します．')
+            ui.label('元PDF，プロジェクト設定・ヨミ辞書，スライド画像は残します．削除後に自動生成は開始しません．この操作は取り消せません．').classes('text-sm text-zinc-400')
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('キャンセル', on_click=dialog.close).props('flat')
 
@@ -3305,6 +3420,16 @@ class SlideNarratorApp:
                 if directory.exists():
                     shutil.rmtree(directory)
 
+            # 統計データと内容リファインの検査・修正履歴も生成物として初期化する．
+            # 設定・辞書を含むproject.jsonやpages/は削除しない．
+            for statistics_file in paths.root.glob('statistics*'):
+                if statistics_file.is_file():
+                    statistics_file.unlink()
+            validation_dir = paths.root / 'validation'
+            if validation_dir.is_dir():
+                shutil.rmtree(validation_dir)
+            (paths.root / 'time_refine_result.xlsx').unlink(missing_ok=True)
+
             # slide_lecture.py のforce処理同様，最終出力を初期化する．
             # project.json やPDF，ユーザ別ジョブ履歴には触れない．
             for output in (paths.final_video, paths.final_ja_srt, paths.final_en_srt):
@@ -3315,13 +3440,22 @@ class SlideNarratorApp:
                     output.unlink()
 
             self.edit_page = self.active_pages[0] if self.active_pages else None
+            self._statistics_signature = None
+            # 同じプロジェクトの検査結果表示が古い履歴を保持しないようにする．
+            self.validation_view._drafts.clear()
+            self.validation_view._originals.clear()
+            self.validation_view._cancel_diff_tasks()
+            self.validation_view._open_page = None
             self.update_job_status('idle', stage='', message='生成データを削除しました',
                                    completed_stages=[], progress=None, current_page=None,
                                    current_index=None, total_count=None,
                                    cancellation_requested=False)
-            self.append_job_log('[RESET] 生成データを削除しました（元PDF・設定・ページ画像は保持）')
+            self.append_job_log('[RESET] 生成データ・統計・内容リファイン履歴を削除しました（元PDF・設定・ページ画像は保持）')
             await self.refresh_all()
-            safe_notify('生成データを削除しました．生成ボタンから作り直せます．', type='positive')
+            self.validation_view.refresh()
+            self.time_refine_view.refresh()
+            self.refresh_statistics_chart(force=True)
+            safe_notify('生成データと統計・検査履歴を削除しました．生成ボタンから作り直せます．', type='positive')
         except Exception as exc:
             LOGGER.exception('生成データの削除に失敗しました')
             safe_notify(f'生成データの削除に失敗しました: {exc}', type='negative')
@@ -3419,7 +3553,7 @@ class SlideNarratorApp:
             args.extend(['--pages', spec])
         return args
 
-    async def handle_pipeline_button(self, stage: str, initial_title: str) -> None:
+    async def handle_pipeline_button(self, stage: str, initial_title: str, *, full_auto: bool = False) -> None:
         if GLOBAL_EXECUTION_LOCK.is_locked():
             if GLOBAL_EXECUTION_LOCK.current_user == self.username:
                 owner = GLOBAL_EXECUTION_LOCK.owner_app
@@ -3432,13 +3566,13 @@ class SlideNarratorApp:
             else:
                 safe_notify(f'{GLOBAL_EXECUTION_LOCK.current_user or "別のユーザー"} が処理中です．完了までお待ちください．', type='warning')
             return
-        await self.pipeline(stage, initial_title)
+        await self.pipeline(stage, initial_title, full_auto=full_auto)
 
-    async def pipeline(self, stage: str, initial_title: str) -> None:
+    async def pipeline(self, stage: str, initial_title: str, *, full_auto: bool = False) -> None:
         if not self.write_access_allowed():
             return
         self._start_background_job(
-            lambda: self._pipeline_worker(stage, initial_title),
+            lambda: self._pipeline_worker(stage, initial_title, full_auto=full_auto),
             busy_message='このユーザーの生成処理はすでに実行中です．',
         )
 
@@ -3469,7 +3603,7 @@ class SlideNarratorApp:
             return 'tts'
         return target_stage
 
-    async def _pipeline_worker(self, stage: str, initial_title: str) -> None:
+    async def _pipeline_worker(self, stage: str, initial_title: str, *, full_auto: bool = False) -> None:
         if not self.pdf:
             safe_notify('先にプレゼンテーションPDFを選択してください．', type='warning')
             self.current_task = None
@@ -3487,6 +3621,10 @@ class SlideNarratorApp:
         first_idx = ORDERED_STAGES.index(from_stage)
         target_idx = ORDERED_STAGES.index(stage)
         stages_to_run = ORDERED_STAGES[first_idx:target_idx + 1]
+        # 起動ボタンに関係なく，①を実際に実行する場合はその直後にリファインする．
+        # ①が既に完了していて再実行しない場合はリファインも省略する．
+        pipeline_refine = ('explain' in stages_to_run
+                           and self._pipeline_auto_refine_enabled())
 
         lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"パイプライン ({stage})", self)
         if not lock_acquired:
@@ -3666,6 +3804,12 @@ class SlideNarratorApp:
                 )
                 self.debounce_refresh_views((run_stage,))
 
+                if run_stage == 'explain' and pipeline_refine:
+                    current_phase = 'validation'
+                    await self._run_pipeline_auto_refine(completed_stages)
+                    if self.cancellation_requested:
+                        raise asyncio.CancelledError()
+
             if succeeded and not cancelled:
                 self.update_job_status(
                     'completed', stage=stage,
@@ -3722,6 +3866,65 @@ class SlideNarratorApp:
             safe_notify(f'処理に失敗しました: {exc}', type='negative')
         finally:
             self._finalize_cancel_request(completed_stages=list(completed_stages))
+            self._complete_background_job()
+
+    def start_time_refine_pipeline(self) -> None:
+        """時間調整終了後，独立した通常パイプラインのジョブを開始する．"""
+        self._start_background_job(
+            lambda: self._run_time_refine_pipeline(),
+            busy_message='時間調整後の動画生成はすでに実行中です．',
+        )
+
+    async def _run_time_refine_pipeline(self) -> None:
+        """時間リファイナーのジョブに依存せず，通常の②〜④を実行する．"""
+        project_root = self.paths.root if self.paths else None
+        try:
+            if self.paths is None or not self.active_pages:
+                raise RuntimeError('再生成するプロジェクトまたは対象スライドがありません．')
+            missing = [page for page in self.active_pages
+                       if not self.paths.explanation(page).is_file()
+                       or not self.paths.explanation(page).read_text(encoding='utf-8').strip()]
+            if missing:
+                raise RuntimeError(f'時間調整後の原稿がありません（スライド {missing}）．')
+            if self._determine_starting_stage('video') == 'explain':
+                raise RuntimeError('①の再実行が必要です．時間調整済み原稿を保護するため停止します．')
+            await self._pipeline_worker('video', '時間調整後の動画生成')
+            status = read_user_job_status(self.username)
+            if status.get('state') == 'cancelled':
+                raise asyncio.CancelledError()
+            if status.get('state') != 'completed' or not self.paths.final_video.is_file():
+                state = status.get('state', 'failed')
+                raise RuntimeError(f'後続工程が完了しませんでした：{state}')
+            from validation.time_ui import duration
+            result = await run.io_bound(duration, self.paths.final_video)
+            if result is None:
+                raise RuntimeError('完成動画の時間を取得できませんでした．')
+            config = load_project_json(project_root)
+            meta = config.get('time_refine', {})
+            if isinstance(meta, dict):
+                meta['state'] = 'completed'
+                meta['result_seconds'] = result
+                save_project_json(project_root, config)
+            self._safe_view_update(self.time_refine_view.update_result, '時間調整結果の表示')
+        except asyncio.CancelledError:
+            if project_root is not None:
+                config = load_project_json(project_root)
+                if isinstance(config.get('time_refine'), dict):
+                    config['time_refine']['state'] = 'cancelled'
+                    save_project_json(project_root, config)
+            raise
+        except Exception as exc:
+            if project_root is not None:
+                config = load_project_json(project_root)
+                if isinstance(config.get('time_refine'), dict):
+                    config['time_refine']['state'] = 'failed'
+                    config['time_refine']['error'] = f'{type(exc).__name__}: {exc}'
+                    save_project_json(project_root, config)
+            self.append_job_log(f'[TIME_REFINE] 通常パイプライン引き継ぎ後のエラー: {exc}')
+            # パイプライン起動前の検査失敗もユーザに見えるように記録する．
+            status = read_user_job_status(self.username)
+            if status.get('state') not in ('failed', 'cancelled'):
+                self.update_job_status('failed', stage='align', message=str(exc)[:240])
             self._complete_background_job()
 
     # --- 個別スライド操作（原稿再生成・アライメント・TTS） ---
@@ -4601,6 +4804,27 @@ class SlideNarratorApp:
             self.append_job_log(f'[STATISTICS ERROR] {type(exc).__name__}: {exc}')
             safe_notify(f'統計XLSXの作成に失敗しました: {exc}', type='negative')
 
+    def start_sidebar_time_refine(self, minutes: float | None) -> None:
+        """Use the existing time-refiner; no parallel sidebar worker."""
+        view = self.time_refine_view
+        seconds, reason = view._source()
+        if reason or seconds is None:
+            ui.notify(reason or '完成動画を確認できません．', type='warning')
+            return
+        try:
+            target = float(minutes)
+        except (TypeError, ValueError):
+            ui.notify('目標時間を入力してください．', type='warning')
+            return
+        if not 0 < target * 60 < seconds:
+            ui.notify('目標時間は現在の動画時間より短く設定してください．', type='warning')
+            return
+        if view.controls is None:
+            ui.notify('時間リファイン画面が初期化されていません．', type='negative')
+            return
+        view.target_minutes = target
+        view.start()
+
     async def refresh_final_video(self) -> None:
         if not self._widget_available(self.final_video_container):
             return
@@ -4624,6 +4848,23 @@ class SlideNarratorApp:
                 ui.button('MP4ダウンロード', icon='download',
                           on_click=lambda url=video_download_url, name=download_name: ui.download(url, filename=name)) \
                     .props('dense outline').classes('w-full')
+                # A concise entry point to the same time-refine workflow as the detail tab.
+                # Re-created with the completed-video panel on project changes.
+                if not self.read_only:
+                    secs, reason = self.time_refine_view._source()
+                    if secs is not None and not reason:
+                        ui.separator().classes('my-1')
+                        ui.label('解説時間の調整').classes('text-sm font-bold text-zinc-200')
+                        ui.label(f'現在の動画：約{secs / 60:.1f}分').classes('text-xs text-zinc-400')
+                        target_input = ui.number('目標時間（分）', min=1, max=1440, precision=1,
+                                                 value=None).props('outlined dense').classes('w-full')
+                        ui.label('新しいプロジェクトを作成して時間を調整します．元のプロジェクトと動画は変更されません．') \
+                            .classes('text-xs text-zinc-400')
+                        ui.label('現在の動画より短い時間を入力してください．詳細な短縮方針は「時間のリファイン」タブで設定できます．') \
+                            .classes('text-xs text-zinc-400')
+                        ui.button('解説時間の調整', icon='schedule',
+                                  on_click=lambda field=target_input: self.start_sidebar_time_refine(field.value)) \
+                            .props('outline color=primary').classes('w-full')
             else:
                 ui.label('動画未生成').classes('text-xs text-zinc-500')
 
@@ -5758,12 +5999,6 @@ class SlideNarratorApp:
             self.project_id_label = ui.label(f'プロジェクトID：{current_id or "未選択"}') \
                 .classes('w-full text-xs text-zinc-400 font-mono mt-2 select-text')
 
-            with ui.column().classes('w-full gap-2 p-3 mt-2 rounded-lg border border-blue-500/40 bg-slate-900') as self.refine_sidebar_panel:
-                self.refine_sidebar_title = ui.label('').classes('font-bold text-sm text-blue-300')
-                self.refine_sidebar_project = ui.label('').classes('text-xs text-zinc-400')
-                self.refine_sidebar_detail = ui.label('').classes('text-xs whitespace-pre-wrap break-words')
-                self.refine_sidebar_bar = ui.linear_progress(value=0, show_value=False).props('rounded size=8px color=primary').classes('w-full')
-            self.refine_sidebar_panel.visible = False
 
             # 設定行のラベル列とラジオ選択肢の列幅を揃える．
             with ui.column().classes('w-full gap-1 mt-2'):
@@ -5859,6 +6094,15 @@ class SlideNarratorApp:
                 self.pointer_default_select.on_value_change(lambda e: self._pointer_default_changed(e.value))
                 ui.label('スライド・文ごとの個別設定が優先されます．').classes('text-xs text-zinc-400')
 
+            with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2') as refine_settings_card:
+                self.advanced_sidebar_sections.append(refine_settings_card)
+                self.auto_refine_switch = ui.switch(
+                    '①原稿生成後に内容をリファインする',
+                    value=bool(self.proj_cfg.get('pipeline_auto_refine', True)),
+                ).props('dense color=primary')
+                self.auto_refine_switch.tooltip('①原稿生成後，3種類の検査を1回ずつ実行します．設定はEasy/Advanced共通で，切り替えても維持されます．')
+                self.auto_refine_switch.on_value_change(lambda e: self._auto_refine_changed(e.value))
+
             # Easyでは見出しと付随する区切り線を隠し，余白を残さない．
             self.pipeline_heading_separator = ui.separator()
             self.pipeline_heading_label = ui.label('パイプライン実行').classes('text-h6')
@@ -5872,7 +6116,7 @@ class SlideNarratorApp:
 
             self.easy_generate_button = ui.button(
                 '全自動生成', icon='play_arrow',
-                on_click=lambda: self.handle_pipeline_button('video', '④ ナレーションビデオを作成中…'),
+                on_click=lambda: self.handle_pipeline_button('video', '④ ナレーションビデオを作成中…', full_auto=True),
             ).props('color=primary').classes('w-full')
             self.easy_generate_button.tooltip('必要な前工程から動画完成まで一括して実行します．')
             self.easy_cancel_button = ui.button(
@@ -5893,6 +6137,14 @@ class SlideNarratorApp:
             self.advanced_stage_rows.clear()
 
             for key, label, initial_msg in STAGE_DEFINITIONS:
+                if key == 'align':
+                    # ①と②の間で実行する内容のリファインは，④の進捗欄を流用しない．
+                    with ui.column().classes('w-full gap-1 px-2 py-2 rounded-lg bg-zinc-900 border border-zinc-800 hidden') as self.pipeline_refine_progress_box:
+                        with ui.row().classes('w-full items-center gap-2'):
+                            self.pipeline_refine_spinner = ui.spinner(size='xs', color='primary')
+                            ui.label('内容のリファイン').classes('text-sm font-bold')
+                        self.pipeline_refine_progress_label = ui.label('準備中…').classes('text-xs text-zinc-300 whitespace-pre-wrap')
+                        self.pipeline_refine_progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=6px color=positive').classes('w-full')
                 with ui.column().classes('w-full gap-1 mb-2') as stage_row:
                     self.advanced_stage_rows.append(stage_row)
                     btn = ui.button(label, on_click=lambda k=key, m=initial_msg: self.handle_pipeline_button(k, m)).props('color=primary').classes('w-full')
@@ -5922,6 +6174,18 @@ class SlideNarratorApp:
                         'easy_elapsed': p_easy_elapsed,
                         'error': p_error,
                     }
+
+            # リファインと通常生成の進捗を同じ位置に表示する．
+            with ui.column().classes('w-full gap-2 p-3 mt-2 rounded-lg border border-blue-500/40 bg-slate-900') as self.refine_sidebar_panel:
+                self.refine_sidebar_title = ui.label('処理状況').classes('font-bold text-sm text-blue-300')
+                self.refine_sidebar_project = ui.label('').classes('text-xs text-zinc-400')
+                self.refine_sidebar_detail = ui.label('').classes('text-xs whitespace-pre-wrap break-words')
+                self.refine_sidebar_elapsed = ui.label('').classes('hidden text-xs text-zinc-400')
+                self.refine_sidebar_metrics = ui.label('').classes('hidden text-xs text-zinc-300 whitespace-pre-wrap break-words')
+                with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
+                    self.refine_sidebar_spinner = ui.spinner(size='sm', color='primary').classes('hidden shrink-0')
+                    self.refine_sidebar_bar = ui.linear_progress(value=0, show_value=False).props('rounded size=8px color=primary').classes('flex-1 min-w-0')
+            self.refine_sidebar_panel.visible = False
 
             self.reset_generated_button = self.register_main_action_button(
                 ui.button('生成データを削除', icon='delete_outline', on_click=self.confirm_reset_generated_data)
@@ -5960,7 +6224,7 @@ class SlideNarratorApp:
                     self._tab_simple_edit = tab_simple_edit
                     tab_edit = ui.tab('📝 ナレーション編集')
                     self._tab_edit = tab_edit
-                    tab_validation = ui.tab('✨ リファイン').props('id=na-refine-main-tab')
+                    tab_validation = ui.tab('✨ リファイナー').props('id=na-refine-main-tab')
                     self._tab_validation = tab_validation
                 tab_statistics = ui.tab('📊 統計')
                 tab_logs = ui.tab('📜 ログ')
@@ -5984,6 +6248,14 @@ class SlideNarratorApp:
                     with ui.tab_panel(tab_edit):
                         self.edit_container = ui.column().classes('w-full')
                     with ui.tab_panel(tab_validation):
+                        # リファイナーの詳細操作は任意．通常の生成・時間調整はサイドバーから実行できる．
+                        with ui.column().classes('w-full rounded-lg bg-slate-800/40 border border-slate-700 p-4 gap-1'):
+                            ui.label('ナレーション原稿の内容と解説時間を調整します．').classes('text-sm font-semibold')
+                            ui.label('通常はこのタブを操作する必要はありません．').classes('text-sm text-slate-300')
+                            ui.label('・内容のリファイン：サイドバーの設定がONの場合，①原稿生成の直後に自動実行されます．設定の変更はAdvancedモードで行えます．').classes('text-sm text-slate-300')
+                            ui.label('・時間のリファイン：完成動画はサイドバーの「解説時間の調整」から調整できます．調整後は新しいプロジェクトとして作成され，元の動画は保持されます．').classes('text-sm text-slate-300')
+                            ui.label('調整前後の解説時間やナレーションの変更内容は，「統計」タブではなく，「時間のリファイン」タブで確認できます．').classes('text-sm text-slate-300')
+                            ui.label('このタブでは，検査結果の確認や調整条件の指定など，詳しい操作を行えます．').classes('text-sm text-slate-300')
                         with ui.tabs().classes('w-full') as refine_tabs:
                             self._refine_tabs = refine_tabs
                             refine_content = ui.tab('内容のリファイン（解説と展開の改善）').props('id=na-refine-content-tab')
@@ -6128,6 +6400,53 @@ class SlideNarratorApp:
         self.save_project_settings()
         background_tasks.create(self.refresh_simple_editor())
         background_tasks.create(self.refresh_editor())
+
+    def _auto_refine_changed(self, enabled: bool) -> None:
+        """プロジェクト共通のリファイン設定．表示モードには依存しない．"""
+        if not self.write_access_allowed() or not self.paths:
+            return
+        if bool(self.proj_cfg.get('pipeline_auto_refine', True)) == bool(enabled):
+            return
+        self.proj_cfg['pipeline_auto_refine'] = bool(enabled)
+        self.save_project_settings()
+
+    def _pipeline_auto_refine_enabled(self) -> bool:
+        return bool(self.proj_cfg.get('pipeline_auto_refine', True))
+
+    async def _run_pipeline_auto_refine(self, completed_stages: list[str]) -> None:
+        """①の直後に1周実行．共通runnerはジョブとロックを所有しない．"""
+        self.append_job_log('=== 内容のリファイン 開始（3検査，各1回） ===')
+        self.update_job_status('running', stage='validation', completed_stages=list(completed_stages),
+                               message='内容のリファインを開始します', progress=0.0)
+
+        def report(message: str, *, page=None, index=None, total=None, progress=None, stage='validation') -> None:
+            self.append_job_log(message)
+            self.update_job_status('running', stage='validation',
+                                   completed_stages=list(completed_stages), message=message,
+                                   current_page=page, current_index=index,
+                                   total_count=total, progress=progress)
+
+        def refresh() -> None:
+            # 履歴を保存した後に結果タブが開いていれば更新する．
+            self._safe_view_update(self.validation_view.render_results, 'リファイン履歴更新')
+
+        state = await run_auto_refiner(
+            self, ('rules', 'individual', 'overall'), 1,
+            atomic_write_text, report=report, notify_change=refresh,
+        )
+        if self.cancellation_requested or not state.get('completed'):
+            raise asyncio.CancelledError()
+        errors = [f for f in state.get('findings', []) if f.get('kind') == 'check_error']
+        errors.extend(row for row in state.get('auto_refiner', {}).get('history', [])
+                      if str(row.get('status', '')).startswith('失敗：'))
+        if errors:
+            raise RuntimeError(f'内容のリファインで検査・修正エラーが{len(errors)}件発生しました')
+        remaining = len({int(f['page']) for f in state.get('findings', []) if 'page' in f})
+        message = f'内容のリファイン完了（1周，残り指摘：{remaining}スライド）'
+        self.append_job_log(message)
+        validation_log(self.paths.root, message)
+        self.update_job_status('running', stage='validation',
+                               completed_stages=list(completed_stages), message=message, progress=1.0)
 
     def _default_vlm_changed(self, value: bool) -> None:
         if not self.write_access_allowed():
