@@ -38,7 +38,9 @@ class ValidationView:
         self.progress = None
         self.bar = None
         self.results = None
-        self.selection = {s: s == 'rules' for s in STAGES}
+        self.selection = {s: True for s in STAGES}
+        self.auto_refiner = True
+        self.max_rounds = 3
         self._project_key = None
         self._drafts: dict[int, str] = {}
         self._originals: dict[int, str] = {}
@@ -52,7 +54,7 @@ class ValidationView:
 
     def build(self):
         ui.label('🔎 ナレーション品質検査').classes('text-h5')
-        ui.label('検査は原稿を変更しません．指摘を確認して編集し，保存した場合だけ原稿に反映します．').classes('text-caption text-slate-400')
+        ui.label('オートリファイナーONでは検査・修正・保存を自動実行します．OFFでは従来どおり手動で確認できます．').classes('text-caption text-slate-400')
         ui.add_css('''
             .validation-narration-editor .q-field__control { min-height: 300px; height: 300px; }
             .validation-narration-editor textarea { line-height: 1.55; }
@@ -84,6 +86,9 @@ class ValidationView:
                 ui.label('プロジェクトを選択してください．')
                 self.results.clear()
                 return
+            with ui.row().classes('items-center gap-4'):
+                ui.switch('オートリファイナー', value=self.auto_refiner, on_change=lambda e: setattr(self, 'auto_refiner', bool(e.value)))
+                ui.number('最大周回数', value=self.max_rounds, min=1, max=10, step=1, precision=0, on_change=lambda e: setattr(self, 'max_rounds', max(1, min(10, int(e.value or 1))))).props('dense outlined').classes('w-32')
             for stage in STAGES:
                 with ui.row().classes('w-full items-center gap-3'):
                     ui.checkbox(STAGE_NAMES[stage], value=self.selection[stage],
@@ -103,9 +108,14 @@ class ValidationView:
         if progress is not None:
             self._progress_value = min(1.0, max(0.0, progress))
             self.bar.value = self._progress_value
+        # index/total are inspection work units, not slide numbers.
+        # Keep them for the inspection progress bar, but report actual slide
+        # counts to the shared sidebar status display.
+        pages = self._pages()
+        slide_index = pages.index(page) + 1 if page in pages else None
         self.owner.update_job_status('running', stage=stage, message=text,
-                                     current_page=page, current_index=index,
-                                     total_count=total, progress=self._progress_value)
+                                     current_page=page, current_index=slide_index,
+                                     total_count=len(pages), progress=self._progress_value)
 
     def start(self):
         if self.busy or self.owner.processing:
@@ -126,7 +136,7 @@ class ValidationView:
         self.busy = True  # タスクの起動を待たずにボタンを無効化する
         if self._start_button is not None:
             self._start_button.disable()
-        asyncio.create_task(self._worker(stages))
+        asyncio.create_task(self._auto_worker(stages, self.max_rounds) if self.auto_refiner else self._worker(stages))
 
     async def _worker(self, stages):
         owner = self.owner
@@ -263,6 +273,256 @@ class ValidationView:
             owner._complete_background_job()
             self.render_results()
 
+    async def _auto_worker(self, stages, max_rounds):
+        """Run each selected check against the most recently saved narration.
+
+        Keep the existing manual worker untouched. Failed generations are never saved.
+        """
+        owner = self.owner
+        if not await self.execution_lock.acquire(owner.username, 'オートリファイナー', owner):
+            self.busy = False
+            if self._start_button is not None:
+                self._start_button.enable()
+            ui.notify('ほかのユーザの処理が実行中です．', type='warning')
+            return
+        owner.set_processing(True)
+        owner.current_task = asyncio.current_task()
+        project = owner.paths.root
+        pages = self._pages()
+        self._drafts.clear()
+        self._originals.clear()
+        self._cancel_diff_tasks()
+        self._open_page = None
+        history = []
+        state = {'findings': [], 'stages': {}, 'completed': False,
+                 'auto_refiner': {'max_rounds': max_rounds, 'rounds': 0, 'history': history}}
+        save(project, state)
+        self.render_results()
+        client = None
+        try:
+            total = max_rounds * sum(len(pages) if stage != 'overall' else (len(pages)+7)//8+1 for stage in stages)
+            done = 0
+            previous_failures = set()
+            for turn in range(1, max_rounds + 1):
+                if owner.cancellation_requested:
+                    break
+                modified = False
+                round_findings = []
+                round_errors = []
+                detected = []
+                state['auto_refiner']['rounds'] = turn
+                for stage in stages:
+                    if owner.cancellation_requested:
+                        break
+                    self._status(f'オートリファイナー {turn}/{max_rounds}周：{STAGE_NAMES[stage]}',
+                                 progress=done/max(total, 1), stage='validation-'+stage)
+                    issues = []
+                    if stage == 'rules':
+                        for page in pages:
+                            if owner.cancellation_requested: break
+                            text = owner.paths.explanation(page).read_text(encoding='utf-8')
+                            issues.extend(rule_check(text, page))
+                            done += 1
+                            await asyncio.sleep(0)
+                    elif stage == 'individual':
+                        client = client or await run.io_bound(make_client, owner.cfg['llm'])
+                        for page in pages:
+                            if owner.cancellation_requested: break
+                            text = owner.paths.explanation(page).read_text(encoding='utf-8')
+                            try:
+                                found = await run.io_bound(
+                                    run_with_statistics, project/'statistics.jsonl', page,
+                                    individual_check, client, owner.cfg['llm'], page, text,
+                                    owner.paths.page_image(page), rule_check(text, page))
+                                issues.extend(found)
+                            except Exception as exc:
+                                round_errors.append(dict(page=page, stage=stage, kind='check_error',
+                                                         description=f'検査エラー：{exc}', evidence=''))
+                                log(project, f'オートリファイナー 個別検査 #{page} ERROR {exc}')
+                            done += 1
+                            self._status(f'{turn}/{max_rounds}周 個別検査 #{page}', page=page,
+                                         index=done, total=total, progress=done/max(total, 1))
+                    else:
+                        client = client or await run.io_bound(make_client, owner.cfg['llm'])
+                        summaries = []
+                        for start in range(0, len(pages), 8):
+                            if owner.cancellation_requested: break
+                            part = pages[max(0, start-2):start+8]
+                            texts = [(p, owner.paths.explanation(p).read_text(encoding='utf-8')) for p in part]
+                            try:
+                                found, summary = await run.io_bound(
+                                    run_with_statistics, project/'statistics.jsonl', None,
+                                    overall_check, client, owner.cfg['llm'], texts)
+                                issues.extend(found)
+                                if summary:
+                                    summaries.append((part[0], part[-1], summary))
+                            except Exception as exc:
+                                round_errors.append(dict(page=part[0], stage=stage, kind='check_error',
+                                                         description=f'全体検査エラー：{exc}', evidence=''))
+                                log(project, f'オートリファイナー 全体検査 ERROR {exc}')
+                            done += 1
+                        if summaries and not owner.cancellation_requested:
+                            try:
+                                issues.extend(await run.io_bound(
+                                    run_with_statistics, project/'statistics.jsonl', None,
+                                    synthesis_check, client, owner.cfg['llm'], summaries, pages))
+                            except Exception as exc:
+                                round_errors.append(dict(page=pages[0], stage=stage, kind='check_error',
+                                                         description=f'総合検査エラー：{exc}', evidence=''))
+                                log(project, f'オートリファイナー 総合検査 ERROR {exc}')
+                        done += 1
+                    detected.extend(dict(f, stage=stage) for f in issues)
+                    grouped = OrderedDict()
+                    for issue in issues:
+                        page = int(issue['page'])
+                        if page in pages:
+                            grouped.setdefault(page, []).append(dict(issue, stage=stage))
+                    for page, findings in grouped.items():
+                        if owner.cancellation_requested:
+                            break
+                        path = owner.paths.explanation(page)
+                        before = path.read_text(encoding='utf-8')
+                        signature = (stage, page, digest(before))
+                        row = {'round': turn, 'page': page, 'stage': stage,
+                               'issues': [x.get('description', '') for x in findings],
+                               'action': '再生成' if stage == 'rules' else '自動校正',
+                               'status': '未解決', 'before': before, 'after': before}
+                        history.append(row)
+                        if signature in previous_failures:
+                            row['status'] = '前回と同じ原稿・問題のため再試行を省略'
+                            round_findings.extend(findings)
+                            continue
+                        try:
+                            if stage == 'rules':
+                                client = client or await run.io_bound(make_client, owner.cfg['llm'])
+                                candidate = await run.io_bound(
+                                    run_with_statistics, project/'statistics.jsonl', page,
+                                    generate_single_explanation, client=client, cfg=owner.cfg['llm'],
+                                    pdf=owner.pdf, images=owner.images,
+                                    out_dir=owner.paths.explanations_dir, page=page,
+                                    active_pages=owner.active_pages, mode=owner.mode_code,
+                                    lang=owner.lang_code, persist=False)
+                            else:
+                                candidate = await run.io_bound(
+                                    run_with_statistics, project/'statistics.jsonl', page,
+                                    correct, client, owner.cfg['llm'], page, before, findings)
+                            if not regeneration_valid(candidate):
+                                raise ValueError('空文または特殊トークンを含むため採用できません')
+                            if candidate.strip() == before.strip():
+                                row['status'] = '原稿に変化なし'
+                                previous_failures.add(signature)
+                                round_findings.extend(findings)
+                                continue
+                            candidate = candidate.rstrip() + '\n'
+                            # Only adopt if the on-disk source has not changed since inspection.
+                            if path.read_text(encoding='utf-8') != before:
+                                raise RuntimeError('検査後に原稿が変更されました')
+                            self.atomic_writer(path, candidate)
+                            owner.paths.cleanup_downstream(page, include_alignment=True)
+                            row['after'] = candidate
+                            row['status'] = '修正・保存済み（次周で再検査）'
+                            modified = True
+                        except Exception as exc:
+                            row['status'] = f'失敗：{exc}'
+                            previous_failures.add(signature)
+                            round_findings.extend(findings)
+                            log(project, f'オートリファイナー #{page} {stage} ERROR {exc}')
+                        state['auto_refiner']['history'] = history
+                        save(project, state)
+                    state['stages'][stage] = {'count': len(issues), 'completed': not owner.cancellation_requested,
+                                               'at': datetime.now().isoformat(timespec='seconds')}
+                # A complete final pass is needed after the last changes to establish resolution.
+                if not owner.cancellation_requested and modified and turn == max_rounds:
+                    self._status('最終修正の確認検査を実施中', stage='validation')
+                    round_findings = await self._auto_verify(stages, pages, project, client, round_errors)
+                elif not modified or owner.cancellation_requested:
+                    round_findings = detected + round_errors
+                state['findings'] = self._auto_attach_hash(round_findings, owner)
+                save(project, state)
+                self.render_results()
+                if not modified:
+                    break
+            state['completed'] = not owner.cancellation_requested
+            if owner.cancellation_requested:
+                state['completed'] = False
+            save(project, state)
+            left = len(set(int(f['page']) for f in state['findings']))
+            label = '中断' if owner.cancellation_requested else '完了'
+            message = f'オートリファイナー{label}：{state["auto_refiner"]["rounds"]}周，残り{left}スライド'
+            self.progress.text = message
+            owner.update_job_status('cancelled' if owner.cancellation_requested else 'completed',
+                                    stage='validation', message=message,
+                                    progress=None if owner.cancellation_requested else 1.0)
+            log(project, message)
+        except asyncio.CancelledError:
+            self.progress.text = 'オートリファイナーを中断しました．'
+            owner.update_job_status('cancelled', stage='validation', message=self.progress.text)
+        except Exception as exc:
+            self.progress.text = f'オートリファイナーエラー：{exc}'
+            owner.update_job_status('failed', stage='validation', message=self.progress.text)
+            log(project, f'オートリファイナー ERROR {exc}')
+            ui.notify(self.progress.text, type='negative')
+        finally:
+            self.busy = False
+            if self._start_button is not None:
+                self._start_button.enable()
+            owner._finalize_cancel_request()
+            owner._complete_background_job()
+            self.render_results()
+
+    @staticmethod
+    def _auto_attach_hash(findings, owner):
+        return [dict(f, hash=digest(owner.paths.explanation(int(f['page'])).read_text(encoding='utf-8')))
+                for f in findings if owner.paths.explanation(int(f['page'])).exists()]
+
+    async def _auto_verify(self, stages, pages, project, client, errors):
+        """Read-only final verification; no implicit adoption after the final round."""
+        owner = self.owner
+        found = list(errors)
+        for stage in stages:
+            if owner.cancellation_requested: break
+            if stage == 'rules':
+                for page in pages:
+                    found.extend(dict(f, stage=stage) for f in rule_check(
+                        owner.paths.explanation(page).read_text(encoding='utf-8'), page))
+            elif stage == 'individual':
+                client = client or await run.io_bound(make_client, owner.cfg['llm'])
+                for page in pages:
+                    if owner.cancellation_requested: break
+                    txt = owner.paths.explanation(page).read_text(encoding='utf-8')
+                    try:
+                        result = await run.io_bound(run_with_statistics, project/'statistics.jsonl', page,
+                            individual_check, client, owner.cfg['llm'], page, txt,
+                            owner.paths.page_image(page), rule_check(txt, page))
+                        found.extend(dict(f, stage=stage) for f in result)
+                    except Exception as exc:
+                        found.append(dict(page=page, stage=stage, kind='check_error',
+                                          description=f'検査エラー：{exc}', evidence=''))
+            else:
+                client = client or await run.io_bound(make_client, owner.cfg['llm'])
+                summaries = []
+                for start in range(0, len(pages), 8):
+                    if owner.cancellation_requested: break
+                    part = pages[max(0, start-2):start+8]
+                    texts = [(p, owner.paths.explanation(p).read_text(encoding='utf-8')) for p in part]
+                    try:
+                        result, summary = await run.io_bound(run_with_statistics, project/'statistics.jsonl',
+                            None, overall_check, client, owner.cfg['llm'], texts)
+                        found.extend(dict(f, stage=stage) for f in result)
+                        if summary: summaries.append((part[0], part[-1], summary))
+                    except Exception as exc:
+                        found.append(dict(page=part[0], stage=stage, kind='check_error',
+                                          description=f'全体検査エラー：{exc}', evidence=''))
+                if summaries and not owner.cancellation_requested:
+                    try:
+                        result = await run.io_bound(run_with_statistics, project/'statistics.jsonl',
+                            None, synthesis_check, client, owner.cfg['llm'], summaries, pages)
+                        found.extend(dict(f, stage=stage) for f in result)
+                    except Exception as exc:
+                        found.append(dict(page=pages[0], stage=stage, kind='check_error',
+                                          description=f'総合検査エラー：{exc}', evidence=''))
+        return found
+
     def render_results(self):
         if self.results is None:
             return
@@ -276,6 +536,24 @@ class ValidationView:
         for issue in state.get('findings', []):
             grouped.setdefault(int(issue['page']), []).append(issue)
         with self.results:
+            auto = state.get('auto_refiner')
+            if auto:
+                entries = auto.get('history', [])
+                changed = [r for r in entries if r.get('status', '').startswith('修正・保存')]
+                ui.label(f'オートリファイナー：{auto.get("rounds", 0)}/{auto.get("max_rounds", 3)}周，修正・保存 {len(changed)}回，残り {len(grouped)}スライド').classes('text-subtitle1')
+                per_page = OrderedDict()
+                for row in entries:
+                    per_page.setdefault(int(row['page']), []).append(row)
+                with ui.expansion(f'スライド別修正履歴（{len(per_page)}スライド）', icon='history').classes('w-full border rounded'):
+                    for number, rows in per_page.items():
+                        unresolved = number in grouped
+                        with ui.expansion(f'#{number}：{len(rows)}回対応 ・ {"要手動確認" if unresolved else "解決"}', icon='warning' if unresolved else 'check_circle').classes('w-full'):
+                            for row in rows:
+                                brief = '／'.join(str(t) for t in row.get('issues', []))[:250]
+                                ui.label(f'{row["round"]}周目・{STAGE_NAMES.get(row["stage"], row["stage"])}：{brief} → {row["action"]}：{row["status"]}').classes('text-sm')
+                                if row.get('before') != row.get('after'):
+                                    with ui.expansion('修正前後の差分', icon='difference').classes('w-full'):
+                                        ui.html(self._diff_markup(row['before'], row['after']))
             ui.label(f'検出された問題：残り {len(grouped)} スライド').classes('text-subtitle1 font-medium')
             if not grouped:
                 ui.label('検査結果はありません．').classes('text-slate-400')
