@@ -19,11 +19,9 @@
 - **ローカル運用**：OpenAI互換APIを持つLLM・TTSサーバをローカルで動かせば，処理をローカル環境に閉じることができます．
 - **複数ユーザ・プロジェクト管理**：WebUIではユーザごとにプロジェクトを管理できます．生成ジョブはログアウト後もバックグラウンドで継続可能です．重い生成処理は同時実行を制限し，実行中の他ユーザの要求は待ち行列に入れず拒否します．管理者はユーザの利用可能期間を設定できます．
 
-## 🎬 Demo Video
+## VLMによるポインタ位置の追加調査（実験的機能）
 
-[▶ Watch the demo on YouTube](https://youtu.be/iFu2db1LeAM)
-
-NarrationAutomataで生成したデモビデオです．
+複雑な図などで通常の要素検出だけでは指示先が曖昧な場合，LLMが追加調査の必要性を判断し，質問を生成してVLMに対象位置（bbox）を再確認できます．必要な場合のみ最大1回VLMを呼び出し，有効な領域が得られた文だけポインタ位置を再選定します．**Advanced Modeのスイッチで有効化し，初期値はOFF**です．追加調査の推論設定は管理者設定の通常のLLMと共通です．処理負荷が増える場合があり，位置精度の改善は保証されません．詳しくは [ポインタモード](POINTER_MODES.md) を参照してください．
 
 ## スクリーンショット
 
@@ -253,3 +251,13 @@ python3 slide_lecture.py --help
 The [`pointing_lecturer.png`](pointing_lecturer.png) character artwork was generated using OpenAI's ChatGPT image generation functionality. It is included as an optional custom pointer image for NarrationAutomata.
 
 The repository maintainer intends to permit use, modification, and redistribution of this image. However, copyright protection, exclusive ownership, and non-infringement of third-party rights are not guaranteed for AI-generated artwork. This image is identified separately from the GPLv3-licensed software.
+
+
+## TTSモデル・Voice別の音声キャッシュ（2026-10）
+
+- 生成音声はプロジェクト内の `audio/<モデル名>_<voice名>_<識別ハッシュ>/<ページ番号>.mp3` に保存します．モデル名やvoice名に特殊文字があっても安全なパスに正規化し，識別ハッシュで名前の衝突を防ぎます．
+- TTSモデル・voice・接続先や生成設定，ナレーション本文，管理者のヨミ設定とプロジェクトのヨミ辞書に基づいて生成条件のハッシュを保存します．一致する既存MP3だけを再利用します．従来のメタデータのないMP3は無条件に再利用せず，新方式で一度生成します．
+- ④を実行すると，使用するTTS設定で音声キャッシュを確認します．音声が必要なときは③から実行し，MP3更新に応じてページ動画・完成動画も現在の生成条件で再生成します．音声の長さが変わっても字幕・ポインタのタイミングは動画工程で計算し直します．
+- 動画も，音声・画像・アライメント等に基づくキャッシュ署名を記録します．既存の動画があっても生成条件が一致しない場合は再生成します．完成MP4はFFmpegが一時ファイルに正常出力した後で置き換えるため，生成失敗時には既存ファイルが残ります．
+- ヘッダー右側に設定上の `LLM`，`VLM`，`TTS/Voice` を表示します．使用するモデル名が長い場合は省略表示し，ツールチップで全文を確認できます．管理者の基本設定を保存すると表示内容も更新します．
+- ファイルを削除して作り直す必要はありません．明示的な「生成データを削除」では音声キャッシュも削除対象です．

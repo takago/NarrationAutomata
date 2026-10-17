@@ -43,6 +43,7 @@ from nicegui import app, run, ui, background_tasks
 from PIL import Image, ImageDraw, ImageFont
 
 from job_manager import JobManager, JobState
+from audio_cache import audio_path, cache_matches, tts_signature
 from sidebar_display import select_refinement_candidate, video_render_key
 from job_state_view import resolve_job_display, resolve_terminal_state
 from pointer_settings import effective_mode
@@ -468,8 +469,10 @@ class ProjectPaths:
     def page_preview(self, page: int) -> Path:
         return self.pages_dir / f'{page:03d}_preview.png'
 
-    def audio(self, page: int) -> Path:
-        return self.audio_dir / f'{page:03d}.mp3'
+    def audio(self, page: int, config: dict, lang: str = 'ja') -> Path:
+        """現在のTTSモデルとvoiceに対応する音声ファイルのパス．"""
+        all_tts = config.get('tts', {})
+        return audio_path(self.audio_dir, page, all_tts.get(lang, all_tts))
 
     def video(self, page: int) -> Path:
         return self.video_dir / f'{page:03d}.mp4'
@@ -499,8 +502,13 @@ class ProjectPaths:
         if page is not None:
             if include_alignment:
                 self._unlink(self.alignment(page))
-            for path in (self.audio(page), self.video(page)):
+            # A page edit invalidates its audio across all cached voices.
+            for path in self.audio_dir.glob(f'*/{page:03d}.mp3'):
                 self._unlink(path)
+                self._unlink(path.with_suffix(path.suffix + '.cache.json'))
+                self._unlink(path.with_name(f'{path.stem}_tts.txt'))
+            self._unlink(self.video(page))
+            self._unlink(self.video(page).with_suffix('.mp4.cache.json'))
             return
 
         if include_alignment and self.explanations_dir.exists():
@@ -509,9 +517,7 @@ class ProjectPaths:
 
         for directory in (self.audio_dir, self.video_dir):
             if directory.exists():
-                for path in directory.iterdir():
-                    if path.is_file():
-                        self._unlink(path)
+                shutil.rmtree(directory)
 
 
 def ensure_page_images(paths: ProjectPaths, dpi: int = 120) -> list[Path]:
@@ -1231,7 +1237,7 @@ class SlideNarratorApp:
             current = {
                 'text': self._file_signature(self.paths.explanation(page)),
                 'align': self._file_signature(self.paths.alignment(page)),
-                'audio': self._file_signature(self.paths.audio(page)),
+                'audio': self._file_signature(self.paths.audio(page, self.cfg, self.lang_code)),
             }
             if self._detail_signatures and current != self._detail_signatures:
                 # 詳細画面は現在表示している一枚だけを構築し直す．
@@ -3306,6 +3312,11 @@ class SlideNarratorApp:
         if self._widget_available(self.pointer_preview):
             try:
                 self.pointer_preview.set_source(self._pointer_preview_image())
+                with Image.open(self.paths.page_image(int(self.pointer_page_select.value))) as slide:
+                    preview_size = slide.copy()
+                    preview_size.thumbnail((720, 540), Image.Resampling.LANCZOS)
+                    pw, ph = preview_size.size
+                self.pointer_preview.style(f'width: min(100%, {pw}px); aspect-ratio: {pw} / {ph}; height: auto')
             except (OSError, ValueError, TypeError) as exc:
                 LOGGER.warning('ポインタプレビューを更新できません: %s', exc)
 
@@ -3343,6 +3354,10 @@ class SlideNarratorApp:
             if not custom_mode:
                 ui.label('カスタム画像を選択すると，付属の先生画像が初期表示されます．').classes('text-xs text-zinc-400')
                 return
+            ui.label('ポインタ画像を変更する場合はPNGをアップロードしてください．').classes('text-xs text-zinc-400')
+            self.pointer_image_upload = ui.upload(on_upload=self.upload_pointer_image, auto_upload=True, max_files=1).props('accept=.png').classes('w-full')
+            if self.read_only:
+                self.pointer_image_upload.disable()
             image_path = self._pointer_source(data)
             if not image_path.is_file():
                 ui.label('標準のポインタ画像が見つかりません．').classes('text-xs text-red-400')
@@ -3376,7 +3391,7 @@ class SlideNarratorApp:
                     self.pointer_anchor_x.value = max(0, min(width-1, round(e.image_x)))
                     self.pointer_anchor_y.value = max(0, min(height-1, round(e.image_y)))
                     update_marker()
-            pointer_anchor_image = ui.interactive_image(file_url(image_path), content=marker_svg(), on_mouse=clicked, events=['click'], cross=False).classes('w-full').style('max-height: 230px; object-fit: contain')
+            pointer_anchor_image = ui.interactive_image(file_url(image_path), content=marker_svg(), on_mouse=clicked, events=['click'], cross=False).style(f'width: min(100%, {230 * width / height:.2f}px); aspect-ratio: {width} / {height}; height: auto; max-height: 230px')
             self.pointer_anchor_x.on_value_change(update_marker)
             self.pointer_anchor_y.on_value_change(update_marker)
             ui.label('スライドを背景にしたサイズ・配置プレビュー').classes('text-sm font-semibold')
@@ -3388,7 +3403,7 @@ class SlideNarratorApp:
                 ui.label('表示幅：スライド横幅に対する割合（％）．縦横比は維持します．').classes('text-xs text-zinc-400')
                 self._pointer_dragging = False
                 self.pointer_preview = ui.interactive_image(on_mouse=self._pointer_preview_mouse, events=['mousedown', 'mousemove', 'mouseup'], cross=False).classes('w-full rounded border border-zinc-700').style('touch-action: none; cursor: grab')
-                self.pointer_preview.set_source(self._pointer_preview_image())
+                self._refresh_pointer_preview()
                 ui.label('通常ページではドラッグしてプレビュー位置を変更できます．タイトルページは左下固定です．').classes('text-xs text-zinc-400')
             else:
                 self.pointer_scale_slider = ui.slider(min=5, max=100, step=1, value=float(data.get('pointer_scale_percent', 50))).props('label-always')
@@ -3410,10 +3425,7 @@ class SlideNarratorApp:
             with ui.row().classes('w-full gap-2'):
                 save_btn = ui.button('指示点・サイズを保存', icon='save', on_click=self.save_pointer_anchor).props('outline dense').classes('flex-1')
                 reset_btn = ui.button('標準に戻す', icon='restart_alt', on_click=self.reset_pointer_image).props('outline dense').classes('flex-1')
-            ui.label('PNGをアップロードすると，付属画像に代わって使用します．').classes('text-xs text-zinc-400')
-            self.pointer_image_upload = ui.upload(on_upload=self.upload_pointer_image, auto_upload=True, max_files=1).props('accept=.png').classes('w-full')
             if self.read_only:
-                self.pointer_image_upload.disable()
                 save_btn.disable()
                 reset_btn.disable()
 
@@ -3763,8 +3775,12 @@ class SlideNarratorApp:
             not self.paths.alignment(p).exists()
             for p in self.active_pages
         )
+        tts_all = self.cfg.get('tts', {})
+        tts_cfg = tts_all.get(self.lang_code, tts_all)
         has_missing_tts = any(
-            not self.paths.audio(p).exists()
+            not cache_matches(self.paths.audio(p, self.cfg, self.lang_code),
+                              tts_signature(self.paths.explanation(p), tts_cfg,
+                                            TTS_FILTER_PATH, self.lang_code, self.paths.root))
             for p in self.active_pages
         )
 
@@ -4363,7 +4379,7 @@ class SlideNarratorApp:
         try:
             tts_all = self.cfg.get('tts', {})
             tts_cfg = tts_all.get(self.lang_code, tts_all)
-            out_mp3 = self.paths.audio(page)
+            out_mp3 = self.paths.audio(page, self.cfg, self.lang_code)
 
             await run.io_bound(
                 run_with_statistics,
@@ -4695,7 +4711,7 @@ class SlideNarratorApp:
         self._detail_signatures = {
             'text': self._file_signature(current_text_path),
             'align': self._file_signature(self.paths.alignment(page)),
-            'audio': self._file_signature(self.paths.audio(page)),
+            'audio': self._file_signature(self.paths.audio(page, self.cfg, self.lang_code)),
         }
 
         source_counts, block_usage = alignment_source_statistics(blocks, alignments)
@@ -4802,7 +4818,7 @@ class SlideNarratorApp:
 
                     with ui.card().classes('w-full p-3 bg-zinc-900 border border-zinc-800 rounded-lg gap-2'):
                         ui.label('🔊 ナレーション音声').classes('text-sm font-bold text-zinc-200')
-                        ap = self.paths.audio(page)
+                        ap = self.paths.audio(page, self.cfg, self.lang_code)
                         if ap.exists():
                             ui.audio(file_url(ap)).classes('w-full')
                             self.register_main_action_button(ui.button(
@@ -5903,6 +5919,7 @@ class SlideNarratorApp:
                     self.cfg['llm'].update(llm_saved)
                     for lang in ('ja', 'en'):
                         self.cfg['tts'][lang].update(tts_saved[lang])
+                    self.refresh_model_header()
                     ui.notify('config.yaml に基本設定を保存しました．', type='positive')
                 except Exception as err:
                     LOGGER.exception('基本設定(config.yaml)の保存に失敗しました')
@@ -6112,6 +6129,24 @@ class SlideNarratorApp:
                             ui.button('削除', on_click=handle_delete).props('outline color=negative dense')
 
     # --- 画面レイアウト構築 ---
+
+    def refresh_model_header(self) -> None:
+        """Reflect administrator model settings in the read-only header."""
+        llm = self.cfg.get('llm', {})
+        vlm = self.cfg.get('vlm', {})
+        if not vlm:
+            vlm = llm
+        tts_all = self.cfg.get('tts', {})
+        tts = tts_all.get(getattr(self, 'lang_code', 'ja'), tts_all)
+        for attr, label, value in (
+            ('_model_header_llm', 'LLM', str(llm.get('model') or '未設定')),
+            ('_model_header_vlm', 'VLM', str(vlm.get('model') or llm.get('model') or '未設定')),
+            ('_model_header_tts', 'TTS/Voice', f"{tts.get('model') or '未設定'} / {tts.get('voice') or '未設定'}"),
+        ):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.text = f'{label}: {value}'
+                widget.tooltip(value)
 
     def _build_sidebar(self) -> None:
         # 左サイドドロワー
@@ -6559,8 +6594,14 @@ class SlideNarratorApp:
 
         # ヘッダー
         with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
-            ui.label('🎓 NarrationAutomata').classes('text-h5 text-white')
+            with ui.column().classes('gap-0'):
+                ui.label('NarrationAutomata').classes('text-h5 text-white')
             ui.space()
+            with ui.column().classes('gap-0 mr-4 text-xs'):
+                self._model_header_llm = ui.label().classes('max-w-64 truncate text-slate-200')
+                self._model_header_vlm = ui.label().classes('max-w-64 truncate text-slate-200')
+                self._model_header_tts = ui.label().classes('max-w-64 truncate text-slate-200')
+            self.refresh_model_header()
             if current_username:
                 badge_role = ' (管理者)' if is_admin else ''
                 ui.label(f'👤 {current_username}{badge_role}').classes('text-caption text-slate-400 mr-2')

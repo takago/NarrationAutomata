@@ -39,6 +39,7 @@ from pointer_settings import effective_mode, normalize_motion, create_motion
 
 
 from statistics_store import record as record_statistics, set_current_page
+from audio_cache import audio_path, signature, cache_matches, save_signature, file_digest, tts_signature
 
 from tts_filter import (
     load_config as load_tts_filter_config,
@@ -1929,7 +1930,10 @@ def generate_tts(
     lang: str = "ja",
     progress_callback=None,
 ) -> None:
-    if out_path.exists() and not force:
+    # Reuse audio only when its generation metadata matches the current settings.
+    project_dir = out_path.parent.parent.parent if out_path.parent.parent.name == 'audio' else out_path.parent.parent
+    digest = tts_signature(text_path, tts_cfg, filter_config_path, lang, project_dir)
+    if not force and cache_matches(out_path, digest):
         print(f"[TTS] reuse {out_path}")
         return
 
@@ -1947,7 +1951,7 @@ def generate_tts(
 
         tts_text = apply_tts_filter(raw_text, filter_config_path,
                                     progress_callback=send_filter_progress,
-                                    project_dir=out_path.parent.parent) if lang == "ja" else raw_text
+                                    project_dir=project_dir) if lang == "ja" else raw_text
         limit_key = "max_input_chars" if lang == "ja" else "max_input_words"
         limit = max(0, int(tts_cfg.get(limit_key) or 0))
         chunks = split_tts_text(tts_text, lang, limit)
@@ -2022,6 +2026,7 @@ def generate_tts(
         tts_input_record = "\n\n".join(chunks)
         temp_out.replace(out_path)
         atomic_write_text(tts_text_path, tts_input_record)
+        save_signature(out_path, digest)
         print(f"[TTS:{lang}] {out_path}")
         print(f"[TTS:{lang}] input text: {tts_text_path} ({len(chunks)} chunk(s))")
     except Exception as exc:
@@ -2404,7 +2409,7 @@ def _run_tts_stage(
 
     for index, page_num in enumerate(sorted_active_pages, 1):
         text_file = explanations / f"{page_num:03d}.txt"
-        mp3 = audio / f"{page_num:03d}.mp3"
+        mp3 = audio_path(audio, page_num, tts_cfg)
         if not text_file.exists():
             continue
 
@@ -2438,6 +2443,7 @@ def _run_video_stage(
     video_cfg: dict,
     force: bool,
     lang: str,
+    tts_cfg: dict,
 ) -> None:
     videos: list[Path] = []
     video_slide_indices: list[int] = []
@@ -2447,7 +2453,7 @@ def _run_video_stage(
 
     for index, page_num in enumerate(sorted_active_pages, 1):
         image = pages / f"{page_num:03d}.png"
-        mp3_file = audio / f"{page_num:03d}.mp3"
+        mp3_file = audio_path(audio, page_num, tts_cfg)
         text_file = explanations / f"{page_num:03d}.txt"
         out = video / f"{page_num:03d}.mp4"
         align_file = explanations / f"{page_num:03d}_align.json"
@@ -2502,6 +2508,10 @@ def _run_video_stage(
         all_page_subtitles.append((accumulated_offset, page_subtitles))
         accumulated_offset += duration
 
+        page_digest = signature({'image': file_digest(image), 'audio': file_digest(mp3_file),
+                                 'alignment': file_digest(align_file), 'video_cfg': video_cfg,
+                                 'project': page_settings, 'lang': lang})
+        rebuild_page = force or not cache_matches(out, page_digest)
         video_started = time.monotonic()
         try:
             generate_page_video(
@@ -2511,8 +2521,10 @@ def _run_video_stage(
                 schedule,
                 laser_img,
                 video_cfg,
-                force,
+                rebuild_page,
             )
+            if rebuild_page:
+                save_signature(out, page_digest)
         except Exception as exc:
             record_statistics('video', 'ffmpeg', 'error', page=page_num,
                 video={'elapsed_sec':round(time.monotonic()-video_started,3),
@@ -2533,15 +2545,21 @@ def _run_video_stage(
     create_full_srt(all_page_subtitles, final_en_srt, lang="en")
 
     final = root / f"{pdf.stem}.mp4"
+    final_digest = signature({'pages': [(str(p), file_digest(p)) for p in videos],
+                              'ja': file_digest(final_ja_srt), 'en': file_digest(final_en_srt),
+                              'lang': lang})
+    rebuild_final = force or not cache_matches(final, final_digest)
     concat_videos(
         videos,
         video_slide_indices,
         final_ja_srt,
         final_en_srt,
         final,
-        force,
+        rebuild_final,
         primary_lang=lang,
     )
+    if rebuild_final:
+        save_signature(final, final_digest)
 
 
 def main() -> int:
@@ -2730,6 +2748,7 @@ def main() -> int:
         cfg["video"],
         args.force,
         lang,
+        tts_cfg,
     )
 
     final = root / f"{args.pdf.stem}.mp4"
