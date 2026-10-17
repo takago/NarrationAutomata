@@ -791,6 +791,10 @@ class SlideNarratorApp:
         self._upload_active = False
         self.project_select = None
         self._time_refine_switch_blocked = False
+        # プロジェクト切替はブラウザ接続ごとに直列化する．
+        self._project_switch_lock = asyncio.Lock()
+        self._project_selection_generation = 0
+        self._project_switching = False
         self.project_id_label = None
         self.project_dict_area = None
         self.project_dict_save_button = None
@@ -898,6 +902,9 @@ class SlideNarratorApp:
 
     def _start_background_job(self, worker_factory, *, busy_message: str) -> None:
         """重複起動の確認とジョブ登録を一箇所で管理する．"""
+        if self._project_switching:
+            safe_notify('プロジェクト切替の完了後に実行してください．', type='warning')
+            return
         if self.current_task and not self.current_task.done():
             safe_notify(busy_message, type='warning')
             return
@@ -928,6 +935,10 @@ class SlideNarratorApp:
     # --- 認証・権限制御 ---
 
     def write_access_allowed(self, notify: bool = True) -> bool:
+        if self._project_switching:
+            if notify:
+                safe_notify('プロジェクト切替の完了後に操作してください．', type='warning')
+            return False
         user_info = load_users().get('users', {}).get(self.username, {})
         allowed, reason = is_user_within_allowed_period(user_info)
         self.read_only = not allowed
@@ -1648,6 +1659,8 @@ class SlideNarratorApp:
 
     def refresh_job_status(self) -> None:
         """ポーリング時に画面上のボタン・進捗バー群を同期"""
+        if self._project_switching:
+            return  # 読込途中のプロジェクトを画面に反映しない
         allowed_now = self.write_access_allowed(notify=False)
         if self.read_only != (not allowed_now):
             safe_notify('利用可能時間が変わったため，画面を更新します．', type='info')
@@ -2456,7 +2469,7 @@ class SlideNarratorApp:
         if self.project_select is None:
             return
         try:
-            if self._time_refine_switch_blocked or GLOBAL_EXECUTION_LOCK.is_locked():
+            if self._project_switching or self._time_refine_switch_blocked or GLOBAL_EXECUTION_LOCK.is_locked():
                 self.project_select.disable()
             else:
                 self.project_select.enable()
@@ -2464,10 +2477,17 @@ class SlideNarratorApp:
             pass
 
     async def on_project_selection(self, project_id: str | None) -> None:
-        """Reject stale UI selection events and immediately restore the true value."""
-        if self._time_refine_switch_blocked or GLOBAL_EXECUTION_LOCK.is_locked():
+        """最新の選択だけを反映し，切替中の画面操作を抑止する．"""
+        current_id = self.pdf.parent.name if self.pdf else None
+        if not project_id or project_id == current_id:
+            return  # 表示の同期によって発生した選択イベント
+        if self._project_switching or self._time_refine_switch_blocked or GLOBAL_EXECUTION_LOCK.is_locked():
             self.refresh_project_list()
             safe_notify('処理中はプロジェクトを切り替えられません．', type='warning')
+            return
+        self._project_selection_generation += 1
+        generation = self._project_selection_generation
+        if generation != self._project_selection_generation:
             return
         await self.select_existing_project(project_id)
 
@@ -2547,6 +2567,22 @@ class SlideNarratorApp:
         ui.notify('プロジェクト名を保存しました．', type='positive')
 
     async def select_existing_project(self, project_id: str | None, *, time_refine_internal: bool = False, refine_sidebar_internal: bool = False) -> None:
+        """切替全体を排他制御し，表示更新前の操作を防ぐ．"""
+        async with self._project_switch_lock:
+            self._project_switching = True
+            if not time_refine_internal:
+                self.sync_project_select_enabled()
+            try:
+                await self._select_existing_project_impl(
+                    project_id, time_refine_internal=time_refine_internal,
+                    refine_sidebar_internal=refine_sidebar_internal)
+            finally:
+                self._project_switching = False
+                if not time_refine_internal:
+                    self.sync_project_select_enabled()
+                    self.refresh_job_status()
+
+    async def _select_existing_project_impl(self, project_id: str | None, *, time_refine_internal: bool = False, refine_sidebar_internal: bool = False) -> None:
         if not project_id:
             return
         if self._time_refine_switch_blocked and not (time_refine_internal or refine_sidebar_internal):
@@ -2598,9 +2634,12 @@ class SlideNarratorApp:
         if self.pdf and target_pdf == self.pdf.resolve():
             return
         try:
+            new_paths = ProjectPaths(target_pdf)
+            new_cfg = load_project_json(new_paths.root)
+            new_images = await run.io_bound(ensure_page_images, new_paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
             self.pdf = target_pdf
-            self.paths = ProjectPaths(target_pdf)
-            self.proj_cfg = load_project_json(self.paths.root)
+            self.paths = new_paths
+            self.proj_cfg = new_cfg
             self._gallery_selected_only = self.proj_cfg.get('gallery_selected_only', False) is True
             self._gallery_page = 0
             self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
@@ -2608,7 +2647,7 @@ class SlideNarratorApp:
             saved_vmode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'vlm')
             self.default_use_vlm = saved_vmode in ('vlm', 'auto', True, 'true')
             self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
-            self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
+            self.images = new_images
             marker = user_last_project_file(self.username)
             atomic_write_text(marker, json.dumps({'project_id': project_id}, ensure_ascii=False))
             if time_refine_internal:
