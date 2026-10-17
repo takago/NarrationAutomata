@@ -1,6 +1,10 @@
 # `slide_lecture.py` の使い方と内部構造
 
-> 対象：2026年10月11日に提供された `slide_lecture.py` の構成．WebUIからも呼び出されるCLIバックエンドです．
+> 対象：第7段階リファクタリング後の `slide_lecture.py`．WebUIからも呼び出されるCLIバックエンドです．
+
+## 現行WebUIとの分担
+
+このファイルはPDFから動画までの生成処理を担当し，認証，ブラウザ表示，ジョブIDや進捗カードの管理は行いません．これらは `app.py`，`job_manager.py`，`job_state_view.py`，`sidebar_display.py` が担当します．内容の検査・自動校正は `validation/` を参照してください．旧統計・旧アライメントデータの互換読み込みは前提としていません．
 
 ## 1．概要
 

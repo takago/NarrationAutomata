@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import base64
 import io
 from datetime import datetime, timedelta
@@ -41,6 +42,9 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from nicegui import app, run, ui, background_tasks
 from PIL import Image, ImageDraw, ImageFont
 
+from job_manager import JobManager, JobState
+from sidebar_display import select_refinement_candidate, video_render_key
+from job_state_view import resolve_job_display, resolve_terminal_state
 from pointer_settings import effective_mode
 from statistics_store import run_with_statistics, export_xlsx, read_records
 from validation.ui import ValidationView
@@ -115,8 +119,8 @@ def source_badge_style(block: dict) -> str:
 
 
 def block_source(block: dict) -> str:
-    """旧形式のアライメントデータにも対応して出自を返す．"""
-    return str(block.get('source') or ('vlm' if block.get('type') == 'image_subpart' else 'pdf')).lower()
+    """アライメント要素に記録された出自を返す．"""
+    return str(block.get('source', '')).lower()
 
 
 def block_display_name(block: dict, limit: int = 65) -> str:
@@ -153,33 +157,67 @@ def alignment_source_statistics(blocks: list[dict], alignments: list[dict]) -> t
 # ----------------------------------------------------------------------
 
 class ExecutionLockManager:
-    """複数ユーザーやセッションが同時に重い推論・レンダリング処理を行わないよう排他制御するマネージャ"""
+    """既存UI互換ロック．実行所有権のみ JobManager で管理する．
+
+    各 asyncio タスクの取得IDを ContextVar に保持するため，前ジョブの
+    遅延終了処理から別ジョブのロックを解放できない．
+    """
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
+        self.jobs = JobManager()
+        self._task_job_id: ContextVar[str | None] = ContextVar('execution_job_id', default=None)
+        self._owner_task: asyncio.Task | None = None
         self.current_user: str | None = None
         self.task_name: str | None = None
         self.owner_app: Any | None = None
 
+    @property
+    def job_id(self) -> str | None:
+        current = self.jobs.current()
+        return current.job_id if current else None
+
     def is_locked(self) -> bool:
-        return self.lock.locked()
+        return self.jobs.is_running()
 
     async def acquire(self, username: str, task_name: str, owner_app: Any | None = None) -> bool:
-        """ロックを即座に試行取得。他が実行中の場合はキューイングせず即座に False を返す"""
         if self.lock.locked():
             return False
         await self.lock.acquire()
+        snapshot = self.jobs.try_start(username, task_name)
+        if snapshot is None:
+            self.lock.release()
+            return False
+        self._task_job_id.set(snapshot.job_id)
+        self._owner_task = asyncio.current_task()
         self.current_user = username
         self.task_name = task_name
         self.owner_app = owner_app
         return True
 
-    def release(self) -> None:
+    def request_cancel(self, job_id: str) -> bool:
+        return self.jobs.request_cancel(job_id)
+
+    def release(self, *, state: JobState = JobState.COMPLETED,
+                expected_job_id: str | None = None) -> bool:
+        # 従来の引数なし release() も呼出タスクの取得IDで必ず検証する．
+        owned_id = expected_job_id or self._task_job_id.get()
+        if (not owned_id or asyncio.current_task() is not self._owner_task
+                or not self.jobs.finish(owned_id, state)):
+            return False
         if self.lock.locked():
             self.lock.release()
         self.current_user = None
         self.task_name = None
         self.owner_app = None
+        self._task_job_id.set(None)
+        self._owner_task = None
+        return True
+
+    def owns_current_task(self) -> bool:
+        job_id = self._task_job_id.get()
+        return bool(job_id and job_id == self.job_id
+                    and asyncio.current_task() is self._owner_task)
 
 
 GLOBAL_EXECUTION_LOCK = ExecutionLockManager()
@@ -219,12 +257,12 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
-    """平文パスワードと保存されたハッシュ値の照合（平文との互換移行対応）"""
+    """保存されたPBKDF2ハッシュとパスワードを照合する．"""
     if not stored_hash:
         return False
 
     if not stored_hash.startswith('pbkdf2:sha256:'):
-        return password == stored_hash
+        return False
 
     try:
         header, salt, key_hex = stored_hash.split('$')
@@ -739,6 +777,7 @@ class SlideNarratorApp:
         self._output_project_key: str | None = None
         self._detail_signatures: dict[str, tuple | None] = {}
         self._final_video_signature: tuple | None = None
+        self._final_video_refresh_task: asyncio.Task | None = None
         # 画面更新が重なって完成ビデオのボタンが重複しないようにする．
         self._final_video_refresh_lock = asyncio.Lock()
         self.final_video_container = None
@@ -834,14 +873,28 @@ class SlideNarratorApp:
         # UIが破棄されていてもロック解放を最優先する．
         # 中断要求はジョブ単位の状態．次のリファイナー等に引き継がない．
         # 呼び出し側で中断結果を保存した後に，ここで解放する．
+        # 古いタスクからの終了通知は新しいジョブの状態を書き換えない．
+        if not GLOBAL_EXECUTION_LOCK.owns_current_task():
+            return
+        active = GLOBAL_EXECUTION_LOCK.jobs.current()
+        task_name = active.task_name if active else None
+        # リファイナーの終了に，過去の通常パイプライン状態を流用しない．
+        uses_pipeline_status = (task_name or '').startswith(('パイプライン (', 'スライド '))
+        persisted_state = (read_user_job_status(self.username).get('state')
+                           if uses_pipeline_status else None)
+        state = resolve_terminal_state(
+            task_name=task_name,
+            cancel_requested=self.cancellation_requested,
+            manager_cancel_requested=bool(active and active.cancellation_requested),
+            persisted_state=persisted_state,
+        )
+        if not GLOBAL_EXECUTION_LOCK.release(state=state):
+            return
         self.current_process = None
         self.processing = False
         self.current_task = None
         self.cancellation_requested = False
-        try:
-            GLOBAL_EXECUTION_LOCK.release()
-        finally:
-            self._safe_view_update(lambda: self.set_processing(False), '処理終了時のボタン更新')
+        self._safe_view_update(lambda: self.set_processing(False), '処理終了時のボタン更新')
 
     def _start_background_job(self, worker_factory, *, busy_message: str) -> None:
         """重複起動の確認とジョブ登録を一箇所で管理する．"""
@@ -1148,11 +1201,15 @@ class SlideNarratorApp:
     def _refresh_sidebar_final_video_if_changed(self) -> None:
         if not self.paths or not self._widget_available(self.final_video_container):
             return
-        signature = self._file_signature(self.paths.final_video)
-        if signature != self._final_video_signature:
-            self._final_video_signature = signature
-            background_tasks.create(self._safe_async_view_update(
-                self.refresh_final_video, '完成ビデオの差分更新'))
+        signature = video_render_key(self.paths.root, self._file_signature(self.paths.final_video))
+        if signature == self._final_video_signature:
+            return
+        pending = self._final_video_refresh_task
+        if pending is not None and not pending.done():
+            return
+        # 印は描画の完了後に更新する．失敗や画面切替時は次回再試行する．
+        self._final_video_refresh_task = background_tasks.create(
+            self._safe_async_view_update(self.refresh_final_video, '完成ビデオの差分更新'))
 
     def _refresh_gallery_video_buttons(self) -> None:
         """ビデオプレーヤーを生成せず，単体ビデオの有無のみを差分反映する．"""
@@ -1620,20 +1677,25 @@ class SlideNarratorApp:
                 self._safe_view_update(self.time_refine_view.restore_progress, '再生時間の調整状態の復元')
                 self._safe_view_update(self.time_refine_view.refresh, '再生時間の調整画面の復元')
         refine_active = bool(getattr(self, '_refine_sidebar_live', False))
-        globally_busy = GLOBAL_EXECUTION_LOCK.is_locked()
+        # 実行状態はJobManager，履歴・進捗は保存済みJSONから取得する．
+        # UIセッションのprocessingは変更せず，実行主体と閲覧側を分離する．
+        active_job = GLOBAL_EXECUTION_LOCK.jobs.current()
         self.sync_project_select_enabled()
-        owner_name = GLOBAL_EXECUTION_LOCK.current_user or '' if globally_busy else ''
-
-        if globally_busy:
-            status = read_user_job_status(owner_name) if owner_name else {}
-            status = {**status, 'stage': status.get('stage') or GLOBAL_EXECUTION_LOCK.task_name or '処理中'}
-        else:
-            status = read_user_job_status(self.username)
-            if status.get('state') == 'running':
-                status = {**status, 'state': 'failed', 'message': '実行中状態を確認できません（サーバ再起動等の可能性があります）'}
+        own_persisted = read_user_job_status(self.username)
+        owner_persisted = (read_user_job_status(active_job.username)
+                           if active_job and active_job.username != self.username
+                           else own_persisted)
+        display = resolve_job_display(
+            username=self.username, active_job=active_job,
+            owner_status=owner_persisted, own_status=own_persisted,
+            task_name=GLOBAL_EXECUTION_LOCK.task_name,
+        )
+        globally_busy = display.globally_busy
+        owner_name = display.owner_name
+        status = display.status
+        own_status = display.own_status
 
         # 再ログイン後の新しい画面にも，状態ファイルの内容を反映する．
-        own_status = read_user_job_status(self.username)
         if self._widget_available(self.job_status_label):
             self._safe_view_update(
                 lambda: setattr(self.job_status_label, 'text', self.format_job_status(
@@ -1642,7 +1704,7 @@ class SlideNarratorApp:
             )
 
         active_key = self.get_active_stage_key(status)
-        owner_is_self = globally_busy and owner_name == self.username
+        owner_is_self = display.owner_is_self
         self._refresh_easy_action_visibility()
         if refine_active:
             # A time refinement can invoke _pipeline_worker('video').  Its
@@ -1661,11 +1723,6 @@ class SlideNarratorApp:
                     self.pipeline_busy_row.classes(add='hidden')
             except Exception:
                 pass
-
-        if owner_name == self.username and globally_busy:
-            self.processing = True  # 表示のためだけ．実行主体はowner_appのまま変更しない．
-        elif not globally_busy:
-            self.processing = False
 
         # Retain pipeline lock/cancellation semantics, but hide pipeline stage
         # progress while a refinement owns the operation.
@@ -1836,13 +1893,12 @@ class SlideNarratorApp:
         その他は同一ページ・同一タスクの最後の成功記録を採用する．
         """
         # 表示名はモデルの種類ではなく処理の目的を示す．
-        # 記録上のtask識別子は変更せず，過去の統計データとの互換性を維持する．
         definitions = [(info['task'], info['title']) for info in STATISTICS_STAGE_INFO]
 
         def classify(task: str) -> str | None:
             if task.startswith('ポインタ位置選定'):
                 return 'ポインタ位置選定'
-            if task in ('TTSヨミ変換', 'tts_filter'):
+            if task == 'tts_filter':
                 return 'tts_filter'
             for key, _ in definitions:
                 if task == key:
@@ -1875,27 +1931,23 @@ class SlideNarratorApp:
             if key is None:
                 continue
             details = record.get('llm') or record.get('filter') or {}
-            if not details and any(k in record for k in ('reasoning_chars', 'content_chars',
-                                                            'prompt_tokens', 'completion_tokens')):
-                details = record
             if not isinstance(details, dict):
                 continue
             if key != 'tts_filter':
                 latest[(page, key)] = details
                 continue
-            run_id = str(record.get('run_id') or record.get('request_id') or id(record))
+            run_id = str(record.get('run_id') or '')
+            if not run_id:
+                continue
             run_key = (page, run_id)
-            item = filter_runs.setdefault(run_key, {'values': {}, 'indices': set(), 'total': None,
-                                                     'legacy': False})
+            item = filter_runs.setdefault(run_key, {'values': {}, 'indices': set(), 'total': None})
             ix, total = details.get('paragraph_index'), details.get('paragraph_total')
             try:
                 ix, total = int(ix), int(total)
                 if not 1 <= ix <= total:
                     continue
             except (ValueError, TypeError):
-                # 旧形式の記録は従来と同様，記録の存在を成功条件とする．
-                item['legacy'] = True
-                ix = total = None
+                continue
             if total is not None:
                 if item['total'] is not None and item['total'] != total:
                     continue
@@ -1909,8 +1961,7 @@ class SlideNarratorApp:
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     values = item['values']
                     values[field] = values.get(field, 0) + value
-            complete = item['legacy'] or (item['total'] is not None and
-                        len(item['indices']) == item['total'])
+            complete = item['total'] is not None and len(item['indices']) == item['total']
             if complete:
                 filter_latest_run[page] = run_id
         for page, run_id in filter_latest_run.items():
@@ -2831,9 +2882,21 @@ class SlideNarratorApp:
                 self._refine_sidebar_diag = 'none'
             panel.visible = False
             self._refine_sidebar_live = False
+            self._set_sidebar_slide_preview(None)
             return
-        candidates.sort(reverse=True)
-        live, _, _, _, kind, project, state = candidates[0]
+        active = GLOBAL_EXECUTION_LOCK.jobs.current()
+        # 生きている通常ジョブがある場合，古いJSONのrunningでカードを奪わない．
+        selected = select_refinement_candidate(
+            candidates,
+            pipeline_running=bool(active and active.username == self.username
+                                  and not any(c[0] for c in candidates)),
+        )
+        if selected is None:
+            panel.visible = False
+            self._refine_sidebar_live = False
+            self._set_sidebar_slide_preview(None)
+            return
+        live, _, _, _, kind, project, state = selected
         diagnostic = (project.name, kind, bool(live), state.get('state'),
                       state.get('title'), state.get('detail'))
         if getattr(self, '_refine_sidebar_diag', None) != diagnostic:
@@ -3538,6 +3601,10 @@ class SlideNarratorApp:
             safe_notify('すでに中断要求を受け付けています．', type='warning')
             return
 
+        active_job_id = GLOBAL_EXECUTION_LOCK.job_id
+        if not active_job_id or not GLOBAL_EXECUTION_LOCK.request_cancel(active_job_id):
+            safe_notify('ジョブが終了したため，中断要求は送信しませんでした．', type='info')
+            return
         owner.cancellation_requested = True
         owner.update_job_status(
             'running', cancellation_requested=True,
@@ -4753,7 +4820,7 @@ class SlideNarratorApp:
                     ui.label('🎯 文ごとのポインタ先 & 対訳字幕の微調整').classes('text-h6')
                     block_options = {None: '指定なし'}
                     for b in blocks:
-                        source = str(b.get('source') or ('vlm' if b.get('type') == 'image_subpart' else 'pdf')).upper()
+                        source = block_source(b).upper()
                         desc = block_display_name(b, 45)
                         block_options[b['block_id']] = f"#{b['block_id']} [{source}] {desc}"
                     rows = []
@@ -4898,6 +4965,10 @@ class SlideNarratorApp:
                         .props('dense outline').classes('w-full')
                 else:
                     ui.label('ビデオ未生成').classes('text-xs text-zinc-500')
+            # プロジェクトを切り替えた場合には前の描画を確定しない．
+            if paths is self.paths:
+                self._final_video_signature = video_render_key(
+                    paths.root, self._file_signature(paths.final_video))
 
     async def refresh_all(self) -> None:
         self._output_project_key = str(self.pdf.resolve()) if self.pdf else None
@@ -6508,11 +6579,6 @@ def login_page():
         if not user_info or not verify_password(password, str(user_info.get('password', ''))):
             ui.notify('ユーザー名またはパスワードが正しくありません．', type='negative')
             return
-
-        stored_pw = str(user_info.get('password', ''))
-        if not stored_pw.startswith('pbkdf2:sha256:'):
-            user_info['password'] = hash_password(password)
-            save_users(users_data)
 
         app.storage.user['authenticated'] = True
         app.storage.user['username'] = username

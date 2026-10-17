@@ -61,7 +61,7 @@ def surrounding_narrations(paths, pages: list[int], index: int, *, window: int =
                            char_limit: int = 2200) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     """Read the nearest narrated slides; never include the target slide itself.
 
-    Earlier texts reflect edits already accepted in this cycle. Later texts are
+    Earlier texts reflect edits already accepted in this run. Later texts are
     contextual previews, not a reason to remove information unique to this slide.
     """
     def collect(indices):
@@ -176,10 +176,9 @@ def reset_refined_project(paths) -> None:
 
 def refine_rows(paths, metadata: dict) -> list[dict]:
     original = metadata.get('original_narration_chars') or {}
-    failures = {int(item['page']): 'エラー' for cycle in metadata.get('rounds', [])
-                for item in cycle.get('failures', [])}
-    modified = {int(item['page']) for cycle in metadata.get('rounds', [])
-                for item in cycle.get('modified', [])}
+    result = metadata.get('result') or {}
+    failures = {int(item['page']): 'エラー' for item in result.get('failures', [])}
+    modified = {int(item['page']) for item in result.get('modified', [])}
     rows = []
     for key, before in sorted(original.items(), key=lambda item: int(item[0])):
         page = int(key)
@@ -644,7 +643,7 @@ class TimeRefineView:
             new_cfg['time_refine'] = {'source_project_id': source_pdf.parent.name,
                                       'original_seconds': baseline, 'target_seconds': target,
                                       'original_narration_chars': baseline_chars,
-                                      'rounds': [], 'state': 'running', 'policies': policies}
+                                      'result': None, 'state': 'running', 'policies': policies}
             save_project_json(new_paths.root, new_cfg)
             self._target_project = new_paths.root
             refine_job.register(owner.username, self._target_project, self)
@@ -658,11 +657,9 @@ class TimeRefineView:
             self._message('新規プロジェクトを作成しました．ナレーションを短縮します…')
             self._progress('ナレーション短縮', '短縮処理を準備しています…', fraction=0)
             self._safe_ui(lambda: ui.notify('コピー完了．新しいプロジェクトでナレーションを短縮します．', type='info'))
-            for cycle in range(1, 2):
-                self._check_stop()
-                current = baseline
-                if current <= target:
-                    break
+            self._check_stop()
+            current = baseline
+            if current > target:
                 pages = list(owner.active_pages)
                 ratio = max(0.35, min(.92, target / current * .96))
                 self._message(f'短縮を開始します：対象 {len(pages)} 枚，文字数目標 {ratio * 100:.0f}%')
@@ -740,9 +737,9 @@ class TimeRefineView:
                                        fraction=(index + 1) / len(pages))
                         self.update_result()
                     new_cfg = load_project_json(owner.paths.root)
-                    new_cfg['time_refine']['rounds'].append({'round': cycle, 'before_seconds': current,
-                                                              'modified': modified,
-                                                              'failures': failures, 'skipped': skipped})
+                    new_cfg['time_refine']['result'] = {'before_seconds': current,
+                                                        'modified': modified,
+                                                        'failures': failures, 'skipped': skipped}
                     save_project_json(owner.paths.root, new_cfg)
                     self.update_result()
                 finally:

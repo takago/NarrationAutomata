@@ -1,6 +1,6 @@
 # `tts_filter.py` ヨミ変換フィルタ解説
 
-> この文書はGitHub公開版の `tts_filter.md` に記載された仕様を整理したものです．`app.py` と `slide_lecture.py` からの利用経路については，2026年10月11日の提供コードでも確認しています．
+> 対象：第7段階リファクタリング後の `tts_filter.py`．現行のプロンプトと辞書定義はコード・YAMLを正本とし，ここでは処理と設定方法を説明します．
 
 ## 1．目的
 
@@ -41,7 +41,7 @@
 | `transform_text()` | 文章全体を段落ごとに変換する |
 | `main()` | CLI引数の解析と入出力 |
 
-GitHubの既存文書では，辞書展開用の `{{DICTIONARY}}` プレースホルダーと，`DEFAULT_SYSTEM_PROMPT_TEMPLATE` を利用する設計が説明されています．実際にプロンプトや辞書の形式を変更するときは，実行環境の `tts_filter.py` と `tts_filter.yaml` を合わせて確認してください．
+辞書展開には `{{DICTIONARY}}` プレースホルダーと，`DEFAULT_SYSTEM_PROMPT_TEMPLATE` を利用します．実際にプロンプトや辞書の形式を変更するときは，実行環境の `tts_filter.py` と `tts_filter.yaml` を合わせて確認してください．
 
 ## 4．設定ファイル例
 

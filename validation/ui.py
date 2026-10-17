@@ -577,7 +577,7 @@ class ValidationView:
                     f'修正・保存 {len(changed)}件 ／ 未解決の指摘 {len(grouped)}スライド'
                 ).classes('text-sm')
                 ui.label('保存済みの修正履歴です．残った指摘は下の一覧から個別修正するか，一括校正してください．').classes('text-xs text-slate-400')
-                # 保存済みの修正履歴を表示する（旧実行分も閲覧可能）．
+                # 現在のプロジェクトに保存された修正履歴を表示する．
                 per_page = OrderedDict()
                 for row in entries:
                     try:

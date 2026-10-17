@@ -1124,7 +1124,7 @@ def align_narration_with_blocks(
         item = {
             "block_id": b["block_id"],
             "type": b["type"],
-            "source": b.get("source", "vlm" if b.get("type") == "image_subpart" else "pdf"),
+            "source": b["source"],
             "bbox": b["bbox"],
         }
         if b["type"] in ("text", "code_line", "image_subpart"):
@@ -2049,9 +2049,9 @@ def generate_page_video(
                         print(f'[POINTER] fallback to fixed: {exc}')
                         motion = None
                 if not motion and not event.get('title_fixed'):
-                    # Preserve legacy location behavior while correcting hidden intervals.
+                    # 静止ポインタの配置を維持しつつ，表示期間を補正する．
                     if anchor is None:
-                        # Legacy placement retained for existing projects.
+                        # アンカーなしのレーザーポインタ配置．
                         x = f"({event['x']}+{jitter_px}*sin(4*PI*{jitter_rate}*t))"
                         y = f"({event['y']}+{jitter_px}*cos(4*PI*{jitter_rate}*t))"
                     else:
