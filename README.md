@@ -27,8 +27,6 @@
 
 NarrationAutomataで生成したデモ動画です．PDFスライドからナレーション付き動画を自動生成する様子をご覧いただけます．
 
-[![NarrationAutomata デモ動画](https://img.youtube.com/vi/iFu2db1LeAM/maxresdefault.jpg)](https://www.youtube.com/watch?v=iFu2db1LeAM)
-
 ▶ **[YouTubeでデモ動画を見る](https://www.youtube.com/watch?v=iFu2db1LeAM)**
 
 ## スクリーンショット
