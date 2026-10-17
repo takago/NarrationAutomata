@@ -23,6 +23,14 @@
 
 複雑な図などで通常の要素検出だけでは指示先が曖昧な場合，LLMが追加調査の必要性を判断し，質問を生成してVLMに対象位置（bbox）を再確認できます．必要な場合のみ最大1回VLMを呼び出し，有効な領域が得られた文だけポインタ位置を再選定します．**Advanced Modeのスイッチで有効化し，初期値はOFF**です．追加調査の推論設定は管理者設定の通常のLLMと共通です．処理負荷が増える場合があり，位置精度の改善は保証されません．詳しくは [ポインタモード](POINTER_MODES.md) を参照してください．
 
+## デモ動画（Demo Video）
+
+NarrationAutomataで生成したデモ動画です．PDFスライドからナレーション付き動画を自動生成する様子をご覧いただけます．
+
+[![NarrationAutomata デモ動画](https://img.youtube.com/vi/iFu2db1LeAM/maxresdefault.jpg)](https://www.youtube.com/watch?v=iFu2db1LeAM)
+
+▶ **[YouTubeでデモ動画を見る](https://www.youtube.com/watch?v=iFu2db1LeAM)**
+
 ## スクリーンショット
 
 ### WebUI（画面例 1）
