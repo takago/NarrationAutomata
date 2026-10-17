@@ -1219,6 +1219,147 @@ Return each object's existing sentence_index and block_id plus motion:{type:...}
         raise
 
 
+
+
+def request_pointer_visual_clarification(
+    client: OpenAI,
+    cfg: dict,
+    image_path: Path,
+    blocks: list[dict],
+    sentences: list[str],
+    alignments: list[dict],
+    lang: str = "ja",
+) -> list[dict]:
+    """LLMが追加の視覚情報を必要とする文のみ，VLMへの質問を提案する．
+
+    JSONの構造とVLMの座標系は呼び出し側が固定する．モデル生成の質問には
+    画像上の対象の特定だけを許し，最大3文までに制限する．
+    """
+    if not sentences or not any(b.get("type") in ("image", "image_subpart") or
+                                    (b.get("source") == "vlm" and b.get("kind") == "graphic")
+                                    for b in blocks):
+        return []
+    block_map = {b["block_id"]: b for b in blocks}
+    candidates = []
+    for idx, item in enumerate(alignments):
+        block = block_map.get(item.get("block_id"))
+        candidates.append({
+            "sentence_index": idx,
+            "sentence": sentences[idx],
+            "selected_block": {"label": block.get("label", block.get("text", ""))[:120],
+                               "type": block.get("type"), "source": block.get("source")}
+                              if block else None,
+        })
+    prompt = (
+        "Review the pointer targets for these narration sentences and slide elements. "
+        "Only when a sentence refers to a specific visible part of a diagram/chart/image "
+        "but the available blocks do not locate it precisely, request one targeted visual lookup. "
+        "Do not request lookups for ordinary text, code, transitions, or already precise targets. "
+        "Return only JSON: {\"requests\":[{\"sentence_index\":0,\"question\":\"Identify the ...\"}]}. "
+        "At most three requests. Return an empty array when nothing needs clarification. "
+        "The question must identify a visual object, not ask for an explanation."
+    )
+    response = stream_chat(
+        client, task="ポインタ追加調査の必要性判定", model=cfg["model"], temperature=0.0,
+        messages=[{"role": "system", "content": prompt},
+                  {"role": "user", "content": [
+                      {"type": "text", "text": json.dumps({"candidates": candidates,
+                          "visual_blocks": [{"id": b["block_id"],
+                                             "label": str(b.get("label", b.get("text", "")))[:120],
+                                             "type": b.get("type"), "source": b.get("source")}
+                                            for b in blocks][:100]}, ensure_ascii=False)},
+                      {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
+                  ]}], **reasoning_extra_kwargs(cfg.get("reasoning_effort", "none")),
+    )
+    data = extract_json(response.choices[0].message.content or "")
+    requests = data.get("requests", []) if isinstance(data, dict) else []
+    if not isinstance(requests, list):
+        return []
+    checked, result = set(), []
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        idx, question = request.get("sentence_index"), request.get("question")
+        if (type(idx) is int and 0 <= idx < len(sentences) and idx not in checked
+                and isinstance(question, str) and 8 <= len(question.strip()) <= 500):
+            checked.add(idx)
+            result.append({"sentence_index": idx, "question": question.strip()})
+        if len(result) >= 3:
+            break
+    return result
+
+
+def emit_pointer_clarification(page: int, phase: str, *, client=None, **details) -> None:
+    """CLI と WebUI に共通する追加調査の進捗イベント．"""
+    payload = {"page": page, "phase": phase, **details}
+    callback = getattr(client, '_slide_pointer_event_callback', None)
+    if callback is not None:
+        callback(payload)
+    else:
+        print('[POINTER_CLARIFICATION] ' + json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def refine_pointer_with_vlm(
+    client: OpenAI, cfg: dict, image_path: Path, blocks: list[dict],
+    sentences: list[str], alignments: list[dict], lang: str = "ja", active: bool = False,
+    page: int = 0,
+) -> tuple[list[dict], list[dict], dict]:
+    """必要と判定された場合だけ1回VLMに再問い合わせし，追加bboxで再選定する．"""
+    info = {"requested": 0, "added_blocks": 0, "changed_sentences": 0}
+    emit_pointer_clarification(page, "checking", client=client)
+    requests = request_pointer_visual_clarification(
+        client, cfg, image_path, blocks, sentences, alignments, lang)
+    info["requested"] = len(requests)
+    if not requests:
+        emit_pointer_clarification(page, "skipped", client=client)
+        return blocks, alignments, info
+
+    emit_pointer_clarification(page, "detecting", client=client, requested=len(requests))
+    # 質問内容はLLMが作成し，座標規則・JSON構造は既存のVLM検出器側で固定する．
+    questions = "\n".join(
+        f"- sentence_index={r['sentence_index']}: {r['question']}" for r in requests)
+    prompt = (
+        "次の対象をスライド画像から探し，それぞれの領域を検出してください．\n"
+        + questions + "\n見つからない対象は出力しないでください．"
+        "各領域のkindはtextまたはgraphic，bboxは0〜1000の正規化XYXY座標です．"
+        if lang == "ja" else
+        "Find only these visual targets in the slide image:\n" + questions +
+        "\nOmit targets not found. Return kind (text/graphic) and bounding boxes "
+        "in normalized 0-1000 XYXY coordinates."
+    )
+    sys_prompt = DETECT_IMAGE_PARTS_SYSTEM_JA if lang == "ja" else DETECT_IMAGE_PARTS_SYSTEM_EN
+    _, additions = run_vlm_element_detection(
+        client, cfg["model"], image_path, prompt, system_prompt=sys_prompt,
+        temperature=0.0, reasoning_effort=cfg.get("reasoning_effort", "none"))
+    existing = {(tuple(b.get("bbox", [])), str(b.get("label", ""))) for b in blocks}
+    for elem in additions:
+        key = (tuple(elem["bbox"]), str(elem.get("label", "")))
+        if key in existing:
+            continue
+        existing.add(key)
+        elem["block_id"] = len(blocks)
+        elem["source"] = "vlm"
+        blocks.append(elem)
+        info["added_blocks"] += 1
+    if not info["added_blocks"]:
+        emit_pointer_clarification(page, "completed", client=client, **info)
+        return blocks, alignments, info
+
+    emit_pointer_clarification(page, "realigning", client=client, requested=len(requests), added_blocks=info["added_blocks"])
+    revised = align_narration_with_blocks(
+        client, cfg, image_path, blocks, sentences, lang=lang, active=active)
+    # 追加調査対象以外のポインタは変更しない．同じ文でも新規bboxが採用された場合だけ置換する．
+    requested = {r["sentence_index"] for r in requests}
+    new_ids = {b["block_id"] for b in blocks[-info["added_blocks"]:]}
+    for idx in requested:
+        if idx < len(revised) and revised[idx].get("block_id") in new_ids:
+            if revised[idx].get("block_id") != alignments[idx].get("block_id"):
+                alignments[idx] = revised[idx]
+                info["changed_sentences"] += 1
+    emit_pointer_clarification(page, "completed", client=client, **info)
+    return blocks, alignments, info
+
+
 def build_pointer_schedule(
     blocks: list[dict],
     alignments: list[dict],
@@ -1538,6 +1679,13 @@ def generate_single_alignment(
     sentences = split_sentences(text, lang=lang)
     alignments = align_narration_with_blocks(client, cfg, image_path, blocks, sentences, lang=lang, active=active_pointer)
 
+    pointer_clarification = {"requested": 0, "added_blocks": 0, "changed_sentences": 0}
+    if use_vlm and cfg.get("pointer_vlm_clarification", False):
+        blocks, alignments, pointer_clarification = refine_pointer_with_vlm(
+            client, cfg, image_path, blocks, sentences, alignments, lang=lang,
+            active=active_pointer, page=page_num,
+        )
+
     target_lang = "en" if lang == "ja" else "ja"
     translations = translate_sentences(client, cfg, sentences, target_lang=target_lang)
 
@@ -1555,6 +1703,7 @@ def generate_single_alignment(
         "visual_mode": "vlm" if use_vlm else "pdf",
         "blocks": blocks,
         "alignments": alignments,
+        "pointer_clarification": pointer_clarification,
     }
 
 
@@ -2435,6 +2584,9 @@ def main() -> int:
     filter_config_path = Path("tts_filter.yaml")
 
     proj_cfg = load_project_json(root)
+    # WebUIとCLIの双方で，プロジェクト固有の追加調査設定を使用する．
+    cfg['llm'] = {**cfg['llm'],
+                  'pointer_vlm_clarification': proj_cfg.get('pointer_vlm_clarification', False) is True}
     mode = args.mode or proj_cfg.get("mode") or cfg.get("mode", "lecture")
     lang = args.lang or proj_cfg.get("language") or cfg.get("language", "ja")
     pages_spec = args.pages if args.pages is not None else proj_cfg.get("pages", "")

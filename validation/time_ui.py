@@ -317,6 +317,12 @@ class TimeRefineView:
         self.busy = False
         self.stop_requested = False
         self.result_container = None
+        self._chart_project = None
+        self._chart_signature = None
+        self._chart_data_signature = None
+        self._chart_widgets = []
+        self._chart_summary = None
+        self._chart_mode_label = None
         self._source_project = None
         self._target_project = None
         self._progress_fraction = 0.0
@@ -538,62 +544,110 @@ class TimeRefineView:
             pass  # UI can disappear while the server task continues.
 
     def refresh_result(self):
-        if self.result_container is None:
+        """Update chart data only when it changes; preserve ECharts instances and zoom.
+
+        A project change (or loss of the result panel) recreates the charts.
+        Otherwise the existing widgets receive only changed options, so a
+        progress/status refresh does not flicker or reset the user's zoom.
+        """
+        container = self.result_container
+        if container is None or getattr(container, 'is_deleted', False):
             return
-        self.result_container.clear()
-        if self.owner.paths is None:
-            return
-        meta = load_project_json(self.owner.paths.root).get('time_refine')
-        if not isinstance(meta, dict) or not meta.get('original_narration_chars'):
-            return
-        rows = refine_rows(self.owner.paths, meta)
+        paths = self.owner.paths
+        project = paths.root if paths is not None else None
+        meta = load_project_json(project).get('time_refine') if project is not None else None
+        rows = (refine_rows(paths, meta) if isinstance(meta, dict) and meta.get('original_narration_chars') else [])
+
         if not rows:
+            if self._chart_project is not None or self._chart_signature is not None:
+                container.clear()
+            self._chart_project = project
+            self._chart_signature = None
+            self._chart_data_signature = None
+            self._chart_widgets = []
+            self._chart_summary = None
+            self._chart_mode_label = None
             return
+
         before = sum(r['before'] for r in rows)
         after = sum(r['after'] or 0 for r in rows)
-        with self.result_container:
-            ui.separator()
-            ui.label('再生時間の調整結果').classes('text-h6')
-            state = meta.get('state', '不明')
-            ui.label(f'状態：{state} ／ 短縮前 {before:,}字 → 現在 {after:,}字'
-                     f'（削減率 {(1 - after/before)*100:.1f}%）' if before else f'状態：{state}').classes('text-sm')
-            first = meta.get('original_seconds')
-            target = meta.get('target_seconds')
-            last = meta.get('result_seconds')
-            if meta.get('mode') == 'percent':
-                ui.label(f'目標文字量：{float(meta.get("target_percent") or 0):g}% ／ 動画は自動生成しません．').classes('text-sm')
-            else:
-                ui.label('ビデオ時間：元 {:.1f}分 ／ 目標 {:.1f}分 ／ 完成 {}'.format(
+        state = meta.get('state', '不明')
+        summary = (f'状態：{state} ／ 短縮前 {before:,}字 → 現在 {after:,}字'
+                   f'（削減率 {(1 - after/before)*100:.1f}%）') if before else f'状態：{state}'
+        first = meta.get('original_seconds')
+        target = meta.get('target_seconds')
+        last = meta.get('result_seconds')
+        if meta.get('mode') == 'percent':
+            mode_text = f'目標文字量：{float(meta.get("target_percent") or 0):g}% ／ 動画は自動生成しません．'
+        else:
+            mode_text = 'ビデオ時間：元 {:.1f}分 ／ 目標 {:.1f}分 ／ 完成 {}'.format(
                 first/60 if first else 0, target/60 if target else 0,
-                f'{last/60:.1f}分' if last is not None else '未完成')).classes('text-sm')
-            max_chars = max([r['before'] for r in rows] + [r['after'] or 0 for r in rows] + [1])
-            slide_labels = [str(r['page']) for r in rows]
-            image_urls = {}
-            for row in rows:
-                page = int(row['page'])
-                image_path = self.owner.paths.page_image(page)
-                if image_path.is_file():
-                    image_urls[str(page)] = _time_refine_file_url(image_path)
-            # Identical y-axis limits for the two charts; x-axis is slide number.
-            for key, title, color in [('before', '上段：短縮前の原稿文字数', '#94a3b8'),
-                                       ('after', '下段：短縮後の原稿文字数', '#6478b5')]:
-                ui.label(title).classes('text-sm font-bold')
-                options = _time_refine_bar_chart_options(rows, slide_labels, max_chars,
-                                                         key=key, title=title, color=color,
-                                                         image_urls=image_urls)
-                ui.echart(options).classes('w-full h-64')
-            # Relative narration length: 1.00 is unchanged; 0.90 means 10% shorter.
-            relative = [round(r['after'] / r['before'], 4)
-                        if r['before'] and r['after'] is not None else None for r in rows]
-            # A shortening ratio is bounded by 1.0; avoid ECharts automatic padding.
-            relative = [min(1.0, max(0.0, value)) if value is not None else None for value in relative]
-            ui.label('短縮比率（短縮前＝1.00）').classes('text-sm font-bold')
-            ui.label('0.90は10%短縮，1.00は変更なしを表します．').classes('text-xs text-slate-400')
-            ratio_options = _time_refine_ratio_chart_options(rows, slide_labels, relative, image_urls)
-            ui.echart(ratio_options).classes('w-full h-64')
-            ui.label('各スライドの短縮結果はExcelのスライド別明細で確認できます．').classes('text-xs text-slate-400')
-            ui.button('調整結果をExcelダウンロード', icon='download',
-                      on_click=self.download_result).props('outline dense')
+                f'{last/60:.1f}分' if last is not None else '未完成')
+
+        slide_labels = [str(r['page']) for r in rows]
+        image_urls = {}
+        for row in rows:
+            page = int(row['page'])
+            image_path = paths.page_image(page)
+            if image_path.is_file():
+                image_urls[str(page)] = _time_refine_file_url(image_path)
+        max_chars = max([r['before'] for r in rows] + [r['after'] or 0 for r in rows] + [1])
+        relative = [round(r['after'] / r['before'], 4)
+                    if r['before'] and r['after'] is not None else None for r in rows]
+        relative = [min(1.0, max(0.0, value)) if value is not None else None for value in relative]
+
+        # Includes tooltip images and status text, but not the unrelated progress
+        # fraction or focused slide.  JSON makes nested dictionaries comparable.
+        signature = json.dumps([summary, mode_text, rows, image_urls],
+                               sort_keys=True, ensure_ascii=False, default=str)
+        if (self._chart_project == project and self._chart_signature == signature
+                and len(self._chart_widgets) == 3
+                and all(not getattr(chart, 'is_deleted', False) for chart in self._chart_widgets)):
+            return
+        data_signature = json.dumps([rows, image_urls], sort_keys=True, ensure_ascii=False, default=str)
+
+        options = [
+            _time_refine_bar_chart_options(rows, slide_labels, max_chars, key='before',
+                                           title='上段：短縮前の原稿文字数', color='#94a3b8', image_urls=image_urls),
+            _time_refine_bar_chart_options(rows, slide_labels, max_chars, key='after',
+                                           title='下段：短縮後の原稿文字数', color='#6478b5', image_urls=image_urls),
+            _time_refine_ratio_chart_options(rows, slide_labels, relative, image_urls),
+        ]
+        can_update = (self._chart_project == project and len(self._chart_widgets) == 3
+                      and all(not getattr(chart, 'is_deleted', False) for chart in self._chart_widgets)
+                      and self._chart_summary is not None and self._chart_mode_label is not None)
+        if can_update:
+            self._chart_summary.text = summary
+            self._chart_mode_label.text = mode_text
+            if self._chart_data_signature != data_signature:
+                # Reuse the chart elements to keep their dataZoom state.
+                for chart, updated_options in zip(self._chart_widgets, options):
+                    chart.options['xAxis']['data'] = updated_options['xAxis']['data']
+                    chart.options['yAxis']['max'] = updated_options['yAxis']['max']
+                    chart.options['series'] = updated_options['series']
+                    chart.options['tooltip'] = updated_options['tooltip']
+                    chart.update()
+        else:
+            container.clear()
+            self._chart_widgets = []
+            with container:
+                ui.separator()
+                ui.label('再生時間の調整結果').classes('text-h6')
+                self._chart_summary = ui.label(summary).classes('text-sm')
+                self._chart_mode_label = ui.label(mode_text).classes('text-sm')
+                for title, chart_options in zip(
+                        ['上段：短縮前の原稿文字数', '下段：短縮後の原稿文字数'], options[:2]):
+                    ui.label(title).classes('text-sm font-bold')
+                    self._chart_widgets.append(ui.echart(chart_options).classes('w-full h-64'))
+                ui.label('短縮比率（短縮前＝1.00）').classes('text-sm font-bold')
+                ui.label('0.90は10%短縮，1.00は変更なしを表します．').classes('text-xs text-slate-400')
+                self._chart_widgets.append(ui.echart(options[2]).classes('w-full h-64'))
+                ui.label('各スライドの短縮結果はExcelのスライド別明細で確認できます．').classes('text-xs text-slate-400')
+                ui.button('調整結果をExcelダウンロード', icon='download',
+                          on_click=self.download_result).props('outline dense')
+        self._chart_project = project
+        self._chart_signature = signature
+        self._chart_data_signature = data_signature
 
     def download_result(self):
         paths = self.owner.paths

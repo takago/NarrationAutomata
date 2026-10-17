@@ -805,6 +805,7 @@ class SlideNarratorApp:
         self.mode_select = None
         self.lang_select = None
         self.default_vlm_switch = None
+        self.pointer_clarification_switch = None
         self.pointer_default_select = None
         self.pointer_image_panel = None
         self.pointer_anchor_x = None
@@ -987,6 +988,37 @@ class SlideNarratorApp:
                 lambda: self.history_log_widget.push(f'[{datetime.now():%H:%M:%S}] {line}'),
                 'ログ表示',
             )
+
+    def handle_pointer_clarification(self, event: dict[str, Any]) -> None:
+        """追加調査のイベントを既存のジョブ進捗とログ表示に反映する．"""
+        if not isinstance(event, dict):
+            return
+        phase = event.get('phase')
+        page = event.get('page')
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            return
+        messages = {
+            'checking': '追加調査の必要性を判定中…',
+            'detecting': f'VLMによる追加調査中（対象：{event.get("requested", 0)}文）…',
+            'realigning': '追加検出した領域でポインタ位置を再選定中…',
+            'completed': (f'追加調査完了（対象：{event.get("requested", 0)}文，'
+                          f'追加検出：{event.get("added_blocks", 0)}領域，'
+                          f'位置変更：{event.get("changed_sentences", 0)}文）'),
+        }
+        if phase == 'skipped':
+            return  # 不要な場合は通常の進捗表示に戻す
+        message = messages.get(phase)
+        if message is None:
+            return
+        status = read_user_job_status(self.username)
+        if status.get('state') != 'running' or status.get('stage') != 'align':
+            return
+        if status.get('current_page') is not None and int(status['current_page']) != page:
+            return
+        self.update_job_status('running', message=f'スライド {page}：{message}',
+                               current_page=page, llm_metrics=None)
 
     def handle_llm_progress(self, metrics: dict[str, Any]) -> None:
         """子プロセス／個別再生成に共通するLLM進捗イベントの受け口．"""
@@ -3453,6 +3485,8 @@ class SlideNarratorApp:
             self.lang_select.value = self.lang_code
         if self.default_vlm_switch:
             self.default_vlm_switch.value = self.default_use_vlm
+        if self.pointer_clarification_switch is not None:
+            self.pointer_clarification_switch.value = self.proj_cfg.get('pointer_vlm_clarification', False) is True
         self.refresh_pointer_image_panel()
         if self.pointer_default_select:
             default_mode = self.proj_cfg.get('pointer_default_mode', 'static') if self.pdf else 'static'
@@ -3867,6 +3901,13 @@ class SlideNarratorApp:
                         except (ValueError, TypeError):
                             pass
 
+                    if line.startswith('[POINTER_CLARIFICATION]'):
+                        try:
+                            event = json.loads(line[len('[POINTER_CLARIFICATION]'):].strip())
+                            self.handle_pointer_clarification(event)
+                        except (ValueError, TypeError):
+                            pass
+
                     if line.startswith('[LLM_PROGRESS]'):
                         try:
                             metrics = json.loads(line[len('[LLM_PROGRESS]'):].strip())
@@ -4247,12 +4288,14 @@ class SlideNarratorApp:
         try:
             client = await run.io_bound(make_client, self.cfg['llm'])
             client._slide_progress_callback = self.make_individual_llm_progress_callback()
+            client._slide_pointer_event_callback = self._make_threadsafe_progress_callback(self.handle_pointer_clarification)
             dpi = int(self.cfg.get('pdf', {}).get('dpi', 150))
             data = await run.io_bound(
                 run_with_statistics,
                 self.paths.root / 'statistics.jsonl', page,
                 generate_single_alignment,
-                client, self.cfg['llm'], self.pdf, page,
+                client, {**self.cfg['llm'],
+                         'pointer_vlm_clarification': self.proj_cfg.get('pointer_vlm_clarification', False) is True}, self.pdf, page,
                 self.paths.page_image(page), text.strip(), dpi, self.lang_code,
                 visual_mode=mode_str,
                 active_pointer=(effective_mode(load_project_json(self.paths.root), page) == 'active' or
@@ -6214,6 +6257,13 @@ class SlideNarratorApp:
                 self.default_vlm_switch = ui.switch('VLMを活用してポインタ配置を決定する', value=self.default_use_vlm).props('dense color=primary')
                 self.default_vlm_switch.tooltip('ONにすると図形・数式・グラフの内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
                 self.default_vlm_switch.on_value_change(lambda e: self._default_vlm_changed(e.value))
+                self.pointer_clarification_switch = ui.switch(
+                    '曖昧なポインタ位置をVLMで追加調査する',
+                    value=self.proj_cfg.get('pointer_vlm_clarification', False) is True,
+                ).props('dense color=primary')
+                self.pointer_clarification_switch.tooltip('LLMが必要と判断したときだけ，VLMに最大1回追加問い合わせします．処理時間が増える場合があります．')
+                self.pointer_clarification_switch.on_value_change(
+                    lambda e: self._pointer_clarification_changed(e.value))
                 pointer_default_mode = self.proj_cfg.get('pointer_default_mode', 'static')
                 if pointer_default_mode not in ('static', 'active', 'hidden'):
                     pointer_default_mode = 'static'
@@ -6224,7 +6274,7 @@ class SlideNarratorApp:
                 self.pointer_default_select.on_value_change(lambda e: self._pointer_default_changed(e.value))
                 ui.label('スライド・文ごとの個別設定が優先されます．').classes('text-xs text-zinc-400')
 
-            self.sidebar_busy_controls.extend([self.default_vlm_switch, self.pointer_default_select])
+            self.sidebar_busy_controls.extend([self.default_vlm_switch, self.pointer_clarification_switch, self.pointer_default_select])
             # Easyでは見出しと付随する区切り線を隠し，余白を残さない．
             self.pipeline_heading_separator = ui.separator()
             self.pipeline_heading_label = ui.label('パイプライン実行').classes('text-h6')
@@ -6329,6 +6379,7 @@ class SlideNarratorApp:
                 self.mode_select.disable()
                 self.lang_select.disable()
                 self.default_vlm_switch.disable()
+                self.pointer_clarification_switch.disable()
                 self.pointer_default_select.disable()
                 self.pages_input.disable()
 
@@ -6553,6 +6604,19 @@ class SlideNarratorApp:
             return
         self.default_use_vlm = bool(value)
         self.save_project_settings()
+
+    def _save_pointer_clarification_option(self, key: str, value: object) -> None:
+        if not self.write_access_allowed() or not self.paths or GLOBAL_EXECUTION_LOCK.is_locked():
+            return
+        project = load_project_json(self.paths.root)
+        if project.get(key) == value:
+            return
+        project[key] = value
+        save_project_json(self.paths.root, project)
+        self.proj_cfg = project
+
+    def _pointer_clarification_changed(self, value: bool) -> None:
+        self._save_pointer_clarification_option('pointer_vlm_clarification', bool(value))
 
     def _pointer_default_changed(self, value: str) -> None:
         if value not in ('static', 'active', 'hidden') or not self.paths:
