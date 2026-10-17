@@ -6441,6 +6441,32 @@ class SlideNarratorApp:
             app.storage.user.clear()
             ui.navigate.to('/login')
 
+        # 全ユーザー共通の簡易操作ガイド．生成や設定は変更しない．
+        with ui.dialog() as help_dialog:
+            with ui.card().classes('w-full max-w-2xl bg-slate-900 text-slate-100'):
+                with ui.row().classes('w-full items-center gap-2'):
+                    ui.icon('help_outline', size='24px').classes('text-blue-300')
+                    ui.label('NarrationAutomataの使い方').classes('text-h6')
+                with ui.column().classes('w-full gap-3 max-h-[65vh] overflow-y-auto pr-2'):
+                    ui.label('おすすめの作成手順').classes('font-bold text-blue-300')
+                    guide_steps = (
+                        ('1．PDFをアップロード', '「＋」からPDFを登録し，新しいプロジェクトを作成します．'),
+                        ('2．Advanced Modeでポインタを設定', '必要に応じてポインタの種類・動き・画像などを設定します．'),
+                        ('3．① ナレーション原稿の生成', '①を実行して，スライドごとの原稿を作成します．'),
+                        ('4．リファイナーで原稿を確認', '検査結果を確認し，指摘された問題を必要に応じて手動で修正します．'),
+                        ('5．再生時間の調整（50%）', '動画がない状態では目標文字量を50%にして短縮します．元のプロジェクトを残して新しいプロジェクトを作成し，原稿のみを書き換えます．'),
+                        ('6．④ ナレーションビデオの作成', '短縮後の新しいプロジェクトで④を実行します．不足している②・③も必要に応じて実行され，動画が完成します．'),
+                    )
+                    for heading, description in guide_steps:
+                        with ui.column().classes('w-full gap-1'):
+                            ui.label(heading).classes('font-bold')
+                            ui.label(description).classes('text-sm text-slate-300 whitespace-normal')
+                    ui.separator()
+                    ui.label('完成したビデオが長すぎる場合').classes('font-bold text-blue-300')
+                    ui.label('もう一度「再生時間の調整」を実行し，今度は目標再生時間を指定してください．別の新しいプロジェクトを作成して，動画まで自動的に再生成します．').classes('text-sm text-slate-300 whitespace-normal')
+                with ui.row().classes('w-full justify-end'):
+                    ui.button('閉じる', on_click=help_dialog.close).props('flat color=primary')
+
         # ヘッダー
         with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
             ui.label('🎓 NarrationAutomata').classes('text-h5 text-white')
@@ -6448,6 +6474,7 @@ class SlideNarratorApp:
             if current_username:
                 badge_role = ' (管理者)' if is_admin else ''
                 ui.label(f'👤 {current_username}{badge_role}').classes('text-caption text-slate-400 mr-2')
+            ui.button(icon='help_outline', on_click=help_dialog.open).props('flat round dense color=white').tooltip('使い方')
             ui.button('ログアウト', on_click=logout).props('dense outline size=sm color=white').classes('mr-3')
             ui.label('TAKAGO_LAB. 2026').classes('text-subtitle2 font-mono tracking-wider text-slate-300 mr-2')
 
