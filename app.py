@@ -943,8 +943,6 @@ class SlideNarratorApp:
 
     def write_access_allowed(self, notify: bool = True) -> bool:
         if self._project_switching:
-            if notify:
-                safe_notify('プロジェクト切替の完了後に操作してください．', type='warning')
             return False
         user_info = load_users().get('users', {}).get(self.username, {})
         allowed, reason = is_user_within_allowed_period(user_info)
@@ -1313,7 +1311,9 @@ class SlideNarratorApp:
             else:
                 self.easy_generate_button.classes(add='hidden')
         if self._widget_available(self.cancel_button):
-            self.cancel_button.classes(remove='hidden') if owner_running else self.cancel_button.classes(add='hidden')
+            panel = getattr(self, 'refine_sidebar_panel', None)
+            show_cancel = owner_running and bool(panel is not None and panel.visible)
+            self.cancel_button.classes(remove='hidden') if show_cancel else self.cancel_button.classes(add='hidden')
 
     def set_sidebar_view_mode(self, mode: str) -> None:
         """表示内容だけを変更する．生成設定と実行中のジョブには触れない．"""
@@ -1638,15 +1638,7 @@ class SlideNarratorApp:
                 'tts': '③ 音声生成', 'video': '④ ビデオ生成'}
         stage = name.get(self.get_active_stage_key(display), '通常パイプライン')
         state_label = {'running': '実行中', 'failed': 'エラー停止', 'cancelled': '中断'}[state]
-        self.refine_sidebar_title.text = f'処理状況：{stage}（{state_label}）'
-        # ProjectPaths.root is a generated "*_lecture" directory, not the
-        # project's display name.  Use the same label as the project selector.
-        pdf = self.pdf if self.pdf is not None and self.pdf.is_file() else None
-        if pdf is None and self.paths is not None:
-            pdf = self.paths.pdf if self.paths.pdf.is_file() else None
-        project_name = self.project_display_name(pdf) if pdf is not None else ''
-        self.refine_sidebar_project.text = f'プロジェクト：{project_name}' if project_name else ''
-
+        self.refine_sidebar_title.text = f'{stage}（{state_label}）'
         detail = str(display.get('error_detail') or display.get('message') or stage).strip()
         current = display.get('current_index')
         total = display.get('total_count')
@@ -1666,10 +1658,15 @@ class SlideNarratorApp:
                     detail = ' ／ '.join(part for part in (mode, remainder.strip(' ：:')) if part)
                 elif detail == prefix:
                     detail = ''
-            detail = prefix + (f'\n{detail}' if detail else '')
+            self.refine_sidebar_slide.text = prefix
+            self.refine_sidebar_slide.visible = True
+        if not (current and total):
+            self.refine_sidebar_slide.visible = False
         progress = display.get('progress')
-        if isinstance(progress, (int, float)):
-            detail = f'進捗：{max(0, min(100, int(progress * 100)))}％\n{detail}'
+        self.refine_sidebar_percent.text = (
+            f'{max(0, min(100, int(progress * 100)))}%'
+            if isinstance(progress, (int, float)) else ''
+        )
         self.refine_sidebar_detail.text = detail
         self._set_sidebar_slide_preview(display.get('current_page'))
         self._update_sidebar_extra_progress(display, active_stage=self.get_active_stage_key(display))
@@ -1781,6 +1778,7 @@ class SlideNarratorApp:
         cancel_pending = self._refresh_advanced_stages(
             stage_status, None if refine_active else active_key, globally_busy, owner_is_self)
         self.refresh_common_job_sidebar(status, own_status, owner_is_self)
+        self._refresh_easy_action_visibility()  # カードの表示状態が確定した後に停止ボタンを同期する．
         # 共通カードが進捗の唯一の表示場所．工程別ボタンと中断操作は残す．
         if self._widget_available(self.refine_sidebar_panel) and self.refine_sidebar_panel.visible:
             if self._widget_available(self.easy_progress_box):
@@ -2995,13 +2993,7 @@ class SlideNarratorApp:
                 LOGGER.info('[refine-sidebar] synchronized project selector: %s', project.name)
         title = '再生時間の調整' if kind == 'time' else 'リファイナー'
         self.refine_sidebar_title.text = (
-            f'処理状況：{title}（実行中）' if live else f'処理状況：{title}（状態未確認）')
-        # Display the user-facing project name as in the project selector,
-        # while keeping its stable ID available for identification.
-        project_pdfs = list(project.glob('*.pdf'))
-        display_name = (self.project_display_name(project_pdfs[0])
-                        if len(project_pdfs) == 1 else project.name)
-        self.refine_sidebar_project.text = f'プロジェクト：{display_name}（{project.name}）'
+            f'{title}（実行中）' if live else f'{title}（状態未確認）')
         phase = str(state.get('title') or state.get('stage') or '').strip()
         detail = str(state.get('detail') or state.get('message') or '').strip()
         if phase and detail and phase not in detail:
@@ -3010,6 +3002,15 @@ class SlideNarratorApp:
             detail = detail or phase or '処理中…'
         if not live:
             detail += '\n保存済みの進捗です．サーバ側の実行は確認できません．'
+        # The detailed status retains the original message, while slide position
+        # and percentage are displayed in their dedicated places.
+        slide_match = re.match(r'^スライド\s+\d+\s*[（(]\s*\d+\s*/\s*\d+\s*[）)]', detail)
+        if slide_match:
+            self.refine_sidebar_slide.text = slide_match.group(0)
+            self.refine_sidebar_slide.visible = True
+            detail = detail[slide_match.end():].lstrip(' ：:／\n')
+        else:
+            self.refine_sidebar_slide.visible = False
         self.refine_sidebar_detail.text = detail
         self._update_sidebar_extra_progress(state, active_stage=kind)
         fraction = state.get('fraction') if kind == 'time' else state.get('progress')
@@ -3017,6 +3018,7 @@ class SlideNarratorApp:
             value = max(0.0, min(1.0, float(fraction))) if fraction is not None else None
         except (ValueError, TypeError):
             value = None
+        self.refine_sidebar_percent.text = f'{int(value * 100)}%' if value is not None else ''
         if value is None or state.get('indeterminate'):
             self.refine_sidebar_bar.props('indeterminate')
         else:
@@ -5631,8 +5633,10 @@ class SlideNarratorApp:
 
             return base_in, key_in, model_sel, voice_sel, limit_in
 
-        ja_widgets = _build_single_tts_card('ja', '日本語', ja, 'こんにちは。日本語の音声合成テストです。正常に聞こえますか？', 'test_ja.mp3')
-        en_widgets = _build_single_tts_card('en', '英語', en, 'Hello! This is a test for English text-to-speech synthesis.', 'test_en.mp3')
+        with ui.expansion('日本語 TTS', icon='record_voice_over', value=False).classes('w-full border border-zinc-800 rounded-lg'):
+            ja_widgets = _build_single_tts_card('ja', '日本語', ja, 'こんにちは。日本語の音声合成テストです。正常に聞こえますか？', 'test_ja.mp3')
+        with ui.expansion('英語 TTS', icon='record_voice_over', value=False).classes('w-full border border-zinc-800 rounded-lg'):
+            en_widgets = _build_single_tts_card('en', '英語', en, 'Hello! This is a test for English text-to-speech synthesis.', 'test_en.mp3')
         return ja_widgets, en_widgets
 
     def _build_dict_editor(self) -> None:
@@ -5844,22 +5848,25 @@ class SlideNarratorApp:
             with ui.row().classes('w-full items-center justify-between pb-2'):
                 ui.label('システム設定').classes('text-h4 font-bold')
 
-            llm_base, llm_key, llm_model, llm_temp, llm_reason = self._build_llm_settings()
+            # 各設定は生成時に構築するため，折りたたんでも入力値やイベントは維持される．
+            with ui.expansion('LLM / VLM', icon='psychology', value=False).classes('w-full border border-zinc-800 rounded-lg'):
+                llm_base, llm_key, llm_model, llm_temp, llm_reason = self._build_llm_settings()
             (ja_base, ja_key, ja_model, ja_voice, ja_limit), (en_base, en_key, en_model, en_voice, en_limit) = self._build_tts_settings()
 
-            with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-lg'):
-                ui.label('PDF・ビデオ設定（システム共通）').classes('text-lg font-bold')
-                pdf_cfg = self.cfg.get('pdf', {})
-                video_cfg = self.cfg.get('video', {})
-                with ui.row().classes('w-full gap-3'):
-                    pdf_dpi = ui.number('PDF DPI', value=pdf_cfg.get('dpi', 81), min=36, max=600, step=1).props('outlined').classes('w-40')
-                    video_fps = ui.number('ビデオ FPS', value=video_cfg.get('fps', 10), min=1, max=60, step=1).props('outlined').classes('w-40')
-                    video_crf = ui.number('CRF（小さいほど高画質）', value=video_cfg.get('crf', 26), min=0, max=51, step=1).props('outlined').classes('w-52')
-                with ui.row().classes('w-full gap-3'):
-                    video_preset = ui.select(['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], value=video_cfg.get('preset', 'veryfast'), label='エンコード preset').props('outlined').classes('w-52')
-                    video_codec = ui.select(['aac', 'libmp3lame', 'ac3'], value=video_cfg.get('audio_codec', 'aac'), label='音声コーデック').props('outlined').classes('w-44')
-                    video_bitrate = ui.select(['64k', '96k', '128k', '160k', '192k', '256k', '320k'], value=video_cfg.get('audio_bitrate', '96k'), label='音声ビットレート').props('outlined').classes('w-44')
-                ui.label('設定は次回の画像・ビデオ生成から適用されます．既存の生成ファイルは自動再生成されません．').classes('text-xs text-zinc-400')
+            with ui.expansion('PDF・ビデオ', icon='movie', value=False).classes('w-full border border-zinc-800 rounded-lg'):
+                with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-lg'):
+                    ui.label('PDF・ビデオ設定（システム共通）').classes('text-lg font-bold')
+                    pdf_cfg = self.cfg.get('pdf', {})
+                    video_cfg = self.cfg.get('video', {})
+                    with ui.row().classes('w-full gap-3'):
+                        pdf_dpi = ui.number('PDF DPI', value=pdf_cfg.get('dpi', 81), min=36, max=600, step=1).props('outlined').classes('w-40')
+                        video_fps = ui.number('ビデオ FPS', value=video_cfg.get('fps', 10), min=1, max=60, step=1).props('outlined').classes('w-40')
+                        video_crf = ui.number('CRF（小さいほど高画質）', value=video_cfg.get('crf', 26), min=0, max=51, step=1).props('outlined').classes('w-52')
+                    with ui.row().classes('w-full gap-3'):
+                        video_preset = ui.select(['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'], value=video_cfg.get('preset', 'veryfast'), label='エンコード preset').props('outlined').classes('w-52')
+                        video_codec = ui.select(['aac', 'libmp3lame', 'ac3'], value=video_cfg.get('audio_codec', 'aac'), label='音声コーデック').props('outlined').classes('w-44')
+                        video_bitrate = ui.select(['64k', '96k', '128k', '160k', '192k', '256k', '320k'], value=video_cfg.get('audio_bitrate', '96k'), label='音声ビットレート').props('outlined').classes('w-44')
+                    ui.label('設定は次回の画像・ビデオ生成から適用されます．既存の生成ファイルは自動再生成されません．').classes('text-xs text-zinc-400')
 
             def save_main_config() -> None:
                 """基本設定を保存し，結果を通知する．"""
@@ -5926,7 +5933,8 @@ class SlideNarratorApp:
                     ui.notify(f'config.yaml の保存に失敗しました: {err}', type='negative')
 
             ui.button('💾 基本設定 (config.yaml) を一括保存', on_click=save_main_config).props('color=primary size=lg').classes('w-full mt-2 mb-2')
-            self._build_dict_editor()
+            with ui.expansion('ヨミ変換・辞書', icon='translate', value=False).classes('w-full border border-zinc-800 rounded-lg'):
+                self._build_dict_editor()
 
     # --- ユーザー管理タブ ---
 
@@ -6202,9 +6210,39 @@ class SlideNarratorApp:
 
             # 選択中のプロジェクトを名前とは独立した一意のIDで確認できるようにする．
             current_id = self.pdf.parent.name if self.pdf and self.pdf.exists() else None
-            self.project_id_label = ui.label(f'プロジェクトID：{current_id or "未選択"}') \
-                .classes('w-full text-xs text-zinc-400 font-mono mt-2 select-text')
+            with ui.row().classes('w-full items-center justify-between gap-2 mt-2'):
+                self.project_id_label = ui.label(f'プロジェクトID：{current_id or "未選択"}') \
+                    .classes('text-xs text-zinc-400 font-mono select-text')
+                self.final_video_duration_label = ui.label('').classes('text-xs text-zinc-400')
 
+            # プロジェクトID直下に，通常生成とリファイン共通の進捗を表示する．
+            with ui.column().classes('w-full gap-2 p-3 mt-2 rounded-lg border border-blue-500/40 bg-slate-900') as self.refine_sidebar_panel:
+                self.refine_sidebar_title = ui.label('処理状況').classes('font-bold text-sm text-blue-300')
+                self.refine_sidebar_slide = ui.label('').classes('w-full text-center font-bold text-sm text-blue-200')
+                self.refine_sidebar_slide.visible = False
+                self.refine_sidebar_detail = ui.label('').classes('text-xs whitespace-pre-wrap break-words')
+                self.refine_sidebar_slide_preview = ui.image('').classes('w-full rounded-md border border-zinc-700 object-contain')
+                self.refine_sidebar_slide_preview.visible = False
+                self._sidebar_slide_preview_source = None
+                self.refine_sidebar_elapsed = ui.label('').classes('hidden text-xs text-zinc-400')
+                self.refine_sidebar_metrics = ui.label('').classes('hidden text-xs text-zinc-300 whitespace-pre-wrap break-words')
+                with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
+                    self.refine_sidebar_spinner = ui.spinner(size='sm', color='primary').classes('hidden shrink-0')
+                    self.refine_sidebar_percent = ui.label('').classes('text-xs font-semibold text-blue-200 tabular-nums shrink-0')
+                    self.refine_sidebar_bar = ui.linear_progress(value=0, show_value=False).props('rounded size=8px color=primary').classes('flex-1 min-w-0')
+                # 停止ボタンは共通カード内の末尾にだけ配置する．
+                self.cancel_button = ui.button(
+                    '中断', icon='stop', on_click=self.confirm_cancel,
+                ).props('outline color=negative').classes('w-full hidden')
+                self.cancel_button.tooltip('実行中の処理に中断を要求します．')
+                self.cancel_button.disable()
+            self.refine_sidebar_panel.visible = False
+
+            # 完成動画の操作はプロジェクトIDの下に配置し，見出しは省く．
+            self.final_video_container = ui.column().classes('w-full gap-2')
+
+            # プロジェクト情報と生成設定を区切る．
+            ui.separator().classes('w-full my-3')
 
             # 設定行のラベル列とラジオ選択肢の列幅を揃える．
             with ui.column().classes('w-full gap-1 mt-2'):
@@ -6282,13 +6320,8 @@ class SlideNarratorApp:
             self.sidebar_busy_controls.extend([self.project_prompt_save_button, self.project_dict_save_button, self.project_dict_audio_button])
             self.refresh_project_widgets()
 
-            with ui.expansion('ポインタ画像・指示点', icon='ads_click').classes('w-full mt-2') as pointer_expansion:
+            with ui.expansion('ポインタ', icon='ads_click').classes('w-full mt-2') as pointer_expansion:
                 self.advanced_sidebar_sections.append(pointer_expansion)
-                self.pointer_image_panel = ui.column().classes('w-full gap-2')
-                self.refresh_pointer_image_panel()
-
-            with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2') as vlm_card:
-                self.advanced_sidebar_sections.append(vlm_card)
                 self.default_vlm_switch = ui.switch('VLMを活用してポインタ配置を決定する', value=self.default_use_vlm).props('dense color=primary')
                 self.default_vlm_switch.tooltip('ONにすると図形・数式・グラフの内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
                 self.default_vlm_switch.on_value_change(lambda e: self._default_vlm_changed(e.value))
@@ -6308,6 +6341,8 @@ class SlideNarratorApp:
                 ).props('dense outlined').classes('w-full')
                 self.pointer_default_select.on_value_change(lambda e: self._pointer_default_changed(e.value))
                 ui.label('スライド・文ごとの個別設定が優先されます．').classes('text-xs text-zinc-400')
+                self.pointer_image_panel = ui.column().classes('w-full gap-2')
+                self.refresh_pointer_image_panel()
 
             self.sidebar_busy_controls.extend([self.default_vlm_switch, self.pointer_clarification_switch, self.pointer_default_select])
             # Easyでは見出しと付随する区切り線を隠し，余白を残さない．
@@ -6326,13 +6361,8 @@ class SlideNarratorApp:
                 on_click=lambda: self.handle_pipeline_button('video', '④ ナレーションビデオを作成中…', full_auto=True),
             ).props('color=primary').classes('w-full')
             self.easy_generate_button.tooltip('必要な前工程からビデオ完成まで一括して実行します．')
-            with ui.column().classes('w-full gap-2 rounded-lg p-2 bg-zinc-900 border border-zinc-800 hidden') as self.easy_progress_box:
-                self.easy_progress_label = ui.label('生成処理中…').classes('font-bold text-sm')
-                with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
-                    self.easy_progress_spinner = ui.spinner(size='sm', color='primary').classes('hidden shrink-0')
-                    self.easy_progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=8px color=positive').classes('flex-1 min-w-0')
-                self.easy_progress_detail = ui.label('').classes('text-xs text-zinc-400 whitespace-pre-wrap')
-                self.easy_progress_metrics = ui.label('').classes('hidden text-xs text-zinc-400 whitespace-pre-wrap')
+            # 進捗表示はProject ID直下の共通カードに集約する．
+            # Easy専用の進捗カードは二重表示になるため生成しない．
 
             self.stage_widgets.clear()
             self.pipeline_buttons.clear()
@@ -6377,28 +6407,6 @@ class SlideNarratorApp:
                         'error': p_error,
                     }
 
-            # リファインと通常生成の進捗を同じ位置に表示する．
-            with ui.column().classes('w-full gap-2 p-3 mt-2 rounded-lg border border-blue-500/40 bg-slate-900') as self.refine_sidebar_panel:
-                self.refine_sidebar_title = ui.label('処理状況').classes('font-bold text-sm text-blue-300')
-                self.refine_sidebar_project = ui.label('').classes('text-xs text-zinc-400')
-                self.refine_sidebar_detail = ui.label('').classes('text-xs whitespace-pre-wrap break-words')
-                self.refine_sidebar_slide_preview = ui.image('').classes('w-full rounded-md border border-zinc-700 object-contain')
-                self.refine_sidebar_slide_preview.visible = False
-                self._sidebar_slide_preview_source = None
-                self.refine_sidebar_elapsed = ui.label('').classes('hidden text-xs text-zinc-400')
-                self.refine_sidebar_metrics = ui.label('').classes('hidden text-xs text-zinc-300 whitespace-pre-wrap break-words')
-                with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
-                    self.refine_sidebar_spinner = ui.spinner(size='sm', color='primary').classes('hidden shrink-0')
-                    self.refine_sidebar_bar = ui.linear_progress(value=0, show_value=False).props('rounded size=8px color=primary').classes('flex-1 min-w-0')
-            self.refine_sidebar_panel.visible = False
-
-            # 中断は共通進捗カードの直下に置く（Easy／Advanced共通）．
-            self.cancel_button = ui.button(
-                '中断', icon='stop', on_click=self.confirm_cancel,
-            ).props('outline color=negative').classes('w-full hidden')
-            self.cancel_button.tooltip('実行中のパイプライン処理に中断を要求します．')
-            self.cancel_button.disable()
-
             self.reset_generated_button = self.register_main_action_button(
                 ui.button('生成データを削除', icon='delete_outline', on_click=self.confirm_reset_generated_data)
                 .props('outline color=negative').classes('w-full mt-2')
@@ -6418,14 +6426,6 @@ class SlideNarratorApp:
                 self.pointer_default_select.disable()
                 self.pages_input.disable()
 
-            ui.separator()
-            with ui.row().classes('w-full items-center justify-between gap-2'):
-                ui.label('🎬 完成ビデオ').classes('text-subtitle1 font-bold text-zinc-200')
-                self.final_video_duration_label = ui.label('').classes('text-xs text-zinc-400')
-            self.final_video_container = ui.column().classes('w-full gap-2')
-            ui.separator()
-            ui.label('TAKAGO LAB., KIT, Japan.').classes('text-caption')
-            ui.link('GitHub: takago/NarrationAutomata', 'https://github.com/takago/NarrationAutomata', new_tab=True)
 
     def _build_main_tabs(self, is_admin: bool) -> None:
         # メインタブエリア
@@ -6596,6 +6596,9 @@ class SlideNarratorApp:
         with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
             with ui.column().classes('gap-0'):
                 ui.label('NarrationAutomata').classes('text-h5 text-white')
+                ui.link('GitHub: takago/NarrationAutomata',
+                        'https://github.com/takago/NarrationAutomata', new_tab=True) \
+                    .classes('text-xs text-slate-400 hover:text-blue-300')
             ui.space()
             with ui.column().classes('gap-0 mr-4 text-xs'):
                 self._model_header_llm = ui.label().classes('max-w-64 truncate text-slate-200')
