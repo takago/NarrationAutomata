@@ -96,8 +96,15 @@ class ValidationView:
         The validation worker itself uses owner.processing as well, so keep
         the manual validation cancellation control available in that case.
         """
-        return bool(self.owner.processing or self._pipeline_running()) and (
-            self._pipeline_running() or not self.busy
+        project = self.owner.paths.root if self.owner.paths else None
+        worker = refine_job.running(self.owner.username, project) if project else None
+        # Time refinement owns the project while it is shortening narration.
+        # Treat it like the pipeline: hide validation/editing buttons even
+        # during phases when it temporarily releases the execution lock.
+        time_refine_running = worker is not None and hasattr(worker, '_target_project')
+        return time_refine_running or (
+            bool(self.owner.processing or self._pipeline_running()) and
+            (self._pipeline_running() or not self.busy)
         )
 
     def _sync_controls_on_state_change(self):
@@ -143,7 +150,8 @@ class ValidationView:
                         ui.checkbox(STAGE_NAMES[stage], value=self.selection[stage],
                                     on_change=lambda e, s=stage: self.selection.__setitem__(s, bool(e.value)))
                         ui.label(STAGE_DESCRIPTIONS[stage]).classes('text-xs text-slate-400')
-                self._start_button = ui.button('検査を開始', icon='play_arrow', on_click=self.start).props('outline').bind_enabled_from(self, 'busy', backward=lambda value: not value and not self._actions_locked())
+                self._start_button = ui.button('検査を開始', icon='play_arrow', on_click=self.start).props('outline')
+                self._start_button.set_enabled(not self._actions_locked())
                 ui.label('実行時に前回の検査結果をすべて破棄します．検査中は閲覧のみ可能です．').classes('text-caption text-slate-400')
         self.restore_progress()
         self.render_results()
@@ -227,8 +235,6 @@ class ValidationView:
         self._running_project = self.owner.paths.root
         refine_job.register(self.owner.username, self._running_project, self)
         refine_job.write(self._running_project, "content", state="running", message="検査を開始しています", progress=0.0)
-        if self._start_button is not None:
-            self._start_button.disable()
         self.owner.current_task = background_tasks.create(
             self._worker(stages),
             name="content-refine")
@@ -238,11 +244,6 @@ class ValidationView:
         owner = self.owner
         if not await self.execution_lock.acquire(owner.username, 'ナレーション品質検査', owner):
             self.busy = False
-            try:
-                if self._start_button is not None and not getattr(self._start_button, "is_deleted", False):
-                    self._start_button.enable()
-            except Exception:
-                pass
             refine_job.write(self._running_project, 'content', state='failed', message='ほかのユーザの処理が実行中です．')
             refine_job.unregister(owner.username, self._running_project, self)
             self._running_project = None
@@ -381,11 +382,6 @@ class ValidationView:
                 pass
         finally:
             self.busy = False
-            try:
-                if self._start_button is not None and not getattr(self._start_button, "is_deleted", False):
-                    self._start_button.enable()
-            except Exception:
-                pass
             refine_job.finish_content(project, cancelled=owner.cancellation_requested)
             refine_job.unregister(owner.username, project, self)
             self._running_project = None
@@ -596,19 +592,6 @@ class ValidationView:
                     after_counts = [counts[1] for counts in changed_pages.values()]
                     ui.label(f'修正されたスライド：{len(changed_pages)}枚 ／ '
                              f'文字数 {sum(before_counts):,} → {sum(after_counts):,}字').classes('text-sm')
-                    ui.label('修正されたスライドの原稿文字数（変更前後）').classes('text-sm font-bold')
-                    ui.echart({
-                        'tooltip': {'trigger': 'axis'},
-                        'legend': {'data': ['修正前', '修正後']},
-                        'grid': {'left': 60, 'right': 25, 'top': 42, 'bottom': 52},
-                        'xAxis': {'type': 'category', 'data': labels, 'name': 'スライド'},
-                        'yAxis': {'type': 'value', 'name': '文字数'},
-                        'dataZoom': [{'type': 'inside'}, {'type': 'slider', 'bottom': 5, 'height': 16}],
-                        'series': [
-                            {'name': '修正前', 'type': 'bar', 'data': before_counts, 'itemStyle': {'color': '#94a3b8'}},
-                            {'name': '修正後', 'type': 'bar', 'data': after_counts, 'itemStyle': {'color': '#6478b5'}},
-                        ],
-                    }).classes('w-full h-72')
                 elif not entries:
                     ui.label('修正履歴はありません．').classes('text-sm text-slate-400')
                 else:

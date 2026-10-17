@@ -2813,20 +2813,6 @@ class SlideNarratorApp:
             self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
             self._set_upload_status('スライド画像を準備中…', filename)
             self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
-            if time_refine_internal:
-                # Do not touch browser widgets from the independent worker.
-                # Preserve the same page-range rules as apply_pages_spec().
-                spec = str(self.proj_cfg.get('pages', '')).strip()
-                available = set(range(1, self.total_slides + 1))
-                if spec == 'none':
-                    self._selected_pages = set()
-                elif spec:
-                    self._selected_pages = parse_page_ranges(spec) & available
-                else:
-                    self._selected_pages = available
-                if self.edit_page not in self._selected_pages:
-                    self.edit_page = self.active_pages[0] if self.active_pages else None
-                return
             self.apply_pages_spec(self.proj_cfg.get('pages', ''), save_and_refresh=False)
             self.refresh_project_widgets()
             self.refresh_project_list()
@@ -2908,8 +2894,7 @@ class SlideNarratorApp:
         self._refine_sidebar_live = bool(live)
         # Content refinement writes the actual page to its persisted job status.
         # Show its PNG in the same preview used by normal pipeline stages.
-        self._set_sidebar_slide_preview(state.get('page') if kind == 'content' else None,
-                                        project=project)
+        self._set_sidebar_slide_preview(state.get('page'), project=project)
         panel.visible = True
         if self._widget_available(getattr(self, 'refine_sidebar_spinner', None)):
             self.refine_sidebar_spinner.classes(remove='hidden') if live else self.refine_sidebar_spinner.classes(add='hidden')
@@ -6358,8 +6343,6 @@ class SlideNarratorApp:
                         with ui.column().classes('w-full rounded-lg bg-slate-800/40 border border-slate-700 p-4 gap-1'):
                             ui.label('ナレーション原稿の品質を検査・修正します．').classes('text-sm font-semibold')
                             ui.label('①の生成後など，必要なときに「検査を開始」を押してください．生成工程とは独立した手動操作です．').classes('text-sm text-slate-300')
-                            ui.label('ルール検査の指摘は自動再生成せず，ほかの自動校正を終えた後に手動修正を求めます．').classes('text-sm text-slate-300')
-                            ui.label('結果は「統計」ではなく，この「リファイナー」タブで確認できます．').classes('text-sm text-slate-300')
                         self.validation_view.build()
                     with ui.tab_panel(tab_time_refine):
                         self.time_refine_view.build()

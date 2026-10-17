@@ -7,6 +7,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -35,9 +36,11 @@ def fmt(value: float) -> str:
     return f'{total // 3600:02}:{(total // 60) % 60:02}:{total % 60:02}' if total >= 3600 else f'{total // 60:02}:{total % 60:02}'
 
 
-def refined_project_name(source_name: str, target_minutes: float) -> str:
+def refined_project_name(source_name: str, target_minutes: float | None = None, target_percent: float | None = None) -> str:
     """Name a time-refined copy by its requested duration, not its version."""
-    base_name = re.sub(r'(?:_RF\d+(?:\.\d+)?m)+$', '', source_name.strip(), flags=re.IGNORECASE)
+    base_name = re.sub(r'(?:_RF\d+(?:\.\d+)?[mp])+$', '', source_name.strip(), flags=re.IGNORECASE)
+    if target_percent is not None:
+        return f'{base_name}_RF{target_percent:g}p'
     return f'{base_name}_RF{target_minutes:g}m'
 
 
@@ -204,6 +207,8 @@ def export_refine_excel(path: Path, metadata: dict, rows: list[dict]) -> None:
                        ('完成時間（分）', 'result_seconds')]:
         value = metadata.get(key)
         summary.append([label, round(value / 60, 2) if value is not None else None])
+    if metadata.get('mode') == 'percent':
+        summary.append(['目標文字量（%）', metadata.get('target_percent')])
     summary.append(['実行状態', metadata.get('state', '不明')])
     summary.append(['元の原稿総文字数', sum(row['before'] for row in rows)])
     summary.append(['現在の原稿総文字数', sum(row['after'] or 0 for row in rows)])
@@ -224,11 +229,80 @@ def export_refine_excel(path: Path, metadata: dict, rows: list[dict]) -> None:
     wb.save(path)
 
 
+def _time_refine_file_url(path: Path) -> str:
+    rel = path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    ts = int(path.stat().st_mtime) if path.exists() else int(time.time())
+    return f'/files/{rel}?t={ts}'
+
+
+def _time_refine_tooltip_formatter(image_urls: dict[str, str], rows: list[dict]) -> str:
+    images_json = json.dumps(image_urls, ensure_ascii=False)
+    before_json = json.dumps({str(r['page']): int(r['before']) for r in rows}, ensure_ascii=False)
+    after_json = json.dumps({str(r['page']): (int(r['after']) if r['after'] is not None else None) for r in rows}, ensure_ascii=False)
+    ratio_json = json.dumps({str(r['page']): (round((r['after'] / r['before']), 4) if r['before'] and r['after'] is not None else None) for r in rows}, ensure_ascii=False)
+    formatter = r'''function(params) {
+        const list = Array.isArray(params) ? params : [params];
+        if (!list.length) return '';
+        const item = list[0];
+        const page = String(item.axisValue ?? item.name ?? '');
+        const images = __IMAGES__;
+        const before = __BEFORE__;
+        const after = __AFTER__;
+        const ratios = __RATIOS__;
+        const fmtInt = value => (value === null || value === undefined) ? '—' : Number(value).toLocaleString('ja-JP');
+        const fmtRatio = value => (value === null || value === undefined) ? '—' : Number(value).toFixed(2);
+        const imgHtml = images[page] ? '<img src="' + images[page] + '" style="display:block;width:260px;max-width:100%;height:auto;max-height:160px;object-fit:contain;background:#fff;margin:7px 0;border-radius:4px" />' : '';
+        return '<div style="min-width:230px;color:#e2e8f0">' +
+               '<strong>スライド ' + page + '</strong>' +
+               imgHtml +
+               '<div>短縮前：' + fmtInt(before[page]) + '字</div>' +
+               '<div>短縮後：' + fmtInt(after[page]) + '字</div>' +
+               '<div>短縮後／短縮前：' + fmtRatio(ratios[page]) + '</div>' +
+               '</div>';
+    }'''
+    return (formatter.replace('__IMAGES__', images_json)
+                    .replace('__BEFORE__', before_json)
+                    .replace('__AFTER__', after_json)
+                    .replace('__RATIOS__', ratio_json))
+
+
+def _time_refine_bar_chart_options(rows: list[dict], slide_labels: list[str], max_chars: int, *, key: str, title: str, color: str, image_urls: dict[str, str]) -> dict:
+    return {
+        'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'},
+                    'backgroundColor': '#1f2937', 'borderColor': '#475569',
+                    'confine': True, 'enterable': False,
+                    ':formatter': _time_refine_tooltip_formatter(image_urls, rows)},
+        'grid': {'left': 58, 'right': 25, 'bottom': 42, 'top': 15},
+        'xAxis': {'type': 'category', 'data': slide_labels, 'name': 'スライド'},
+        'yAxis': {'type': 'value', 'min': 0, 'max': max_chars, 'name': '文字数'},
+        'dataZoom': [{'type': 'inside', 'xAxisIndex': 0}, {'type': 'slider', 'bottom': 5, 'height': 15}],
+        'series': [{'type': 'bar', 'name': title, 'itemStyle': {'color': color}, 'data': [r[key] for r in rows]}],
+    }
+
+
+def _time_refine_ratio_chart_options(rows: list[dict], slide_labels: list[str], relative: list[float | None], image_urls: dict[str, str]) -> dict:
+    return {
+        'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'},
+                    'backgroundColor': '#1f2937', 'borderColor': '#475569',
+                    'confine': True, 'enterable': False,
+                    ':formatter': _time_refine_tooltip_formatter(image_urls, rows)},
+        'grid': {'left': 58, 'right': 25, 'bottom': 42, 'top': 15},
+        'xAxis': {'type': 'category', 'data': slide_labels, 'name': 'スライド'},
+        'yAxis': {'type': 'value', 'min': 0, 'max': 1.0, 'interval': 0.2, 'name': '短縮比率'},
+        'dataZoom': [{'type': 'inside', 'xAxisIndex': 0}, {'type': 'slider', 'bottom': 5, 'height': 15}],
+        'series': [
+            {'type': 'bar', 'name': '短縮後／短縮前', 'data': relative, 'itemStyle': {'color': '#6478b5'}},
+            {'type': 'line', 'name': '短縮前（1.00）', 'data': [1.0] * len(rows), 'symbol': 'none', 'lineStyle': {'type': 'dashed', 'color': '#94a3b8'}},
+        ],
+    }
+
+
 class TimeRefineView:
     def __init__(self, owner, lock):
         self.owner = owner
         self.lock = lock
         self.target_minutes = None
+        self.target_percent = 50.0
         self.policies = {key: True for key, _, _ in REFINE_POLICIES}
         self.controls = None
         self.status = None
@@ -248,10 +322,15 @@ class TimeRefineView:
         self._progress_fraction = 0.0
         self._progress_indeterminate = False
         self._shown_busy = None
+        self._shown_other_job = None
 
     def build(self):
         ui.label('再生時間の調整').classes('text-h5')
-        ui.label('完成ビデオの再生時間を基準に，短縮版を新規プロジェクトとして全自動生成します．元のプロジェクトは変更しません．').classes('text-caption text-slate-400')
+        self.mode_description = ui.label(
+            '元のプロジェクトを残し，新しいプロジェクトを作成して調整します．'
+            '動画がある場合は，再生時間を指定してナレーションを短縮し，動画を作り直します．'
+            '動画がない場合は，文字数の割合を指定してナレーションのみを書き換えます．'
+        ).classes('text-caption text-slate-400')
         self.controls = ui.column().classes('w-full gap-3')
         self.target_input = None
         self.start_button = None
@@ -272,6 +351,20 @@ class TimeRefineView:
         self.result_container = ui.column().classes('w-full gap-2 mt-3')
         self.refresh()
 
+    def _other_job_running(self) -> bool:
+        """Hide time-refinement inputs while any *other* job owns execution.
+
+        Check the live registry in addition to the lock because a worker may
+        temporarily release the lock between stages.  The current time-refine
+        worker must retain its own stop button.
+        """
+        project = self.owner.paths.root if self.owner.paths else None
+        own = refine_job.running_as(self.owner.username, project, TimeRefineView)
+        if own is not None:
+            return False
+        other = refine_job.running(self.owner.username, project) if project else None
+        return bool(other is not None or self.owner.processing or self.lock.is_locked())
+
     def _sync_controls_on_state_change(self):
         """Rebuild settings after completion, cancellation, or failure."""
         if self.controls is None or getattr(self.controls, "is_deleted", False):
@@ -280,7 +373,7 @@ class TimeRefineView:
         live = refine_job.running_as(self.owner.username, project, TimeRefineView)
         if self.running_spinner is not None:
             self.running_spinner.visible = live is not None
-        if (live is not None) != self._shown_busy:
+        if (live is not None) != self._shown_busy or self._other_job_running() != self._shown_other_job:
             self.refresh()
 
     def update_result(self):
@@ -299,26 +392,37 @@ class TimeRefineView:
     def _source(self):
         paths = self.owner.paths
         if paths is None or self.owner.pdf is None:
-            return None, '先にプロジェクトを選択してください．'
-        if not paths.final_video.is_file():
-            return None, 'ビデオが完成している必要があります．先にビデオ生成を完了してください．'
-        if any(not paths.explanation(p).is_file() for p in self.owner.active_pages):
-            return None, '全対象スライドのナレーションが必要です．先に原稿を生成してください．'
-        secs = duration(paths.final_video)
-        if secs is None:
-            return None, '完成ビデオの再生時間を取得できません．ffprobeとビデオファイルを確認してください．'
-        return secs, ''
+            return None, None, '先にプロジェクトを選択してください．'
+        if not self.owner.active_pages or any(not paths.explanation(p).is_file() for p in self.owner.active_pages):
+            return None, None, '全対象スライドのナレーションが必要です．先に原稿を生成してください．'
+        if paths.final_video.is_file():
+            secs = duration(paths.final_video)
+            if secs is None:
+                return None, None, '完成ビデオの再生時間を取得できません．ffprobeとビデオファイルを確認してください．'
+            return 'time', secs, ''
+        chars = sum(len(paths.explanation(p).read_text(encoding='utf-8').strip()) for p in self.owner.active_pages)
+        if chars <= 0:
+            return None, None, '短縮対象のナレーション原稿がありません．'
+        return 'percent', chars, ''
+
+    def _can_start(self, mode, baseline, reason):
+        if reason or mode is None or baseline is None or self.busy or self.owner.processing or self.lock.is_locked() or self.owner.read_only:
+            return False
+        if mode == 'time':
+            return self.target_minutes is not None and 0 < self.target_minutes * 60 < baseline
+        return self.target_percent is not None and 30 <= self.target_percent <= 95
 
     def refresh(self):
         if self.controls is None:
             return
         self.restore_progress()
         self._shown_busy = self.busy
+        self._shown_other_job = self._other_job_running()
         self.controls.clear()
         self.target_input = None
         self.start_button = None
         # Do not require the source video while a live refinement is running.
-        secs, reason = (None, '') if self.busy else self._source()
+        mode, baseline, reason = (None, None, '') if self.busy else self._source()
         # The chart is reconstructed from project.json and narration files.
         # It must also be restored while a refinement is still running.
         self.update_result()
@@ -329,39 +433,48 @@ class TimeRefineView:
                 target_seconds = snapshot.get('target_seconds')
                 if target_seconds is None and self.target_minutes is not None:
                     target_seconds = self.target_minutes * 60
-                if target_seconds is not None:
+                if snapshot.get('mode') == 'percent':
+                    ui.label(f'目標文字量：{float(snapshot.get("target_percent") or 0):g}%').classes('text-sm text-slate-300')
+                elif target_seconds is not None:
                     ui.label(f'目標時間：{float(target_seconds) / 60:.1f}分').classes('text-sm text-slate-300')
                 stop_button = ui.button('再生時間の調整を中断', icon='stop', on_click=self.request_stop).props('outline color=negative')
                 if self.stop_requested:
                     stop_button.disable()
                     ui.label('中断要求を受け付けました．現在の処理の終了後に停止します．').classes('text-orange-300 text-sm')
+            elif self._shown_other_job:
+                ui.label('ほかの生成処理中のため，設定項目と操作ボタンは非表示です．結果は閲覧できます．').classes('text-caption text-slate-400')
             else:
                 if reason:
                     ui.label(reason).classes('text-orange-300')
-                elif secs is not None:
-                    ui.label(f'現在のビデオ時間：約{secs / 60:.1f}分').classes('font-bold')
+                elif mode == 'time':
+                    ui.label(f'現在のビデオ時間：約{baseline / 60:.1f}分').classes('font-bold')
+                else:
+                    ui.label(f'現在の原稿文字数：{baseline:,}字').classes('font-bold')
                 with ui.row().classes('items-center gap-3 flex-wrap'):
-                    self.target_input = ui.number('目標時間（分）', value=self.target_minutes, min=1, max=1440, precision=1,
-                                                  on_change=self._set_target).props('outlined dense').classes('w-44')
-                    if self.busy or self.owner.read_only:
+                    if mode == 'percent':
+                        self.target_input = ui.number('目標文字量（%）', value=self.target_percent, min=30, max=95, precision=1,
+                                                      on_change=self._set_target).props('outlined dense').classes('w-44')
+                    else:
+                        self.target_input = ui.number('目標時間（分）', value=self.target_minutes, min=1, max=1440, precision=1,
+                                                      on_change=self._set_target).props('outlined dense').classes('w-44')
+                    if self.owner.read_only:
                         self.target_input.disable()
                 ui.label('短縮方針').classes('font-bold mt-2')
                 ui.label('ONの項目をLLMの短縮指示に追加します．OFFでも通常の短縮は行います．').classes('text-xs text-slate-400')
                 for key, label, _ in REFINE_POLICIES:
                     policy_checkbox = ui.checkbox(label, value=self.policies[key],
-                                                  on_change=lambda e, k=key: self.policies.__setitem__(k, bool(e.value)) if not self.busy else None)
-                    if self.busy or self.owner.read_only:
+                                                  on_change=lambda e, k=key: self.policies.__setitem__(k, bool(e.value)))
+                    if self.owner.read_only:
                         policy_checkbox.disable()
-                can_start = bool(secs and self.target_minutes is not None and
-                                 0 < self.target_minutes * 60 < secs and
-                                 not self.busy and not self.owner.processing and
-                                 not self.lock.is_locked() and not self.owner.read_only)
-                self.start_button = ui.button('新しいプロジェクトとして再生時間の調整を開始', icon='content_copy', on_click=self.start).props('outline')
+                can_start = self._can_start(mode, baseline, reason)
+                self.start_button = ui.button('新しいプロジェクトで調整を開始', icon='content_copy', on_click=self.start).props('outline')
                 if not can_start:
                     self.start_button.disable()
-                ui.label('実行条件：完成ビデオ・原稿が存在し，ほかの生成処理が実行されていないこと．').classes('text-xs text-slate-400')
-                ui.label('目標時間は必須です．現在のビデオより短い時間を指定してください．').classes('text-xs text-slate-400')
-                ui.label('目標時間は上限の目安です．情報を保持できない場合，目標未達でも停止します．').classes('text-xs text-slate-400')
+                if mode == 'time':
+                    ui.label('目標時間は必須です．現在のビデオより短い時間を指定してください．').classes('text-xs text-slate-400')
+                elif mode == 'percent':
+                    ui.label('現在の原稿文字数を100%として30〜95%を指定します．短縮後の動画は生成しません．').classes('text-xs text-slate-400')
+                ui.label('目標は目安です．重要な説明を保持できない場合，目標未達でも停止します．').classes('text-xs text-slate-400')
 
     def restore_progress(self):
         if self.owner.paths is None:
@@ -378,6 +491,24 @@ class TimeRefineView:
             self.busy = False
         if self.running_spinner is not None:
             self.running_spinner.visible = self.busy
+        if not snapshot:
+            # A project without a time-refinement job must not inherit the
+            # previously selected project's progress or log widgets.
+            self.step_log_lines = []
+            if self.step_log is not None:
+                self.step_log.text = ''
+            if self.status is not None:
+                self.status.text = ''
+            if self.progress_panel is not None:
+                self.progress_panel.visible = False
+            if self.progress_title is not None:
+                self.progress_title.text = '準備中'
+            if self.progress_detail is not None:
+                self.progress_detail.text = ''
+            if self.progress_bar is not None:
+                self.progress_bar.props(remove='indeterminate')
+                self.progress_bar.value = 0
+            return
         if snapshot:
             if self.progress_panel is not None:
                 self.progress_panel.visible = True
@@ -429,45 +560,36 @@ class TimeRefineView:
             first = meta.get('original_seconds')
             target = meta.get('target_seconds')
             last = meta.get('result_seconds')
-            ui.label('ビデオ時間：元 {:.1f}分 ／ 目標 {:.1f}分 ／ 完成 {}'.format(
+            if meta.get('mode') == 'percent':
+                ui.label(f'目標文字量：{float(meta.get("target_percent") or 0):g}% ／ 動画は自動生成しません．').classes('text-sm')
+            else:
+                ui.label('ビデオ時間：元 {:.1f}分 ／ 目標 {:.1f}分 ／ 完成 {}'.format(
                 first/60 if first else 0, target/60 if target else 0,
                 f'{last/60:.1f}分' if last is not None else '未完成')).classes('text-sm')
             max_chars = max([r['before'] for r in rows] + [r['after'] or 0 for r in rows] + [1])
             slide_labels = [str(r['page']) for r in rows]
+            image_urls = {}
+            for row in rows:
+                page = int(row['page'])
+                image_path = self.owner.paths.page_image(page)
+                if image_path.is_file():
+                    image_urls[str(page)] = _time_refine_file_url(image_path)
             # Identical y-axis limits for the two charts; x-axis is slide number.
             for key, title, color in [('before', '上段：短縮前の原稿文字数', '#94a3b8'),
                                        ('after', '下段：短縮後の原稿文字数', '#6478b5')]:
                 ui.label(title).classes('text-sm font-bold')
-                options = {'tooltip': {'trigger': 'axis'}, 'grid': {'left': 58, 'right': 25, 'bottom': 42, 'top': 15},
-                           'xAxis': {'type': 'category', 'data': slide_labels, 'name': 'スライド'},
-                           'yAxis': {'type': 'value', 'min': 0, 'max': max_chars, 'name': '文字数'},
-                           'dataZoom': [{'type': 'inside', 'xAxisIndex': 0},
-                                        {'type': 'slider', 'bottom': 5, 'height': 15}],
-                           'series': [{'type': 'bar', 'name': title, 'itemStyle': {'color': color},
-                                       'data': [r[key] for r in rows]}]}
+                options = _time_refine_bar_chart_options(rows, slide_labels, max_chars,
+                                                         key=key, title=title, color=color,
+                                                         image_urls=image_urls)
                 ui.echart(options).classes('w-full h-64')
             # Relative narration length: 1.00 is unchanged; 0.90 means 10% shorter.
             relative = [round(r['after'] / r['before'], 4)
                         if r['before'] and r['after'] is not None else None for r in rows]
-            finite = [v for v in relative if v is not None]
             # A shortening ratio is bounded by 1.0; avoid ECharts automatic padding.
             relative = [min(1.0, max(0.0, value)) if value is not None else None for value in relative]
             ui.label('短縮比率（短縮前＝1.00）').classes('text-sm font-bold')
             ui.label('0.90は10%短縮，1.00は変更なしを表します．').classes('text-xs text-slate-400')
-            ratio_options = {
-                'tooltip': {'trigger': 'axis'},
-                'grid': {'left': 58, 'right': 25, 'bottom': 42, 'top': 15},
-                'xAxis': {'type': 'category', 'data': slide_labels, 'name': 'スライド'},
-                'yAxis': {'type': 'value', 'min': 0, 'max': 1.0, 'interval': 0.2, 'name': '短縮比率'},
-                'dataZoom': [{'type': 'inside', 'xAxisIndex': 0},
-                             {'type': 'slider', 'bottom': 5, 'height': 15}],
-                'series': [
-                    {'type': 'bar', 'name': '短縮後／短縮前', 'data': relative,
-                     'itemStyle': {'color': '#6478b5'}},
-                    {'type': 'line', 'name': '短縮前（1.00）', 'data': [1.0] * len(rows),
-                     'symbol': 'none', 'lineStyle': {'type': 'dashed', 'color': '#94a3b8'}}
-                ],
-            }
+            ratio_options = _time_refine_ratio_chart_options(rows, slide_labels, relative, image_urls)
             ui.echart(ratio_options).classes('w-full h-64')
             ui.label('各スライドの短縮結果はExcelのスライド別明細で確認できます．').classes('text-xs text-slate-400')
             ui.button('調整結果をExcelダウンロード', icon='download',
@@ -494,20 +616,17 @@ class TimeRefineView:
     def _set_target(self, event):
         if self.busy:
             return
-        value = event.value
+        mode, baseline, reason = self._source()
         try:
-            minutes = float(value) if value is not None and str(value).strip() else None
-            self.target_minutes = minutes if minutes is not None and minutes > 0 else None
+            value = float(event.value) if event.value is not None and str(event.value).strip() else None
         except (ValueError, TypeError):
-            self.target_minutes = None
-        # Do not rebuild the controls on each keystroke: that destroys focus.
+            value = None
+        if mode == 'percent':
+            self.target_percent = value
+        else:
+            self.target_minutes = value
         if self.start_button is not None:
-            secs, reason = (None, '実行中') if self.busy else self._source()
-            can_start = (not reason and secs is not None and self.target_minutes is not None
-                         and 0 < self.target_minutes * 60 < secs and not self.busy
-                         and not self.owner.processing and not self.lock.is_locked()
-                         and not self.owner.read_only)
-            if can_start:
+            if self._can_start(mode, baseline, reason):
                 self.start_button.enable()
             else:
                 self.start_button.disable()
@@ -540,20 +659,23 @@ class TimeRefineView:
             raise asyncio.CancelledError()
 
     def start(self):
-        seconds, reason = self._source()
+        mode, baseline, reason = self._source()
         if reason or self.busy or self.lock.is_locked() or self.owner.processing:
             ui.notify(reason or '別の処理が実行中です．', type='warning')
             return
         if not self.owner.write_access_allowed():
             return
-        if self.target_minutes is None or not 0 < self.target_minutes * 60 < seconds:
-            ui.notify('目標時間は現在のビデオ時間より短く設定してください．', type='warning')
+        if not self._can_start(mode, baseline, reason):
+            ui.notify('目標値を確認してください．', type='warning')
             return
+        target = float(self.target_minutes) * 60 if mode == 'time' else float(self.target_percent)
         self.busy = True
         self._source_project = self.owner.paths.root
         self._target_project = None
         refine_job.register(self.owner.username, self._source_project, self)
-        self._persist(state="running", title="準備中", detail="新規プロジェクトを作成しています…", log=[], message="", fraction=0, indeterminate=True, stop_requested=False)
+        self._persist(state='running', mode=mode, target_percent=target if mode == 'percent' else None,
+                      title='準備中', detail='新規プロジェクトを作成しています…', log=[], message='',
+                      fraction=0, indeterminate=True, stop_requested=False)
         self.owner.set_time_refine_project_lock(True)
         self.stop_requested = False
         self.step_log_lines.clear()
@@ -564,14 +686,13 @@ class TimeRefineView:
         self._progress('準備中', '新規プロジェクトを作成しています…', indeterminate=True)
         selected_policies = dict(self.policies)
         self.refresh()
-        background_tasks.create(self._worker(seconds, float(self.target_minutes) * 60,
-                                             selected_policies), name='time-refine')
+        background_tasks.create(self._worker(float(baseline), target, selected_policies, mode), name='time-refine')
 
     def _progress(self, title: str, detail: str = '', *, fraction: float | None = None,
-                  indeterminate: bool = False):
+                  indeterminate: bool = False, page: int | None = None):
         """Update the existing progress widgets; never create UI from the worker."""
         value = max(0.0, min(1.0, fraction if fraction is not None else 0.0))
-        self._persist(title=title, detail=detail, fraction=value, indeterminate=indeterminate)
+        self._persist(title=title, detail=detail, fraction=value, indeterminate=indeterminate, page=page)
         if self.progress_panel is None:
             return
         def update():
@@ -596,7 +717,7 @@ class TimeRefineView:
             self._safe_ui(lambda: setattr(self.step_log, 'text', '\n'.join(self.step_log_lines)))
         self.owner.append_job_log('[TIME_REFINE] ' + message)
 
-    async def _worker(self, baseline: float, target: float, policies: dict[str, bool]):
+    async def _worker(self, baseline: float, target: float, policies: dict[str, bool], mode: str = 'time'):
         # NiceGUI background tasks do not have an implicit UI slot.  Project
         # selection and subsequent pipeline callbacks may create UI elements
         # (including notifications), so establish the originating client's
@@ -606,9 +727,9 @@ class TimeRefineView:
         if self.controls is None:
             raise RuntimeError('再生時間の調整画面が初期化されていません．')
         with self.controls:
-            await self._worker_with_ui_slot(baseline, target, policies)
+            await self._worker_with_ui_slot(baseline, target, policies, mode)
 
-    async def _worker_with_ui_slot(self, baseline: float, target: float, policies: dict[str, bool]):
+    async def _worker_with_ui_slot(self, baseline: float, target: float, policies: dict[str, bool], mode: str = 'time'):
         owner = self.owner
         source_pdf = owner.pdf
         source_paths = owner.paths
@@ -630,7 +751,7 @@ class TimeRefineView:
             new_paths = type(source_paths)(new_pdf)
             new_cfg = load_project_json(new_paths.root)
             new_cfg['project_id'] = project_id
-            new_cfg['project_name'] = refined_project_name(owner.project_display_name(source_pdf), target / 60)
+            new_cfg['project_name'] = refined_project_name(owner.project_display_name(source_pdf), target_minutes=target / 60 if mode == 'time' else None, target_percent=target if mode == 'percent' else None)
             # Snapshot narration lengths across all target slides before editing.
             # Record baseline separately from generation statistics.
             baseline_chars = {}
@@ -641,7 +762,9 @@ class TimeRefineView:
             # Reset copied statistics and derived artifacts BEFORE selecting the new project.
             await run.io_bound(reset_refined_project, new_paths)
             new_cfg['time_refine'] = {'source_project_id': source_pdf.parent.name,
-                                      'original_seconds': baseline, 'target_seconds': target,
+                                      'mode': mode, 'target_percent': target if mode == 'percent' else None,
+                                      'original_seconds': baseline if mode == 'time' else None,
+                                      'target_seconds': target if mode == 'time' else None,
                                       'original_narration_chars': baseline_chars,
                                       'result': None, 'state': 'running', 'policies': policies}
             save_project_json(new_paths.root, new_cfg)
@@ -659,9 +782,9 @@ class TimeRefineView:
             self._safe_ui(lambda: ui.notify('コピー完了．新しいプロジェクトでナレーションを短縮します．', type='info'))
             self._check_stop()
             current = baseline
-            if current > target:
+            if mode == 'percent' or current > target:
                 pages = list(owner.active_pages)
-                ratio = max(0.35, min(.92, target / current * .96))
+                ratio = target / 100 if mode == 'percent' else max(0.35, min(.92, target / current * .96))
                 self._message(f'短縮を開始します：対象 {len(pages)} 枚，文字数目標 {ratio * 100:.0f}%')
                 self._progress('ナレーション短縮', f'0 / {len(pages)} 枚完了', fraction=0)
                 # Exclusive access only for the revision phase. The existing video
@@ -680,7 +803,7 @@ class TimeRefineView:
                         self._check_stop()
                         self._progress('ナレーション短縮・内容保持確認',
                                        f'スライド {page} を処理中（{index + 1} / {len(pages)} 枚目）',
-                                       fraction=index / len(pages))
+                                       fraction=index / len(pages), page=page)
                         text_path = owner.paths.explanation(page)
                         original = text_path.read_text(encoding='utf-8')
                         if not original.strip():
@@ -688,7 +811,7 @@ class TimeRefineView:
                             self._message(f'スライド {page} は原稿が空のためスキップしました．')
                             self._progress('ナレーション短縮・内容保持確認',
                                            f'{index + 1} / {len(pages)} 枚完了（スライド {page} はスキップ）',
-                                           fraction=(index + 1) / len(pages))
+                                           fraction=(index + 1) / len(pages), page=page)
                             self.update_result()
                             continue
                         self._message(f'── スライド #{page}（{index + 1}/{len(pages)}）──')
@@ -734,7 +857,7 @@ class TimeRefineView:
                         self._message(f'  完了：{index + 1}/{len(pages)} 枚')
                         self._progress('ナレーション短縮・内容保持確認',
                                        f'{index + 1} / {len(pages)} 枚完了',
-                                       fraction=(index + 1) / len(pages))
+                                       fraction=(index + 1) / len(pages), page=page)
                         self.update_result()
                     new_cfg = load_project_json(owner.paths.root)
                     new_cfg['time_refine']['result'] = {'before_seconds': current,
@@ -751,16 +874,23 @@ class TimeRefineView:
                     self._message(f'短縮段階が終了しました：採用 {len(modified)} 枚，失敗 {len(failures)} 枚，空原稿 {len(skipped)} 枚．'
                                   + (f' 失敗スライド：{", ".join(str(item["page"]) for item in failures)}．' if failures else ''))
                 self._check_stop()
-                # 原稿の編集はここで完了．後続工程は別の通常生成ジョブに引き渡す．
+                # 原稿の編集が完了した．文字数指定では動画を生成しない．
                 new_cfg = load_project_json(owner.paths.root)
-                new_cfg['time_refine']['state'] = 'pipeline_pending'
-                save_project_json(owner.paths.root, new_cfg)
-                self._message('再生時間の調整が完了しました．②〜④を通常パイプラインへ引き継ぎます．')
-                self._progress('再生時間の調整完了', '通常パイプラインへ引き継ぎます…', fraction=1)
-                self._persist(state='completed', title='再生時間の調整完了',
-                              detail='通常パイプラインへ引き継ぎ', fraction=1, indeterminate=False)
-                handoff_to_pipeline = True
-            self._safe_ui(lambda: ui.notify('再生時間の調整が完了しました．通常生成を開始します．', type='info'))
+                if mode == 'percent':
+                    new_cfg['time_refine']['state'] = 'completed'
+                    save_project_json(owner.paths.root, new_cfg)
+                    self._message('文字数による原稿短縮が完了しました．動画は生成していません．必要に応じて②〜④を実行してください．')
+                    self._progress('原稿短縮完了', '動画は生成していません．', fraction=1)
+                    self._persist(state='completed', title='原稿短縮完了', detail='動画の自動生成なし', fraction=1, indeterminate=False)
+                else:
+                    new_cfg['time_refine']['state'] = 'pipeline_pending'
+                    save_project_json(owner.paths.root, new_cfg)
+                    self._message('再生時間の調整が完了しました．②〜④を通常パイプラインへ引き継ぎます．')
+                    self._progress('再生時間の調整完了', '通常パイプラインへ引き継ぎます…', fraction=1)
+                    self._persist(state='completed', title='再生時間の調整完了', detail='通常パイプラインへ引き継ぎ', fraction=1, indeterminate=False)
+                    handoff_to_pipeline = True
+            self._safe_ui(lambda: ui.notify('原稿短縮が完了しました．動画は生成していません．' if mode == 'percent' else '再生時間の調整が完了しました．通常生成を開始します．', type='info'))
+
         except asyncio.CancelledError:
             if new_dir is not None and new_dir.is_dir():
                 try:
