@@ -1420,6 +1420,59 @@ def build_pointer_schedule(
     return schedule, subtitle_timing
 
 
+def build_highlight_schedule(blocks: list[dict], alignments: list[dict],
+                             subtitles: list[dict], image_size: tuple[int, int],
+                             max_area_percent: float = 25) -> list[dict]:
+    """Use the chosen bbox per sentence, excluding oversized regions."""
+    block_map = {block.get('block_id'): block for block in blocks}
+    width, height = image_size
+    if not 1 <= max_area_percent <= 100:
+        raise ValueError("ハイライトの最大面積は1〜100%で指定してください")
+    result = []
+    for alignment, timing in zip(alignments, subtitles):
+        block = block_map.get(alignment.get('block_id'))
+        if not block or block.get('type') not in ('code_line', 'text', 'image', 'image_subpart', 'graphic'):
+            continue
+        box = block.get('bbox')
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            x0, y0, x1, y1 = (float(v) for v in box)
+        except (TypeError, ValueError):
+            continue
+        x0, y0 = max(0, min(width, x0)), max(0, min(height, y0))
+        x1, y1 = max(0, min(width, x1)), max(0, min(height, y1))
+        if x1 - x0 < 3 or y1 - y0 < 3 or timing['end'] <= timing['start']:
+            continue
+        if (x1 - x0) * (y1 - y0) > width * height * max_area_percent / 100:
+            continue
+        result.append({'start': timing['start'], 'end': timing['end'],
+                       'x': int(x0), 'y': int(y0),
+                       'w': max(1, int(x1-x0)), 'h': max(1, int(y1-y0)),
+                       'canvas_w': width, 'canvas_h': height})
+    return result
+
+
+def highlight_filters(events: list[dict], color: str, opacity: float) -> str:
+    """Render stationary rectangles at sentence times (no highlight jitter)."""
+    if color not in ('yellow', 'cyan', 'lime', 'orange', 'white'):
+        raise ValueError('不正なハイライトカラーです')
+    if not 0.1 <= opacity <= 0.7:
+        raise ValueError('ハイライトの不透明度は10〜70%にしてください')
+    filters = []
+    for item in events:
+        start, end = float(item['start']), float(item['end'])
+        if end <= start:
+            continue
+        x, y, w, h = (int(item[k]) for k in ('x', 'y', 'w', 'h'))
+        filters.append(
+            f'drawbox=x={x}:y={y}:w={w}:h={h}:'
+            f'color={color}@{opacity:.2f}:t=fill:'
+            f"enable='gte(t,{start:.12g})*lt(t,{end:.12g})'"
+        )
+    return ','.join(filters)
+
+
 def get_narration_prompt(mode: str, lang: str) -> str:
     if lang == "ja":
         return NARRATION_SYSTEM_JA_RESEARCH if mode == "research" else NARRATION_SYSTEM_JA_LECTURE
@@ -2082,6 +2135,7 @@ def generate_page_video(
     laser_img: Path,
     cfg: dict,
     force: bool,
+    highlight_events: list[dict] | None = None,
 ) -> None:
     if out.exists() and not force:
         print(f"[VIDEO] reuse {out}")
@@ -2108,6 +2162,9 @@ def generate_page_video(
     audio_codec = str(cfg.get("audio_codec", "aac"))
     audio_bitrate = str(cfg.get("audio_bitrate", "192k"))
 
+    highlight_chain = highlight_filters(highlight_events or [],
+        cfg.get('highlight_color', 'yellow'), float(cfg.get('highlight_opacity', 10)) / 100)
+
     quality_opts = {
         "libx264": ["-crf", crf],
         "h264_nvenc": ["-cq", crf],
@@ -2124,7 +2181,7 @@ def generate_page_video(
                 "-i", str(audio),
                 "-map", "0:v:0",
                 "-map", "1:a:0",
-                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2" + ("," + highlight_chain if highlight_chain else ""),
                 "-c:v", vcodec,
                 *encoder_opts,
                 *quality_opts,
@@ -2167,7 +2224,10 @@ def generate_page_video(
             overlays = []
             previous = '[bg]'
             valid = [event for event in schedule if event['end'] > event['start']]
-            parts = [f'[0:v]scale={width}:{height},format=yuv444p[bg]']
+            base_filters = f'scale={width}:{height},format=yuv444p'
+            if highlight_chain:
+                base_filters += ',' + highlight_chain
+            parts = [f'[0:v]{base_filters}[bg]']
             if len(valid) > 1:
                 parts.append(f'[1:v]scale={pointer_width}:{pointer_height},format=rgba,split={len(valid)}' + ''.join(f'[ptr{i}]' for i in range(len(valid))))
             else:
@@ -2472,6 +2532,7 @@ def _run_video_stage(
 
         duration = get_audio_duration(mp3_file)
 
+        highlight_events = []
         if align_file.exists():
             align_data = json.loads(align_file.read_text(encoding="utf-8"))
             blocks = align_data.get("blocks", [])
@@ -2486,6 +2547,11 @@ def _run_video_stage(
                 blocks, alignments, duration,
                 project_settings=load_project_json(video.parent), page=page_num, image_size=image_size,
             )
+            project_for_highlight = load_project_json(root)
+            if project_for_highlight.get('highlight_enabled', False) is True:
+                highlight_events = build_highlight_schedule(
+                    blocks, alignments, page_subtitles, image_size,
+                    max_area_percent=float(project_for_highlight.get('highlight_max_area_percent', 25)))
         else:
             text = text_file.read_text(encoding="utf-8").strip() if text_file.exists() else ""
             page_subtitles = [{
@@ -2505,11 +2571,17 @@ def _run_video_stage(
                 and page_settings.get('title_pointer_fixed', True) and duration > 0):
             schedule = [{'start': 0.0, 'end': duration, 'title_fixed': True}]
 
+        if page_settings.get('highlight_enabled', False) is True:
+            page_video_cfg = {**video_cfg, 'highlight_color': page_settings.get('highlight_color', 'yellow'),
+                              'highlight_opacity': page_settings.get('highlight_opacity', 10)}
+        else:
+            page_video_cfg = video_cfg
+            highlight_events = []
         all_page_subtitles.append((accumulated_offset, page_subtitles))
         accumulated_offset += duration
 
         page_digest = signature({'image': file_digest(image), 'audio': file_digest(mp3_file),
-                                 'alignment': file_digest(align_file), 'video_cfg': video_cfg,
+                                 'alignment': file_digest(align_file), 'video_cfg': page_video_cfg,
                                  'project': page_settings, 'lang': lang})
         rebuild_page = force or not cache_matches(out, page_digest)
         video_started = time.monotonic()
@@ -2520,8 +2592,9 @@ def _run_video_stage(
                 out,
                 schedule,
                 laser_img,
-                video_cfg,
+                page_video_cfg,
                 rebuild_page,
+                highlight_events,
             )
             if rebuild_page:
                 save_signature(out, page_digest)

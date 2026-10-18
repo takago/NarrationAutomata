@@ -813,6 +813,10 @@ class SlideNarratorApp:
         self.default_vlm_switch = None
         self.pointer_clarification_switch = None
         self.pointer_default_select = None
+        self.highlight_switch = None
+        self.highlight_color_select = None
+        self.highlight_opacity_slider = None
+        self.highlight_max_area_slider = None
         self.pointer_image_panel = None
         self.pointer_anchor_x = None
         self.pointer_anchor_y = None
@@ -3530,6 +3534,17 @@ class SlideNarratorApp:
             self.default_vlm_switch.value = self.default_use_vlm
         if self.pointer_clarification_switch is not None:
             self.pointer_clarification_switch.value = self.proj_cfg.get('pointer_vlm_clarification', False) is True
+        if self.highlight_switch is not None:
+            self.highlight_switch.value = self.proj_cfg.get('highlight_enabled', False) is True if self.pdf else False
+        if self.highlight_color_select is not None:
+            self.highlight_color_select.value = self.proj_cfg.get('highlight_color', 'yellow') if self.pdf else 'yellow'
+        if self.highlight_opacity_slider is not None:
+            self.highlight_opacity_slider.value = int(self.proj_cfg.get('highlight_opacity', 10)) if self.pdf else 10
+        if self.highlight_max_area_slider is not None:
+            self.highlight_max_area_slider.value = int(self.proj_cfg.get('highlight_max_area_percent', 25)) if self.pdf else 25
+        for widget in (self.highlight_switch, self.highlight_color_select, self.highlight_opacity_slider, self.highlight_max_area_slider):
+            if widget is not None:
+                widget.enable() if self.pdf and not self.read_only else widget.disable()
         self.refresh_pointer_image_panel()
         if self.pointer_default_select:
             default_mode = self.proj_cfg.get('pointer_default_mode', 'static') if self.pdf else 'static'
@@ -5076,8 +5091,10 @@ class SlideNarratorApp:
                     video_download_url = download_url(final) + '?filename=' + quote(download_name)
                     # Direct browser navigation to the attachment endpoint works
                     # before the video player has ever been opened.
-                    ui.link('↓ MP4ダウンロード', video_download_url, new_tab=False) \
-                        .classes('w-full text-center border rounded px-3 py-2 text-sm text-primary')
+                    with ui.link(target=video_download_url, new_tab=False) \
+                            .classes('w-full flex items-center justify-center gap-2 border rounded px-3 py-2 text-sm text-primary'):
+                        ui.icon('download')
+                        ui.label('MP4ダウンロード')
                 else:
                     ui.label('ビデオ未生成').classes('text-xs text-zinc-500')
             # プロジェクトを切り替えた場合には前の描画を確定しない．
@@ -6375,6 +6392,20 @@ class SlideNarratorApp:
                 self.refresh_pointer_image_panel()
 
             self.sidebar_busy_controls.extend([self.default_vlm_switch, self.pointer_clarification_switch, self.pointer_default_select])
+            with ui.expansion('ハイライト（試験的）', icon='highlight').classes('w-full mt-2') as highlight_expansion:
+                self.advanced_sidebar_sections.append(highlight_expansion)
+                ui.label('ナレーションの文に対応するPDF/VLM検出領域を，動画内で強調表示します．位置情報がない場合は表示しません．').classes('text-xs text-zinc-400')
+                self.highlight_switch = ui.switch('ハイライトを有効にする', value=self.proj_cfg.get('highlight_enabled', False) is True).props('dense color=primary')
+                self.highlight_color_select = ui.select({'yellow':'黄色', 'cyan':'シアン', 'lime':'黄緑', 'orange':'オレンジ', 'white':'白'}, value=self.proj_cfg.get('highlight_color', 'yellow'), label='ハイライトカラー').props('dense outlined').classes('w-full')
+                self.highlight_opacity_slider = ui.slider(min=10, max=70, step=5, value=int(self.proj_cfg.get('highlight_opacity', 10))).props('label-always')
+                ui.label('ハイライトするbboxの最大面積（スライド全体に対する割合）')
+                self.highlight_max_area_slider = ui.slider(min=5, max=100, step=5, value=int(self.proj_cfg.get('highlight_max_area_percent', 25))).props('label-always')
+                ui.label('透明度の調整（塗りの不透明度：10〜70%）').classes('text-xs text-zinc-400')
+                self.highlight_switch.on_value_change(lambda e: self._highlight_setting_changed('highlight_enabled', bool(e.value)))
+                self.highlight_color_select.on_value_change(lambda e: self._highlight_setting_changed('highlight_color', e.value))
+                self.highlight_opacity_slider.on_value_change(lambda e: self._highlight_setting_changed('highlight_opacity', int(e.value)))
+                self.highlight_max_area_slider.on_value_change(lambda e: self._highlight_setting_changed('highlight_max_area_percent', int(e.value)))
+            self.sidebar_busy_controls.extend([self.highlight_switch, self.highlight_color_select, self.highlight_opacity_slider, self.highlight_max_area_slider])
             # Easyでは見出しと付随する区切り線を隠し，余白を残さない．
             self.pipeline_heading_separator = ui.separator()
             self.pipeline_heading_label = ui.label('パイプライン実行').classes('text-h6')
@@ -6708,6 +6739,24 @@ class SlideNarratorApp:
             video_file.unlink(missing_ok=True)
         self.paths.final_video.unlink(missing_ok=True)
         ui.notify('ポインタモードを保存しました．ビデオ再生成で反映されます．', type='positive')
+
+    def _highlight_setting_changed(self, key: str, value: object) -> None:
+        if not self.paths or not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
+            return
+        if key == 'highlight_color' and value not in ('yellow', 'cyan', 'lime', 'orange', 'white'):
+            return
+        if key == 'highlight_opacity' and (not isinstance(value, int) or not 10 <= value <= 70):
+            return
+        if key == 'highlight_max_area_percent' and (not isinstance(value, int) or not 5 <= value <= 100 or value % 5):
+            return
+        data = load_project_json(self.paths.root)
+        if data.get(key, {'highlight_enabled':False, 'highlight_color':'yellow', 'highlight_opacity':10, 'highlight_max_area_percent':25}[key]) == value:
+            return
+        data[key] = value
+        save_project_json(self.paths.root, data)
+        self.proj_cfg = data
+        self._invalidate_pointer_videos()
+        safe_notify('ハイライト設定を保存しました．ビデオ再生成で反映されます．', type='positive')
 
     def _range_changed(self) -> None:
         if not self.write_access_allowed():
