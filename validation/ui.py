@@ -14,9 +14,8 @@ from nicegui import ui, run, background_tasks
 from statistics_store import run_with_statistics
 from slide_lecture import make_client, generate_single_explanation
 from .core import rule_check, individual_check, overall_check, synthesis_check, correct, regeneration_valid
-from .store import STAGES, digest, load, log, save
+from .store import STAGES, digest, load, log, save, load_guidance, save_guidance
 from . import refine_job
-from .runner import unresolved_fix_failures
 
 STAGE_DESCRIPTIONS = {
     'rules': '思考タグ・特殊トークン・空文などの形式異常を全スライドから検出',
@@ -29,6 +28,20 @@ STAGE_NAMES = {
     'individual': 'LLMによるスライド別検査',
     'overall': 'LLMによる全体検査',
 }
+
+
+def checked_overall_result(value, part):
+    """Validate the worker response before unpacking (including cancelled workers)."""
+    if value is None:
+        raise RuntimeError(
+            f'スライド #{part[0]}〜#{part[-1]}：全体検査の実行結果が返されませんでした'
+            '（非同期処理の中断または実行基盤の問題の可能性）')
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise TypeError(f'全体検査の戻り値が不正です（型：{type(value).__name__}）')
+    issues, summary = value
+    if not isinstance(issues, list) or not isinstance(summary, str):
+        raise TypeError('全体検査の戻り値の型が不正です（指摘一覧／要約）')
+    return issues, summary
 
 
 class ValidationView:
@@ -44,6 +57,8 @@ class ValidationView:
         self.results = None
         self.selection = {s: True for s in STAGES}
         self._project_key = None
+        self.user_guidance = ""
+        self._guidance_snapshot = ""
         self._running_project = None
         self._last_status = None
         self._drafts: dict[int, str] = {}
@@ -77,6 +92,15 @@ class ValidationView:
         self._edit_bar.set_visibility(False)
         self.results = ui.column().classes('w-full gap-2')
         self.refresh()
+
+    def _on_guidance_change(self, event):
+        if self._actions_locked():
+            return
+        project = self.owner.paths.root if self.owner.paths else None
+        if project is None:
+            return
+        self.user_guidance = str(event.value or '')
+        save_guidance(project, self.user_guidance)
 
     def _pipeline_running(self, project=None) -> bool:
         if project is None:
@@ -122,6 +146,7 @@ class ValidationView:
         key = str(project) if project else None
         if key != self._project_key:
             self._project_key = key
+            self.user_guidance = load_guidance(project) if project else ""
             self._drafts.clear()
             self._originals.clear()
             self._cancel_diff_tasks()
@@ -145,6 +170,13 @@ class ValidationView:
                 ui.label('リファイナー実行中').classes('text-blue-300 font-bold text-sm')
                 ui.button('リファイナーを中断', icon='stop', on_click=self.owner.request_cancel).props('outline color=negative')
             else:
+                ui.label('追加指示（任意）').classes('text-sm font-bold')
+                ui.label('ビデオを見て気付いた点や改善方針を入力してください．LLMは内容を確認し，妥当な指摘だけを採用します．').classes('text-xs text-slate-400')
+                ui.textarea(placeholder='例：スライド12の「アドレス空間」は「仮想アドレス空間」と表現する方が適切か確認してください．',
+                            value=self.user_guidance,
+                            on_change=self._on_guidance_change).props('outlined autogrow').classes('w-full')
+                ui.label('入力内容はプロジェクト別に自動保存されます．空欄なら従来どおりの検査です．').classes('text-xs text-slate-400')
+                ui.separator()
                 for stage in STAGES:
                     with ui.row().classes('w-full items-center gap-3'):
                         ui.checkbox(STAGE_NAMES[stage], value=self.selection[stage],
@@ -231,6 +263,7 @@ class ValidationView:
         if any(self._drafts.get(p) != t for p, t in self._originals.items()):
             ui.notify('未保存の編集があります．先に保存するか「元に戻す」を押してください．', type='warning')
             return
+        self._guidance_snapshot = self.user_guidance
         self.busy = True  # タスクの起動を待たずにボタンを無効化する
         self._running_project = self.owner.paths.root
         refine_job.register(self.owner.username, self._running_project, self)
@@ -317,7 +350,7 @@ class ValidationView:
                             issues = await run.io_bound(
                                 run_with_statistics, project/'statistics.jsonl', page,
                                 individual_check, client, owner.cfg['llm'], page, text,
-                                owner.paths.page_image(page), rule_check(text, page))
+                                owner.paths.page_image(page), rule_check(text, page), self._guidance_snapshot)
                             record(issues, stage)
                         except Exception as exc:
                             log(project, f'個別検査 #{page} ERROR {exc}')
@@ -334,8 +367,7 @@ class ValidationView:
                         try:
                             overall_result = await run.io_bound(
                                 run_with_statistics, project/'statistics.jsonl', None,
-                                overall_check, client, owner.cfg['llm'], texts)
-                            from .runner import checked_overall_result
+                                overall_check, client, owner.cfg['llm'], texts, self._guidance_snapshot)
                             issues, summary = checked_overall_result(overall_result, part)
                             record(issues, stage)
                             if summary:
@@ -488,7 +520,7 @@ class ValidationView:
         state = load(project)
         grouped = OrderedDict()
         for issue in state.get('findings', []):
-            if issue.get('stage') not in ('individual', 'overall') or issue.get('kind') in ('check_error', 'auto_fix_error'):
+            if issue.get('stage') not in ('individual', 'overall') or issue.get('kind') == 'check_error':
                 continue
             grouped.setdefault(int(issue['page']), []).append(issue)
         tasks = []
@@ -526,88 +558,18 @@ class ValidationView:
         grouped: OrderedDict[int, list[dict]] = OrderedDict()
         for issue in state.get('findings', []):
             grouped.setdefault(int(issue['page']), []).append(issue)
-        # 検査例外と自動校正失敗は種類が異なるため，履歴からも抽出する．
-        auto_state = state.get('auto_refiner') or {}
-        failed_rows = unresolved_fix_failures(state, self.owner.paths)
         check_errors = [f for f in state.get('findings', []) if f.get('kind') == 'check_error']
         manual_rule_pages = {int(f['page']) for f in state.get('findings', []) if f.get('stage') == 'rules'}
         error_pages = {int(f['page']) for f in check_errors} | manual_rule_pages
-        error_pages.update(int(r['page']) for r in failed_rows if r.get('page') is not None)
-        for row in failed_rows:
-            try:
-                number = int(row['page'])
-            except (KeyError, ValueError, TypeError):
-                continue
-            # Keep correction failures separate from quality findings, but make
-            # both visible together in the page header even when findings exist.
-            descriptions = [str(issue).strip() for issue in row.get('issues', []) if str(issue).strip()]
-            detail = '対象指摘：' + '／'.join(descriptions) if descriptions else ''
-            failure = dict(page=number, stage=row.get('stage', 'individual'),
-                           kind='auto_fix_error', description=str(row.get('status', '自動修正に失敗')),
-                           evidence=detail)
-            if not any(x.get('kind') == 'auto_fix_error' and x.get('description') == failure['description']
-                       for x in grouped.get(number, [])):
-                grouped.setdefault(number, []).append(failure)
-        # 失敗した自動校正は最終確認検査で指摘が消えても履歴から閲覧できる．
         with self.results:
-            if check_errors or failed_rows or manual_rule_pages:
+            if check_errors or manual_rule_pages:
                 with ui.card().classes('w-full border-2 border-red-500 bg-red-50 dark:bg-red-950'):
-                    ui.label(f'要確認：検査エラー {len(check_errors)}件 ／ 自動修正エラー {len(failed_rows)}件').classes('font-bold text-red-700 dark:text-red-200')
+                    ui.label(f'要確認：検査エラー {len(check_errors)}件').classes('font-bold text-red-700 dark:text-red-200')
                     if manual_rule_pages:
                         ui.label(f'ルール検査による要手動修正：{len(manual_rule_pages)}スライド（自動再生成しません）').classes('font-bold text-amber-600')
                     ui.label('赤く表示されたスライドの詳細を確認してください．検査エラーは原稿の誤りとは限らず，通信・LLM応答などが原因の場合があります．').classes('text-sm')
                     for f in check_errors:
                         ui.label(f'#{f.get("page", "?")}・{STAGE_NAMES.get(f.get("stage"), f.get("stage", "?"))}：{f.get("description", "検査失敗")}').classes('text-sm text-red-700 dark:text-red-200')
-                    for r in failed_rows:
-                        ui.label(f'#{r.get("page", "?")}・{STAGE_NAMES.get(r.get("stage"), r.get("stage", "?"))}／{r.get("action", "自動修正")}：{r.get("status")}').classes('text-sm text-red-700 dark:text-red-200')
-                        descriptions = [str(issue).strip() for issue in r.get('issues', []) if str(issue).strip()]
-                        if descriptions:
-                            ui.label('対象となった指摘：' + '／'.join(descriptions)).classes('text-sm text-amber-800 dark:text-amber-200 whitespace-pre-wrap')
-            auto = state.get('auto_refiner')
-            if auto:
-                entries = auto.get('history', [])
-                changed = [r for r in entries if str(r.get('status', '')).startswith('修正・保存')]
-                ui.separator()
-                ui.label('リファイナー結果').classes('text-h6')
-                ui.label(
-                    f'修正・保存 {len(changed)}件 ／ 未解決の指摘 {len(grouped)}スライド'
-                ).classes('text-sm')
-                ui.label('保存済みの修正履歴です．残った指摘は下の一覧から個別修正するか，一括校正してください．').classes('text-xs text-slate-400')
-                # 現在のプロジェクトに保存された修正履歴を表示する．
-                per_page = OrderedDict()
-                for row in entries:
-                    try:
-                        number = int(row['page'])
-                    except (ValueError, TypeError, KeyError):
-                        continue
-                    per_page.setdefault(number, []).append(row)
-                changed_pages = OrderedDict()
-                for number, rows in per_page.items():
-                    actual = [r for r in rows if r in changed and isinstance(r.get('before'), str) and isinstance(r.get('after'), str)]
-                    if actual:
-                        changed_pages[number] = (len(actual[0]['before']), len(actual[-1]['after']))
-                if changed_pages:
-                    labels = [str(page) for page in changed_pages]
-                    before_counts = [counts[0] for counts in changed_pages.values()]
-                    after_counts = [counts[1] for counts in changed_pages.values()]
-                    ui.label(f'修正されたスライド：{len(changed_pages)}枚 ／ '
-                             f'文字数 {sum(before_counts):,} → {sum(after_counts):,}字').classes('text-sm')
-                elif not entries:
-                    ui.label('修正履歴はありません．').classes('text-sm text-slate-400')
-                else:
-                    ui.label('原稿の修正・保存は行われませんでした．').classes('text-sm text-slate-400')
-                with ui.expansion('スライド別修正履歴', icon='history').classes('w-full border rounded'):
-                    for number, rows in per_page.items():
-                        unresolved = number in grouped
-                        failed = number in error_pages
-                        with ui.expansion(f'#{number}：{"エラーあり" if failed else "要手動確認" if unresolved else "解決"}', icon='error' if failed else 'warning' if unresolved else 'check_circle').classes('w-full border-2 border-red-500' if failed else 'w-full'):
-
-                            for row in rows:
-                                brief = '／'.join(str(t) for t in row.get('issues', []))[:250]
-                                ui.label(f'{STAGE_NAMES.get(row.get("stage"), row.get("stage", "?"))}：{brief} → {row.get("action", "?")}：{row.get("status", "?")}').classes('text-sm')
-                                if row.get('before') != row.get('after') and isinstance(row.get('before'), str) and isinstance(row.get('after'), str):
-                                    with ui.expansion('修正前後の差分', icon='difference').classes('w-full'):
-                                        ui.html(self._diff_markup(row['before'], row['after']))
             ui.label(f'検出された問題：残り {len(grouped)} スライド').classes('text-subtitle1 font-medium')
             if grouped and not self.busy and not self._pipeline_controls_hidden():
                 ui.button('残りを一括で自動校正・保存', icon='auto_fix_high',

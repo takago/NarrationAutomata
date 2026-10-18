@@ -35,3 +35,21 @@ def log(project:Path,message:str)->None:
     with (root/'validation.log').open('a',encoding='utf-8') as f:
         f.write(f'[{datetime.now().isoformat(timespec="seconds")}] {message}\n')
 
+
+
+def load_guidance(project: Path) -> str:
+    """Keep user instructions independent from disposable inspection findings."""
+    try:
+        value = json.loads((directory(project) / 'settings.json').read_text(encoding='utf-8'))
+        return str(value.get('user_guidance', '')) if isinstance(value, dict) else ''
+    except (OSError, ValueError, TypeError):
+        return ''
+
+
+def save_guidance(project: Path, guidance: str) -> None:
+    root = directory(project)
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / 'settings.json'
+    temporary = root / f'.settings.{uuid4().hex}.tmp'
+    temporary.write_text(json.dumps({'user_guidance': guidance}, ensure_ascii=False, indent=2), encoding='utf-8')
+    os.replace(temporary, target)
