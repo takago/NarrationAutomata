@@ -13,8 +13,8 @@ class TestTimeRefineDescription(unittest.TestCase):
         build = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'build')
         body = ast.get_source_segment(SOURCE, build)
         self.assertIn('元のプロジェクトを残し，新しいプロジェクトを作成して調整します．', body)
-        self.assertIn('動画を作り直します．', body)
-        self.assertIn('ナレーションのみを書き換えます．', body)
+        self.assertIn('後続工程の自動実行はチェックボックスで選べます．', body)
+        self.assertIn('動画がない場合は文字数の割合', body)
 
     def test_button_name_and_no_redundant_dynamic_message(self):
         self.assertIn("ui.button('新しいプロジェクトで調整を開始'", SOURCE)

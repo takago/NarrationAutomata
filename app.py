@@ -1688,7 +1688,7 @@ class SlideNarratorApp:
         self._safe_view_update(self.refresh_job_status, '通常生成の状態更新')
         for view, label in (
             (self.validation_view, 'リファイナーの操作欄更新'),
-            (self.time_refine_view, '再生時間の調整の操作欄更新'),
+            (self.time_refine_view, 'リデューサーの操作欄更新'),
         ):
             self._safe_view_update(view._sync_controls_on_state_change, label)
 
@@ -1722,8 +1722,8 @@ class SlideNarratorApp:
             time_token = (time_state.get('updated_at'), live_time is not None)
             if getattr(self, '_time_refine_token', None) != time_token:
                 self._time_refine_token = time_token
-                self._safe_view_update(self.time_refine_view.restore_progress, '再生時間の調整状態の復元')
-                self._safe_view_update(self.time_refine_view.refresh, '再生時間の調整画面の復元')
+                self._safe_view_update(self.time_refine_view.restore_progress, 'リデューサー状態の復元')
+                self._safe_view_update(self.time_refine_view.refresh, 'リデューサー画面の復元')
         refine_active = bool(getattr(self, '_refine_sidebar_live', False))
         # 実行状態はJobManager，履歴・進捗は保存済みJSONから取得する．
         # UIセッションのprocessingは変更せず，実行主体と閲覧側を分離する．
@@ -2361,13 +2361,13 @@ class SlideNarratorApp:
                     reduction = before - after
                     percent = (100 * reduction / before) if before else 0
                     self.statistics_time_refine_label.text = (
-                        f'再生時間の調整の原稿文字数：{before:,} → {after:,} 文字 '
+                        f'リデューサーの原稿文字数：{before:,} → {after:,} 文字 '
                         f'（短縮 {reduction:,} 文字，{percent:.1f}%）'
                         ' ／ 元のプロジェクトとの比較')
                 except (TypeError, ValueError, OSError):
-                    self.statistics_time_refine_label.text = '再生時間の調整の原稿文字数：集計できませんでした．'
+                    self.statistics_time_refine_label.text = 'リデューサーの原稿文字数：集計できませんでした．'
             else:
-                self.statistics_time_refine_label.text = '再生時間の調整の原稿文字数：比較記録なし'
+                self.statistics_time_refine_label.text = 'リデューサーの原稿文字数：比較記録なし'
         # 品質検査のLLM統計は既存工程別グラフから分離して表示する．
         validation_records = [r for r in records if str(r.get('task', '')).startswith('品質検査（')]
         prompts = sum(int((r.get('llm') or {}).get('prompt_tokens') or 0) for r in validation_records)
@@ -2622,7 +2622,7 @@ class SlideNarratorApp:
         if not project_id:
             return
         if self._time_refine_switch_blocked and not (time_refine_internal or refine_sidebar_internal):
-            safe_notify('再生時間の調整中は別プロジェクトに切り替えられません．', type='warning')
+            safe_notify('リデューサー中は別プロジェクトに切り替えられません．', type='warning')
             self.refresh_project_list()
             return
         if GLOBAL_EXECUTION_LOCK.is_locked() and GLOBAL_EXECUTION_LOCK.current_user != self.username:
@@ -2638,7 +2638,7 @@ class SlideNarratorApp:
                 GLOBAL_EXECUTION_LOCK.owner_app is not None and
                 GLOBAL_EXECUTION_LOCK.owner_app.pdf is not None and
                 project_id != GLOBAL_EXECUTION_LOCK.owner_app.pdf.parent.name):
-            # 自動復元に限り，同一ユーザが実行している再生時間の調整の
+            # 自動復元に限り，同一ユーザが実行しているリデューサーの
             # コピー先へ移動できる．一般のプロジェクト切替制限は維持する．
             target = self.projects_dir / str(project_id)
             live_time = refine_job.running(self.username, target)
@@ -2991,7 +2991,7 @@ class SlideNarratorApp:
                 self.refresh_project_name_input()
                 self._refine_sidebar_project_sync_id = project.name
                 LOGGER.info('[refine-sidebar] synchronized project selector: %s', project.name)
-        title = '再生時間の調整' if kind == 'time' else 'リファイナー'
+        title = 'リデューサー' if kind == 'time' else 'リファイナー'
         self.refine_sidebar_title.text = (
             f'{title}（実行中）' if live else f'{title}（状態未確認）')
         phase = str(state.get('title') or state.get('stage') or '').strip()
@@ -5045,9 +5045,10 @@ class SlideNarratorApp:
                     display_name = self.project_display_name(self.pdf)
                     download_name = re.sub(r'[\\/\x00-\x1f\x7f]', '_', display_name).strip().rstrip('.') + '.mp4'
                     video_download_url = download_url(final) + '?filename=' + quote(download_name)
-                    ui.button('MP4ダウンロード', icon='download',
-                              on_click=lambda url=video_download_url, name=download_name: ui.download(url, filename=name)) \
-                        .props('dense outline').classes('w-full')
+                    # Direct browser navigation to the attachment endpoint works
+                    # before the video player has ever been opened.
+                    ui.link('↓ MP4ダウンロード', video_download_url, new_tab=False) \
+                        .classes('w-full text-center border rounded px-3 py-2 text-sm text-primary')
                 else:
                     ui.label('ビデオ未生成').classes('text-xs text-zinc-500')
             # プロジェクトを切り替えた場合には前の描画を確定しない．
@@ -6441,7 +6442,7 @@ class SlideNarratorApp:
                     self._tab_edit = tab_edit
                     tab_validation = ui.tab('✨ リファイナー').props('id=na-refine-main-tab')
                     self._tab_validation = tab_validation
-                    tab_time_refine = ui.tab('⏱ 再生時間の調整').props('id=na-video-length-tab')
+                    tab_time_refine = ui.tab('⏱ リデューサー').props('id=na-video-length-tab')
                     self._tab_time_refine = tab_time_refine
                 tab_statistics = ui.tab('📊 統計')
                 tab_logs = ui.tab('📜 ログ')
@@ -6579,7 +6580,7 @@ class SlideNarratorApp:
                         ('2．Advanced Modeでポインタを設定', '必要に応じてポインタの種類・動き・画像などを設定します．'),
                         ('3．① ナレーション原稿の生成', '①を実行して，スライドごとの原稿を作成します．'),
                         ('4．リファイナーで原稿を確認', '検査結果を確認し，指摘された問題を必要に応じて手動で修正します．'),
-                        ('5．再生時間の調整（50%）', '動画がない状態では目標文字量を50%にして短縮します．元のプロジェクトを残して新しいプロジェクトを作成し，原稿のみを書き換えます．'),
+                        ('5．リデューサー（50%）', '動画がない状態では目標文字量を50%にして短縮します．元のプロジェクトを残して新しいプロジェクトを作成し，チェックボックスがOFFなら原稿のみを書き換えます．'),
                         ('6．④ ナレーションビデオの作成', '短縮後の新しいプロジェクトで④を実行します．不足している②・③も必要に応じて実行され，動画が完成します．'),
                     )
                     for heading, description in guide_steps:
@@ -6588,7 +6589,7 @@ class SlideNarratorApp:
                             ui.label(description).classes('text-sm text-slate-300 whitespace-normal')
                     ui.separator()
                     ui.label('完成したビデオが長すぎる場合').classes('font-bold text-blue-300')
-                    ui.label('もう一度「再生時間の調整」を実行し，今度は目標再生時間を指定してください．別の新しいプロジェクトを作成して，動画まで自動的に再生成します．').classes('text-sm text-slate-300 whitespace-normal')
+                    ui.label('もう一度「リデューサー」を実行し，今度は目標再生時間を指定してください．別の新しいプロジェクトを作成して，必要であればチェックボックスをONにして動画まで再生成します．').classes('text-sm text-slate-300 whitespace-normal')
                 with ui.row().classes('w-full justify-end'):
                     ui.button('閉じる', on_click=help_dialog.close).props('flat color=primary')
 

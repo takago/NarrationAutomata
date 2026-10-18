@@ -15,7 +15,8 @@ class PointerClarificationSettingsTests(unittest.TestCase):
     def test_ui_has_project_settings_and_advanced_only(self):
         source = (ROOT / 'app.py').read_text(encoding='utf-8')
         self.assertIn("'曖昧なポインタ位置をVLMで追加調査する'", source)
-        self.assertIn('self.advanced_sidebar_sections.append(vlm_card)', source)
+        self.assertIn('self.advanced_sidebar_sections.append(pointer_expansion)', source)
+        self.assertIn("with ui.expansion('ポインタ'", source)
         self.assertIn("_save_pointer_clarification_option('pointer_vlm_clarification'", source)
         self.assertNotIn('pointer_clarification_reasoning_effort', source)
 

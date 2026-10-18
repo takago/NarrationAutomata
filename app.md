@@ -15,7 +15,7 @@ app.py  ────── project.json / users.yaml / webui_uploads/
     ├─ job_state_view.py    実行状態と表示状態の分離
     ├─ sidebar_display.py   進捗カードと動画更新の判定
     ├─ validation/ui.py     内容リファイナー
-    ├─ validation/time_ui.py 再生時間の調整
+    ├─ validation/time_ui.py リデューサー
     ├─ validation/refine_job.py リファイナー状態・登録
     └─ slide_lecture.py    PDF解析・①〜④（CLIと個別処理）
              └─ tts_filter.py / tts_filter.yaml
@@ -35,7 +35,7 @@ app.py  ────── project.json / users.yaml / webui_uploads/
 | ナレーション一覧 | スライド単位の原稿を一覧表示・編集 |
 | ナレーション編集 | 原稿，追加プロンプト，日英字幕，解析要素とポインタ位置の編集 |
 | リファイナー | ルール・LLM検査，差分表示，再生成，自動校正，検査結果 |
-| 再生時間の調整 | 目標時間に合わせた原稿短縮，生成結果，時間の比較 |
+| リデューサー | 目標時間に合わせた原稿短縮，生成結果，時間の比較 |
 | 統計 | スライド・工程別の文字数／トークン数，Excel出力 |
 | ログ | 生成・検査ログ |
 | 設定・ユーザー管理 | 管理者限定のモデル設定・辞書・ユーザー管理 |
@@ -71,7 +71,7 @@ Easyモードは自動処理を中心とし，Advancedモードでは工程別�
 
 内容リファイナーは `validation/ui.py`，自動品質改善は `validation/runner.py`，検査や校正は `validation/core.py` が担当します．自動リファイナーは1回の実行であり，必要なら利用者が再実行します．結果・差分は「リファイナー」タブで確認します．
 
-再生時間の調整は `validation/time_ui.py` が担当します．原稿を短縮した新しいプロジェクトを作成し，②〜④の生成処理へ引き継ぎます．調整結果は単回の `result` 形式で保存します．短縮とその後の動画生成の境界は障害解析時に特に注意してください．
+リデューサーは `validation/time_ui.py` が担当します．原稿を短縮した新しいプロジェクトを作成し，②〜④の生成処理へ引き継ぎます．調整結果は単回の `result` 形式で保存します．短縮とその後の動画生成の境界は障害解析時に特に注意してください．
 
 ## ポインタと辞書
 
