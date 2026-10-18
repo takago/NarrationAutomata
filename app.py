@@ -891,14 +891,23 @@ class SlideNarratorApp:
         task_name = active.task_name if active else None
         # リファイナーの終了に，過去の通常パイプライン状態を流用しない．
         uses_pipeline_status = (task_name or '').startswith(('パイプライン (', 'スライド '))
-        persisted_state = (read_user_job_status(self.username).get('state')
-                           if uses_pipeline_status else None)
-        state = resolve_terminal_state(
-            task_name=task_name,
-            cancel_requested=self.cancellation_requested,
-            manager_cancel_requested=bool(active and active.cancellation_requested),
-            persisted_state=persisted_state,
-        )
+        # 状態ファイルが破損・読取不能でも排他ロックを取り残さない．
+        persisted_state = None
+        if uses_pipeline_status:
+            try:
+                persisted_state = read_user_job_status(self.username).get('state')
+            except Exception:
+                LOGGER.exception('ジョブ終了状態の読取に失敗しました（ロック解放は継続）')
+        try:
+            state = resolve_terminal_state(
+                task_name=task_name,
+                cancel_requested=self.cancellation_requested,
+                manager_cancel_requested=bool(active and active.cancellation_requested),
+                persisted_state=persisted_state,
+            )
+        except Exception:
+            LOGGER.exception('ジョブ終了状態の判定に失敗しました（ロック解放は継続）')
+            state = JobState.CANCELLED if self.cancellation_requested else JobState.FAILED
         if not GLOBAL_EXECUTION_LOCK.release(state=state):
             return
         self.current_process = None
@@ -2718,6 +2727,10 @@ class SlideNarratorApp:
             self.refresh_project_list()
             self.refresh_project_name_input()
             await self.refresh_all()
+            # refresh_all updates slide/output views, but not the refinement tabs.
+            # Refresh them now so an already-open reducer/refiner shows this project.
+            self._safe_view_update(self.validation_view.refresh, 'プロジェクト切替後のリファイナー更新')
+            self._safe_view_update(self.time_refine_view.refresh, 'プロジェクト切替後のリデューサー更新')
             ui.notify(f'プロジェクト「{self.project_display_name(target_pdf)}」を開きました．', type='positive')
         except Exception as exc:
             if time_refine_internal:

@@ -49,7 +49,7 @@ class TestTimeControlsVisibility(unittest.TestCase):
         conditions = [n for n in ast.walk(refresh) if isinstance(n, ast.If) and isinstance(n.test, ast.Attribute)
                       and n.test.attr == '_shown_other_job']
         self.assertEqual(len(conditions), 1)
-        self.assertIn('self.target_input = ui.number', ast.get_source_segment(SOURCE.read_text(encoding='utf-8'), refresh))
+        self.assertIn('self.target_input = ui.slider', ast.get_source_segment(SOURCE.read_text(encoding='utf-8'), refresh))
 
 
 if __name__ == '__main__':

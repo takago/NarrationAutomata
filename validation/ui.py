@@ -5,6 +5,7 @@ import asyncio
 import traceback
 import difflib
 import html
+import logging
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,8 @@ from slide_lecture import make_client, generate_single_explanation
 from .core import rule_check, individual_check, overall_check, synthesis_check, correct, regeneration_valid
 from .store import STAGES, digest, load, log, save, load_guidance, save_guidance
 from . import refine_job
+
+LOGGER = logging.getLogger(__name__)
 
 STAGE_DESCRIPTIONS = {
     'rules': '思考タグ・特殊トークン・空文などの形式異常を全スライドから検出',
@@ -414,11 +417,22 @@ class ValidationView:
         """
         owner = self.owner
         self.busy = False
-        refine_job.finish_content(project, cancelled=owner.cancellation_requested)
-        refine_job.unregister(owner.username, project, self)
+        # 永続化・登録解除の失敗は後続の解放処理を妨げない．
+        try:
+            refine_job.finish_content(project, cancelled=owner.cancellation_requested)
+        except Exception:
+            LOGGER.exception('リファイナーの終了状態保存に失敗しました')
+        try:
+            refine_job.unregister(owner.username, project, self)
+        except Exception:
+            LOGGER.exception('リファイナーの登録解除に失敗しました')
         self._running_project = None
-        owner._finalize_cancel_request()
-        owner._complete_background_job()
+        try:
+            owner._finalize_cancel_request()
+        except Exception:
+            LOGGER.exception('リファイナーの中断状態確定に失敗しました')
+        finally:
+            owner._complete_background_job()
 
     async def _bulk_correct_worker(self, project, tasks):
         """Correct unresolved, unchanged drafts; persist each successful page once."""
@@ -722,12 +736,19 @@ class ValidationView:
             ui.notify(f'生成・校正に失敗しました：{exc}',type='negative')
         finally:
             self.busy=False
-            self._edit_bar.value = 0
-            self._edit_bar.set_visibility(False)
-            self._edit_status.text = ''
-            owner._finalize_cancel_request()
-            owner._complete_background_job()
-            self.render_results()
+            try:
+                self._edit_bar.value = 0
+                self._edit_bar.set_visibility(False)
+                self._edit_status.text = ''
+            except Exception:
+                LOGGER.exception('ナレーション編集の終了UI更新に失敗しました')
+            try:
+                owner._finalize_cancel_request()
+            except Exception:
+                LOGGER.exception('ナレーション編集の中断状態確定に失敗しました')
+            finally:
+                owner._complete_background_job()
+            self._safe_render_results()
 
     def _save_page(self,page,area):
         owner=self.owner

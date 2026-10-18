@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import re
 import secrets
 import shutil
@@ -16,6 +18,8 @@ from . import refine_job
 from slide_lecture import make_client, stream_chat, reasoning_extra_kwargs, load_project_json, save_project_json, image_data_url
 from .core import regeneration_valid
 from statistics_store import run_with_statistics
+
+LOGGER = logging.getLogger(__name__)
 
 
 def duration(path: Path) -> float | None:
@@ -340,6 +344,7 @@ class TimeRefineView:
         ).classes('text-caption text-slate-400')
         self.controls = ui.column().classes('w-full gap-3')
         self.target_input = None
+        self.target_value_label = None
         self.start_button = None
         with ui.column().classes('w-full gap-1') as self.progress_panel:
             with ui.row().classes('items-center gap-2'):
@@ -427,6 +432,7 @@ class TimeRefineView:
         self._shown_other_job = self._other_job_running()
         self.controls.clear()
         self.target_input = None
+        self.target_value_label = None
         self.start_button = None
         # Do not require the source video while a live refinement is running.
         mode, baseline, reason = (None, None, '') if self.busy else self._source()
@@ -457,15 +463,28 @@ class TimeRefineView:
                     ui.label(f'現在のビデオ時間：約{baseline / 60:.1f}分').classes('font-bold')
                 else:
                     ui.label(f'現在の原稿文字数：{baseline:,}字').classes('font-bold')
-                with ui.row().classes('items-center gap-3 flex-wrap'):
-                    if mode == 'percent':
-                        self.target_input = ui.number('目標文字量（%）', value=self.target_percent, min=30, max=95, precision=1,
-                                                      on_change=self._set_target).props('outlined dense').classes('w-44')
+                if mode == 'percent':
+                    ui.label('目標文字量（%）').classes('text-sm')
+                    with ui.row().classes('items-center gap-3 w-full'):
+                        self.target_input = ui.slider(min=30, max=90, step=10, value=self.target_percent,
+                                                      on_change=self._set_target).classes('flex-grow')
+                        self.target_value_label = ui.label(f'{self.target_percent:g}%').classes('w-16 text-right font-bold')
+                elif mode == 'time' and baseline is not None:
+                    # Whole-minute increments; the maximum must be strictly below the source duration.
+                    max_minutes = min(1440, math.ceil(baseline / 60) - 1)
+                    if max_minutes >= 1:
+                        if (self.target_minutes is None or not (1 <= self.target_minutes <= max_minutes)
+                                or self.target_minutes != int(self.target_minutes)):
+                            self.target_minutes = min(max_minutes, max(1, round(baseline / 120)))
+                        ui.label('目標時間（分）').classes('text-sm')
+                        with ui.row().classes('items-center gap-3 w-full'):
+                            self.target_input = ui.slider(min=1, max=max_minutes, step=1,
+                                                          value=self.target_minutes, on_change=self._set_target).classes('flex-grow')
+                            self.target_value_label = ui.label(f'{self.target_minutes:g}分').classes('w-16 text-right font-bold')
                     else:
-                        self.target_input = ui.number('目標時間（分）', value=self.target_minutes, min=1, max=1440, precision=1,
-                                                      on_change=self._set_target).props('outlined dense').classes('w-44')
-                    if self.owner.read_only:
-                        self.target_input.disable()
+                        ui.label('元のビデオが短すぎるため，目標時間を設定できません．').classes('text-orange-300 text-sm')
+                if self.target_input is not None and self.owner.read_only:
+                    self.target_input.disable()
                 ui.label('短縮方針').classes('font-bold mt-2')
                 ui.label('ONの項目をLLMの短縮指示に追加します．OFFでも通常の短縮は行います．').classes('text-xs text-slate-400')
                 for key, label, _ in REFINE_POLICIES:
@@ -491,7 +510,7 @@ class TimeRefineView:
                 if mode == 'time':
                     ui.label('目標時間は必須です．現在のビデオより短い時間を指定してください．').classes('text-xs text-slate-400')
                 elif mode == 'percent':
-                    ui.label('現在の原稿文字数を100%として30〜95%を指定します．').classes('text-xs text-slate-400')
+                    ui.label('現在の原稿文字数を100%として30〜90%を10%刻みで指定します．').classes('text-xs text-slate-400')
                 ui.label('目標は目安です．重要な説明を保持できない場合，目標未達でも停止します．').classes('text-xs text-slate-400')
 
     def restore_progress(self):
@@ -545,7 +564,13 @@ class TimeRefineView:
                 pass
 
     def _persist(self, **updates):
-        for project in {self._source_project, self._target_project} - {None}:
+        """Write detailed progress only to the destination once it exists.
+
+        Before the copy has a destination, the source holds a brief start record.
+        Source and destination must not share per-slide logs or progress.
+        """
+        project = self._target_project or self._source_project
+        if project is not None:
             refine_job.write(project, 'time', **updates)
 
     @staticmethod
@@ -691,6 +716,8 @@ class TimeRefineView:
             self.target_percent = value
         else:
             self.target_minutes = value
+        if self.target_value_label is not None and value is not None:
+            self.target_value_label.set_text(f'{value:g}%' if mode == 'percent' else f'{value:g}分')
         if self.start_button is not None:
             if self._can_start(mode, baseline, reason):
                 self.start_button.enable()
@@ -741,7 +768,7 @@ class TimeRefineView:
         refine_job.register(self.owner.username, self._source_project, self)
         self._persist(state='running', mode=mode, target_percent=target if mode == 'percent' else None,
                       title='準備中', detail='新規プロジェクトを作成しています…', log=[], message='',
-                      fraction=0, indeterminate=True, stop_requested=False)
+                      fraction=0, indeterminate=True, page=None, target_project_id=None, stop_requested=False)
         self.owner.set_time_refine_project_lock(True)
         self.stop_requested = False
         self.step_log_lines.clear()
@@ -842,9 +869,25 @@ class TimeRefineView:
                                       'result': None, 'state': 'running', 'policies': policies,
                                       'auto_create_video': auto_create_video}
             save_project_json(new_paths.root, new_cfg)
+            # copytree also copies the source's brief time_job.json; remove it
+            # so the destination starts with its own detailed job history.
+            (new_paths.root / 'validation' / 'time_job.json').unlink(missing_ok=True)
             self._target_project = new_paths.root
             refine_job.register(owner.username, self._target_project, self)
-            self._persist(state='running', target_project_id=project_id)
+            # Keep only a destination reference in the source.  All subsequent
+            # messages, slide progress, failures and final status go to target.
+            refine_job.write(self._source_project, 'time',
+                             state='transferred', target_project_id=project_id,
+                             title='コピー先プロジェクトを作成しました',
+                             detail=f'処理状況はコピー先（{project_id}）で確認してください．',
+                             fraction=1, indeterminate=False, page=None,
+                             message='', log=[], stop_requested=False)
+            self._persist(state='running', mode=mode, target_project_id=project_id,
+                          target_percent=target if mode == 'percent' else None,
+                          target_seconds=target if mode == 'time' else None,
+                          title='ナレーション短縮', detail='準備中',
+                          fraction=0, indeterminate=True, page=None,
+                          message='', log=[], stop_requested=False)
             await owner.select_existing_project(project_id, time_refine_internal=True)
             if owner.pdf != new_pdf.resolve():
                 raise RuntimeError('新規プロジェクトに切り替えられませんでした')
@@ -988,19 +1031,28 @@ class TimeRefineView:
             self._progress('リデューサー失敗', f'{type(exc).__name__}: {exc}', fraction=0)
             self._safe_ui(lambda: ui.notify(str(exc), type='negative'))
         finally:
-            self.update_result()
-            if self._source_project is not None:
-                refine_job.unregister(owner.username, self._source_project, self)
-            if self._target_project is not None:
-                refine_job.unregister(owner.username, self._target_project, self)
-            owner.set_time_refine_project_lock(False)
-            self._safe_ui(owner.refresh_project_list)
-            self.busy = False
-            self.stop_requested = False
-            self._safe_ui(self.refresh)
-            # ロックの所有タスク内で解放する．後続の②〜④は独立ジョブとして取得する．
-            if lock_acquired:
-                self.lock.release()
+            # UI更新やジョブ状態保存で例外が起きても，解放を優先する．
+            try:
+                for description, cleanup in (
+                    ('結果画面の更新', self.update_result),
+                    ('コピー元ジョブ登録の解除', lambda: refine_job.unregister(owner.username, self._source_project, self)
+                     if self._source_project is not None else None),
+                    ('コピー先ジョブ登録の解除', lambda: refine_job.unregister(owner.username, self._target_project, self)
+                     if self._target_project is not None else None),
+                    ('プロジェクト切替制限の解除', lambda: owner.set_time_refine_project_lock(False)),
+                ):
+                    try:
+                        cleanup()
+                    except Exception:
+                        LOGGER.exception('リデューサー後処理に失敗しました：%s', description)
+                self._safe_ui(owner.refresh_project_list)
+                self.busy = False
+                self.stop_requested = False
+                self._safe_ui(self.refresh)
+            finally:
+                # 所有タスクで必ず解放を試みる．次の生成工程は別ジョブとして取得する．
+                if lock_acquired:
+                    self.lock.release()
             if handoff_to_pipeline:
                 # リデューサーの登録解除後，起動拒否を確実に検知する．
                 try:
