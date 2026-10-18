@@ -2641,7 +2641,11 @@ class SlideNarratorApp:
                 project_id != GLOBAL_EXECUTION_LOCK.owner_app.pdf.parent.name):
             # 自動復元に限り，同一ユーザが実行しているリデューサーの
             # コピー先へ移動できる．一般のプロジェクト切替制限は維持する．
-            target = self.projects_dir / str(project_id)
+            # Refinement status is stored under <project>/<pdf_stem>_lecture,
+            # not directly under the project-ID directory.
+            target_dir = self.projects_dir / str(project_id)
+            target_pdfs = list(target_dir.glob('*.pdf'))
+            target = ProjectPaths(target_pdfs[0]).root if len(target_pdfs) == 1 else target_dir
             live_time = refine_job.running(self.username, target)
             state = refine_job.read(target, 'time') if live_time is not None else {}
             restoring_time_target = (self._restore_started and live_time is not None and
@@ -2653,7 +2657,15 @@ class SlideNarratorApp:
                             refine_job.running(self.username, target) is not None and
                             any(refine_job.read(target, k).get('state') == 'running'
                                 for k in ('content', 'time')))
-            if not (restoring_time_target or sidebar_live):
+            # The reducer holds the execution lock while cloning a project.
+            # Permit only its own registered destination during the internal
+            # handoff; ordinary project selection remains blocked.
+            reducer_handoff = (time_refine_internal and
+                               GLOBAL_EXECUTION_LOCK.owner_app is self and
+                               live_time is not None and
+                               state.get('state') == 'running' and
+                               state.get('target_project_id') == project_id)
+            if not (restoring_time_target or sidebar_live or reducer_handoff):
                 safe_notify('生成中は別プロジェクトに切り替えられません．', type='warning')
                 self.refresh_project_list()
                 return
@@ -2708,6 +2720,9 @@ class SlideNarratorApp:
             await self.refresh_all()
             ui.notify(f'プロジェクト「{self.project_display_name(target_pdf)}」を開きました．', type='positive')
         except Exception as exc:
+            if time_refine_internal:
+                # Do not mask the underlying reason with a generic handoff error.
+                raise
             ui.notify(f'プロジェクトを開けませんでした: {exc}', type='negative')
             self.refresh_project_list()
 
