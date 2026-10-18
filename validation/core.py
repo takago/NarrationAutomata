@@ -61,31 +61,39 @@ def _ask(client, cfg: dict, *, task: str, messages: list[dict]) -> str:
 
 
 def individual_check(client, cfg: dict, page: int, text: str, image: Path | None,
-                     hints: list[dict]) -> list[dict]:
+                     hints: list[dict], user_guidance: str = "") -> list[dict]:
     content = [{'type':'text', 'text':
         f'スライド番号：{page}\nナレーション：\n{text[:18000]}\n'
         f'ルール検査の指摘（誤検出の可能性あり）：{json.dumps(hints,ensure_ascii=False)[:2400]}'}]
+    if user_guidance.strip():
+        content.append({'type':'text', 'text': '【最優先：ユーザからの改善指示】\n' + user_guidance[:12000]})
     if image is not None and image.is_file():
         content.append({'type':'image_url','image_url':{'url':image_data_url(image)}})
     response = _ask(client,cfg,task='品質検査（個別LLM）',messages=[
         {'role':'system','content':
-         'あなたは講義ナレーションの校閲者です．文章破綻，明らかな事実誤認，スライドとの不整合だけを指摘してください．'
+         'あなたは講義ナレーションの校閲者です．通常検査では文章破綻，明らかな事実誤認，スライドとの不整合を指摘してください．'
          'プログラムコードやLLM特殊タグそのものの説明は正常な可能性があります．根拠の弱い推測は指摘しないでください．'
+         '【最優先事項】ユーザによる改善指示がある場合，通常検査の「明らかな誤りのみ」という制限より優先してください．'
+         'このスライドを対象とする指示は必ず検討し，疑問形（「不適切では？」等）でも，表現の正確さ，用語選択，教育的な分かりやすさを改善できる場合はissuesに具体的な修正提案を出してください．'
+         '指示が不適切な場合や，根拠がない場合は修正を強制せず，issuesに含めないでください．'
+         '他のスライドに関する指示はこのスライドの問題として報告しないでください．'
          '回答はJSONオブジェクトのみ：{"issues":[{"kind":"accuracy","description":"具体的な問題","evidence":"根拠となる短い引用"}]}．'
          '問題がなければ{"issues":[]}．'},
         {'role':'user','content':content}])
     return _normalize(_parse_json(response)['issues'],[page],page)
 
 
-def overall_check(client,cfg:dict, pages:list[tuple[int,str]]) -> tuple[list[dict],str]:
+def overall_check(client,cfg:dict, pages:list[tuple[int,str]], user_guidance: str = "") -> tuple[list[dict],str]:
     payload = '\n\n'.join(f'[SLIDE {n}]\n{txt[:8500]}' for n,txt in pages)
     response = _ask(client,cfg,task='品質検査（全体LLM）',messages=[
         {'role':'system','content':
          '講義ナレーションのスライド間整合性を検査してください．矛盾，無意味な重複，説明の流れ，'
          '用語の不一致を，明確な根拠がある場合に限って指摘してください．'
+         '【最優先事項】ユーザの改善指示は通常の検査基準より優先してください．指示の対象となるスライドについては，明白な誤りでなくても，表現の正確さ，用語選択，教育的な分かりやすさの改善を検討し，妥当なら具体的な修正提案をissuesに出してください．'
+         'ただし，スライドとナレーションに照らして指示が不適切な場合は無理に採用しないでください．'
          '回答はJSONのみ：{"issues":[{"page":12,"kind":"continuity","description":"問題","evidence":"根拠"}]}．'
          'pageには修正候補のスライド番号を指定．問題がなければ{"issues":[]}．'},
-        {'role':'user','content':payload}])
+        {'role':'user','content':payload + ('\n\n【最優先：ユーザからの改善指示】\n' + user_guidance[:12000] if user_guidance.strip() else '')}])
     parsed=_parse_json(response)
     return (_normalize(parsed['issues'],[n for n,_ in pages],pages[0][0]),
             str(parsed.get('summary',''))[:1200])
