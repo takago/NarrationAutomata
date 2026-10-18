@@ -802,7 +802,13 @@ class TimeRefineView:
         source_paths = owner.paths
         new_dir = None
         handoff_to_pipeline = False
+        lock_acquired = False
         try:
+            # コピー開始前から短縮完了まで排他制御する．
+            lock_acquired = await self.lock.acquire(owner.username, 'リデューサー', owner)
+            if not lock_acquired:
+                raise RuntimeError('別のジョブが実行中です')
+            self._check_stop()
             self._message('独立したプロジェクトを作成しています…')
             while True:
                 project_id = datetime.now().strftime('%Y%m%d') + '.' + ''.join(
@@ -855,11 +861,6 @@ class TimeRefineView:
                 ratio = target / 100 if mode == 'percent' else max(0.35, min(.92, target / current * .96))
                 self._message(f'短縮を開始します：対象 {len(pages)} 枚，文字数目標 {ratio * 100:.0f}%')
                 self._progress('ナレーション短縮', f'0 / {len(pages)} 枚完了', fraction=0)
-                # Exclusive access only for the revision phase. The existing video
-                # pipeline acquires the same lock on its own below.
-                acquired = await self.lock.acquire(owner.username, 'リデューサー（原稿短縮）', owner)
-                if not acquired:
-                    raise RuntimeError('別のジョブが実行中です')
                 modified = []
                 failures = []
                 skipped = []
@@ -934,7 +935,6 @@ class TimeRefineView:
                     save_project_json(owner.paths.root, new_cfg)
                     self.update_result()
                 finally:
-                    self.lock.release()
                     owner.set_processing(False)
                 if not modified:
                     self._message('採用できた短縮原稿はありませんが，古い生成物は初期化済みのため全工程を再生成します．')
@@ -998,7 +998,25 @@ class TimeRefineView:
             self.busy = False
             self.stop_requested = False
             self._safe_ui(self.refresh)
+            # ロックの所有タスク内で解放する．後続の②〜④は独立ジョブとして取得する．
+            if lock_acquired:
+                self.lock.release()
             if handoff_to_pipeline:
-                # 再生時間調整の登録・表示状態を閉じてから別ジョブを起動する．
-                # 通常の②〜④が自身のロックとキャンセル管理を取得する．
-                owner.start_time_refine_pipeline()
+                # リデューサーの登録解除後，起動拒否を確実に検知する．
+                try:
+                    started = owner.start_time_refine_pipeline()
+                    if not started:
+                        raise RuntimeError('プロジェクト切替中または別タスク実行中のため，動画生成を開始できませんでした')
+                except Exception as exc:
+                    # 起動失敗を pipeline_pending のまま放置しない．原稿は保持する．
+                    try:
+                        cfg = load_project_json(owner.paths.root)
+                        if isinstance(cfg.get('time_refine'), dict):
+                            cfg['time_refine']['state'] = 'failed'
+                            cfg['time_refine']['error'] = f'{type(exc).__name__}: {exc}'
+                            save_project_json(owner.paths.root, cfg)
+                    except Exception:
+                        LOGGER.exception('引き継ぎ失敗状態の保存に失敗しました')
+                    self._persist(state='failed', title='動画生成の起動失敗', detail=str(exc), indeterminate=False)
+                    self._message(f'動画生成の起動に失敗しました：{exc}')
+                    self._safe_ui(lambda: ui.notify(f'動画生成を開始できませんでした：{exc}', type='negative'))

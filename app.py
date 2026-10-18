@@ -907,15 +907,16 @@ class SlideNarratorApp:
         self.cancellation_requested = False
         self._safe_view_update(lambda: self.set_processing(False), '処理終了時のボタン更新')
 
-    def _start_background_job(self, worker_factory, *, busy_message: str) -> None:
+    def _start_background_job(self, worker_factory, *, busy_message: str) -> bool:
         """重複起動の確認とジョブ登録を一箇所で管理する．"""
         if self._project_switching:
             safe_notify('プロジェクト切替の完了後に実行してください．', type='warning')
-            return
+            return False
         if self.current_task and not self.current_task.done():
             safe_notify(busy_message, type='warning')
-            return
+            return False
         self.current_task = background_tasks.create(worker_factory(), name='slide-narrator-job')
+        return True
 
     def _finalize_cancel_request(self, **extra_status: Any) -> None:
         """中断要求が残ったまま終了した場合にだけ状態を確定する．"""
@@ -4068,9 +4069,9 @@ class SlideNarratorApp:
             self._finalize_cancel_request(completed_stages=list(completed_stages))
             self._complete_background_job()
 
-    def start_time_refine_pipeline(self) -> None:
+    def start_time_refine_pipeline(self) -> bool:
         """時間調整終了後，独立した通常パイプラインのジョブを開始する．"""
-        self._start_background_job(
+        return self._start_background_job(
             lambda: self._run_time_refine_pipeline(),
             busy_message='時間調整後のビデオ生成はすでに実行中です．',
         )

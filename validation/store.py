@@ -8,7 +8,6 @@ from pathlib import Path
 from uuid import uuid4
 
 STAGES=('rules','individual','overall')
-MODES=('report','confirm','auto')
 
 def digest(text:str)->str:
     return hashlib.sha256(text.encode('utf-8')).hexdigest()

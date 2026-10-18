@@ -15,9 +15,9 @@ class PercentageRefineTests(unittest.TestCase):
         self.assertEqual(naming('Lecture', target_percent=80), 'Lecture_RF80p')
         self.assertEqual(naming('Lecture_RF20m', target_percent=60), 'Lecture_RF60p')
         self.assertEqual(naming('Lecture_RF80p', target_minutes=20), 'Lecture_RF20m')
-    def test_percentage_skips_pipeline_handoff(self):
+    def test_both_modes_follow_checkbox_for_pipeline_handoff(self):
         text = (ROOT / 'validation/time_ui.py').read_text(encoding='utf-8')
-        self.assertIn("if mode == 'percent':\n                    new_cfg['time_refine']['state'] = 'completed'", text)
+        self.assertIn("if not auto_create_video:\n                    new_cfg['time_refine']['state'] = 'completed'", text)
         self.assertIn("                    handoff_to_pipeline = True", text)
         self.assertIn("if handoff_to_pipeline:", text)
     def test_result_graphs_unchanged(self):

@@ -102,13 +102,6 @@ class ValidationView:
         self.user_guidance = str(event.value or '')
         save_guidance(project, self.user_guidance)
 
-    def _pipeline_running(self, project=None) -> bool:
-        if project is None:
-            project = self.owner.paths.root if self.owner.paths else None
-        return (project is not None and isinstance(
-            refine_job.running(self.owner.username, project),
-            refine_job.PipelineContentRefine))
-
     def _actions_locked(self) -> bool:
         project = self.owner.paths.root if self.owner.paths else None
         return (self.busy or self.owner.processing or self.execution_lock.is_locked()
@@ -126,10 +119,7 @@ class ValidationView:
         # Treat it like the pipeline: hide validation/editing buttons even
         # during phases when it temporarily releases the execution lock.
         time_refine_running = worker is not None and hasattr(worker, '_target_project')
-        return time_refine_running or (
-            bool(self.owner.processing or self._pipeline_running()) and
-            (self._pipeline_running() or not self.busy)
-        )
+        return time_refine_running or (bool(self.owner.processing) and not self.busy)
 
     def _sync_controls_on_state_change(self):
         """Synchronize manual controls with the pipeline and live jobs."""
@@ -194,7 +184,7 @@ class ValidationView:
             return
         snapshot = refine_job.read(project, "content")
         live = refine_job.running(self.owner.username, project)
-        self.busy = isinstance(live, (ValidationView, refine_job.PipelineContentRefine)) or (self._running_project == project and self.busy)
+        self.busy = isinstance(live, ValidationView) or (self._running_project == project and self.busy)
         if self.running_spinner is not None:
             self.running_spinner.visible = self.busy
         if snapshot:
@@ -413,13 +403,22 @@ class ValidationView:
             except Exception:
                 pass
         finally:
-            self.busy = False
-            refine_job.finish_content(project, cancelled=owner.cancellation_requested)
-            refine_job.unregister(owner.username, project, self)
-            self._running_project = None
-            owner._finalize_cancel_request()
-            owner._complete_background_job()
+            self._finish_content_worker(project)
             self._safe_render_results()
+
+    def _finish_content_worker(self, project):
+        """Shared finalization for inspection and bulk correction workers.
+
+        Keep each caller's UI refresh separate: the inspection renders results,
+        whereas bulk correction refreshes the whole view.
+        """
+        owner = self.owner
+        self.busy = False
+        refine_job.finish_content(project, cancelled=owner.cancellation_requested)
+        refine_job.unregister(owner.username, project, self)
+        self._running_project = None
+        owner._finalize_cancel_request()
+        owner._complete_background_job()
 
     async def _bulk_correct_worker(self, project, tasks):
         """Correct unresolved, unchanged drafts; persist each successful page once."""
@@ -500,12 +499,7 @@ class ValidationView:
             refine_job.write(project, 'content', state='failed')
             log(project, f'一括校正 ERROR {exc}\n{traceback.format_exc()}')
         finally:
-            self.busy = False
-            refine_job.finish_content(project, cancelled=owner.cancellation_requested)
-            refine_job.unregister(owner.username, project, self)
-            self._running_project = None
-            owner._finalize_cancel_request()
-            owner._complete_background_job()
+            self._finish_content_worker(project)
             self.refresh()
 
     def start_bulk_correct(self):
